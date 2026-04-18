@@ -242,7 +242,11 @@ class _Codec:
     def marshal(self, v: Any) -> bytes:
         if self.name == "msgpack":
             return msgpack.packb(v, use_bin_type=True)
-        return json.dumps(v).encode()
+        def _default(o):
+            if isinstance(o, bytes):
+                return o.decode("utf-8", errors="replace")
+            raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+        return json.dumps(v, default=_default).encode()
     def unmarshal(self, data: bytes) -> Any:
         if self.name == "msgpack":
             return msgpack.unpackb(data, raw=False)
@@ -345,6 +349,7 @@ class Worker:
         for attempt in range(10):
             try:
                 self._conn = socket.create_connection((host, port), timeout=5)
+                self._conn.settimeout(None)
                 self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 break
             except OSError:
@@ -369,7 +374,6 @@ class Worker:
                 data = self._recv_frame()
                 if data is None:
                     continue
-                # Frame format: [2-byte topic len][topic][payload]
                 if len(data) < 2:
                     continue
                 topic_len = int.from_bytes(data[:2], "big")
@@ -461,6 +465,11 @@ class Worker:
                 result = loaded.run(inputs)
             self.requests_served += 1
 
+            # If cancelled while running, discard result and return CANCELLED.
+            with _cancelled_lock:
+                if origin_id in _cancelled_ids:
+                    return self._err(env, "CANCELLED", "request cancelled")
+
             # Handle pipe forward: if forward_to is set, publish there and return None
             forward_to = env.get("forward_to", "")
             if forward_to:
@@ -494,15 +503,12 @@ class Worker:
             time.sleep(interval)
             if not self._running:
                 break
-            try:
-                self._send_envelope({
-                    "proto_ver": 1, "msg_type": "hb_ping", "worker_id": self.worker_id,
-                    "runtime": "python", "load": 0, "groups": self.groups,
-                    "requests_served": self.requests_served,
-                    "uptime_ms": int((time.time() - self.started_at) * 1000),
-                })
-            except OSError:
-                break
+            self._send_envelope({
+                "proto_ver": 1, "msg_type": "hb_ping", "worker_id": self.worker_id,
+                "runtime": "python", "load": 0, "groups": self.groups,
+                "requests_served": self.requests_served,
+                "uptime_ms": int((time.time() - self.started_at) * 1000),
+            })
 
     def _send_envelope(self, env: dict):
         if not env:

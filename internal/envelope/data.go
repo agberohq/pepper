@@ -43,6 +43,19 @@ func (e Data) Blobs() []string {
 	}
 	return out
 }
+func (e Data) ForwardTo() string { v, _ := e["forward_to"].(string); return v }
+func (e Data) GatherAt() string  { v, _ := e["gather_at"].(string); return v }
+func (e Data) Int64(key string) int64 {
+	switch val := e[key].(type) {
+	case int64:
+		return val
+	case float64:
+		return int64(val)
+	case uint64:
+		return int64(val)
+	}
+	return 0
+}
 
 func toUint8(v any) uint8 {
 	switch val := v.(type) {

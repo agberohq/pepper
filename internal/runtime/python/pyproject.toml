@@ -1,0 +1,21 @@
+[project]
+name = "pepper-runtime"
+version = "0.5.0"
+description = "Pepper Python worker runtime"
+requires-python = ">=3.9"
+dependencies = [
+    "msgpack>=1.0.0",
+    "pynng>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+py-modules = ["runtime", "cap"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = "test_*.py"

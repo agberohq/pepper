@@ -16,7 +16,7 @@ type Session struct {
 
 // Do executes a capability with this session's context injected.
 func (s *Session) Do(ctx context.Context, cap string, in core.In, opts ...CallOption) (Result, error) {
-	opts = append([]CallOption{WithSession(s.id)}, opts...)
+	opts = append([]CallOption{WithCallSession(s.id)}, opts...)
 	return s.pp.Do(ctx, cap, in, opts...)
 }
 

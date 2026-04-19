@@ -3,7 +3,7 @@
 //	pepper.New(
 //	    pepper.Metrics(pepper.Prometheus()),
 //	    pepper.DLQ(pepper.FileDLQ("/var/log/pepper/dlq")),
-//	    pepper.SessionStore(pepper.InMemoryStore(24*time.Hour)),
+//	    pepper.Storage(pepper.InMemoryStore(24*time.Hour)),
 //	)
 //
 // Hook short-circuit:
@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/agberohq/pepper/internal/blob"
-	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/dlq"
 	"github.com/agberohq/pepper/internal/hooks"
 	"github.com/agberohq/pepper/internal/metrics"
@@ -25,23 +24,23 @@ import (
 // Metrics
 
 // Prometheus returns a MetricsSink backed by the default Prometheus registry.
-func Prometheus() core.MetricsSink { return metrics.Prometheus() }
+func Prometheus() metrics.Sink { return metrics.Prometheus() }
 
 // Noop returns a zero-overhead MetricsSink that discards all observations.
-func Noop() core.MetricsSink { return metrics.Noop() }
+func Noop() metrics.Sink { return metrics.Noop() }
 
 // DLQ
 
 // FileDLQ returns a DLQBackend that persists poison pill entries to dir.
-func FileDLQ(dir string) DLQBackend { return dlq.NewFile(dir) }
+func FileDLQ(dir string) dlq.Backend { return dlq.NewFile(dir) }
 
 // NopDLQ returns a DLQBackend that discards all entries.
-func NopDLQ() DLQBackend { return dlq.Nop{} }
+func NopDLQ() dlq.Backend { return dlq.Nop{} }
 
 // Session
 
 // InMemoryStore returns an in-memory SessionStore with TTL managed by jack.Lifetime.
-func InMemoryStore(ttl time.Duration) SessionStore { return storage.NewMemory(ttl) }
+func InMemoryStore(ttl time.Duration) storage.Store { return storage.NewMemory(ttl) }
 
 // Hook helpers
 
@@ -63,11 +62,8 @@ func CachedResult(payload []byte) hooks.Result {
 
 // BlobRef is the wire representation of a zero-copy blob.
 // Embed in In when passing large binary payloads (images, audio, tensors).
-// Workers mmap the file directly — zero copies into numpy/torch/cv2.
+// WithWorkers mmap the file directly — zero copies into numpy/torch/cv2.
 type BlobRef = blob.Ref
-
-// SessionStore is the pluggable session persistence backend.
-type SessionStore = storage.Store
 
 // DLQBackend is the dead-letter queue storage interface.
 // Receives poison pill entries for investigation and replay.
@@ -75,3 +71,6 @@ type DLQBackend = dlq.Backend
 
 // DLQEntry is one poison pill record written to the DLQ.
 type DLQEntry = dlq.Entry
+
+// Storage is the pluggable session persistence backend.
+type Storage = storage.Store

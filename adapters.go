@@ -45,7 +45,7 @@ type CapBuilder struct {
 	opts   []CapOption
 }
 
-// Version sets the capability semver. Workers announce this in cap_ready.
+// Version sets the capability semver. WithWorkers announce this in cap_ready.
 func (b *CapBuilder) Version(v string) *CapBuilder {
 	b.opts = append(b.opts, func(s *registry.Spec) { s.Version = v })
 	return b

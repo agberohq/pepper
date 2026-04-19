@@ -6,6 +6,11 @@ import (
 	"time"
 
 	"github.com/agberohq/pepper/internal/core"
+	"github.com/olekukonko/ll"
+)
+
+var (
+	testLogger = ll.New("test").Enable()
 )
 
 // TestFlowEchoRoundTrip verifies the full Go→Python→Go request path.
@@ -18,10 +23,11 @@ func TestFlowEchoRoundTrip(t *testing.T) {
 	}
 
 	pp, err := New(
-		Workers(NewWorker("w-test-1").Groups("default")),
+		WithWorkers(NewWorker("w-test-1").Groups("default")),
 		WithSerializer(MsgPack),
 		WithTransport(TCPLoopback),
-		ShutdownTimeout(3*time.Second),
+		WithShutdownTimeout(3*time.Second),
+		WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -65,8 +71,9 @@ func TestFlowTypedDo(t *testing.T) {
 	}
 
 	pp, err := New(
-		Workers(NewWorker("w-typed").Groups("default")),
-		ShutdownTimeout(3*time.Second),
+		WithWorkers(NewWorker("w-typed").Groups("default")),
+		WithShutdownTimeout(3*time.Second),
+		WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)

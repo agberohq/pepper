@@ -30,8 +30,8 @@ func TestMultipleCapabilities(t *testing.T) {
 	}
 
 	pp, err := New(
-		Workers(NewWorker("w-multi").Groups("default")),
-		ShutdownTimeout(3*time.Second),
+		WithWorkers(NewWorker("w-multi").Groups("default")),
+		WithShutdownTimeout(3*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -68,7 +68,7 @@ func TestMultipleCapabilities(t *testing.T) {
 
 // TestContextCancellation verifies that cancelling the Go context returns ctx.Err().
 func TestContextCancellation(t *testing.T) {
-	pp, err := New(ShutdownTimeout(time.Second))
+	pp, err := New(WithShutdownTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -96,15 +96,15 @@ func TestStreamChunksCompiles(t *testing.T) {
 	t.Log("stream API compiles correctly")
 }
 
-// TestWorkerBuilderInterface verifies Workers() accepts *WorkerBuilder directly.
+// TestWorkerBuilderInterface verifies WithWorkers() accepts *WorkerBuilder directly.
 func TestWorkerBuilderInterface(t *testing.T) {
 	pp, err := New(
-		Workers(
+		WithWorkers(
 			NewWorker("w-1").Groups("gpu"),
 			NewWorker("w-2").Groups("cpu"),
 			NewWorker("w-3").Groups("gpu", "asr").MaxRequests(10000).MaxUptime(24*time.Hour),
 		),
-		ShutdownTimeout(time.Second),
+		WithShutdownTimeout(time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -122,7 +122,7 @@ func TestWorkerBuilderInterface(t *testing.T) {
 
 // TestCapabilityRegistration verifies Register, Include, Compose compile.
 func TestCapabilityRegistration(t *testing.T) {
-	pp, err := New(ShutdownTimeout(time.Second))
+	pp, err := New(WithShutdownTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

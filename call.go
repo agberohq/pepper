@@ -45,62 +45,62 @@ func defaultCallOpts() callOpts {
 
 // Routing
 
-// WithGroup routes the request to a named worker group.
-func WithGroup(group string) CallOption {
+// WithCallGroup routes the request to a named worker group.
+func WithCallGroup(group string) CallOption {
 	return func(o *callOpts) { o.group = group }
 }
 
-// WithWorker pins the request to a specific worker ID.
-func WithWorker(id string) CallOption {
+// WithCallWorker pins the request to a specific worker ID.
+func WithCallWorker(id string) CallOption {
 	return func(o *callOpts) { o.workerID = id }
 }
 
-// WithDispatch sets the dispatch mode. Accepts envelope.Dispatch values
+// WithCallDispatch sets the dispatch mode. Accepts envelope.Dispatch values
 // or raw strings ("any", "all", "first", "vote", "quorum").
-func WithDispatch(mode string) CallOption {
+func WithCallDispatch(mode string) CallOption {
 	return func(o *callOpts) { o.dispatch = mode }
 }
 
-// WithQuorum sets the minimum response count for vote/quorum dispatch.
-func WithQuorum(n uint8) CallOption {
+// WithCallQuorum sets the minimum response count for vote/quorum dispatch.
+func WithCallQuorum(n uint8) CallOption {
 	return func(o *callOpts) { o.quorum = n }
 }
 
 // Versioning
 
-// WithVersion sets a semver constraint for the target capability.
-func WithVersion(constraint string) CallOption {
+// WithCallVersion sets a semver constraint for the target capability.
+func WithCallVersion(constraint string) CallOption {
 	return func(o *callOpts) { o.capVer = constraint }
 }
 
 // Timing
 
-// WithDeadline sets an absolute deadline for this request.
-func WithDeadline(t time.Time) CallOption {
+// WithCallDeadline sets an absolute deadline for this request.
+func WithCallDeadline(t time.Time) CallOption {
 	return func(o *callOpts) { o.deadlineMs = t.UnixMilli() }
 }
 
-// WithTimeout sets a relative timeout for this request.
-func WithTimeout(d time.Duration) CallOption {
+// WithCallTimeout sets a relative timeout for this request.
+func WithCallTimeout(d time.Duration) CallOption {
 	return func(o *callOpts) { o.deadlineMs = time.Now().Add(d).UnixMilli() }
 }
 
 // Session
 
-// WithSession injects a session ID into the request envelope.
-func WithSession(id string) CallOption {
+// WithCallSession injects a session ID into the request envelope.
+func WithCallSession(id string) CallOption {
 	return func(o *callOpts) { o.sessionID = id }
 }
 
 // Limits
 
-// WithMaxHops overrides the pipeline hop limit for this request.
-func WithMaxHops(n uint8) CallOption {
+// WithCallMaxHops overrides the pipeline hop limit for this request.
+func WithCallMaxHops(n uint8) CallOption {
 	return func(o *callOpts) { o.maxHops = n }
 }
 
-// WithMaxCbDepth overrides the callback nesting limit for this request.
-func WithMaxCbDepth(n uint8) CallOption {
+// WithCallMaxCbDepth overrides the callback nesting limit for this request.
+func WithCallMaxCbDepth(n uint8) CallOption {
 	return func(o *callOpts) { o.maxCbDepth = n }
 }
 

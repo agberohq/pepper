@@ -48,14 +48,14 @@ func (w *UpperWorker) Capabilities() []core.Capability {
 
 func main() {
 	pp, err := pepper.New(
-		pepper.Workers(
+		pepper.WithWorkers(
 			pepper.NewWorker("w-1").Groups("default", "cpu").
 				MaxRequests(10000).
 				MaxUptime(24*time.Hour),
 		),
 		pepper.WithSerializer(pepper.MsgPack),
-		pepper.ShutdownTimeout(5*time.Second),
-		pepper.Debug(pepper.DebugEnvelope),
+		pepper.WithShutdownTimeout(5*time.Second),
+		pepper.WithDebug(pepper.DebugEnvelope),
 	)
 	if err != nil {
 		log.Fatal(err)

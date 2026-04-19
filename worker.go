@@ -10,7 +10,7 @@
 //	result, err := pepper.Do[FaceResult](ctx, pp, "face.recognize", pepper.In{"image": blob})
 //	// result is FaceResult directly
 //
-// Go Workers implement the Worker interface below. The goruntime package
+// Go WithWorkers implement the Worker interface below. The goruntime package
 // wraps them so the bus always sees map[string]any — generics only exist
 // at the user-facing API boundary.
 package pepper

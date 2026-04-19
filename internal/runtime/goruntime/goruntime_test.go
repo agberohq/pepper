@@ -2,6 +2,7 @@ package goruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -67,11 +68,12 @@ func (w *teardownWorker) Stream(_ context.Context, _ string, _ map[string]any) (
 	return nil, nil
 }
 
-// jsonCodec is a simple JSON codec for tests.
+// jsonCodec is a simple JSON codec for tests. Satisfies codec.Codec.
 type jsonCodec struct{}
 
-func (jsonCodec) Marshal(v any) ([]byte, error)      { return jsonFallback{}.Marshal(v) }
-func (jsonCodec) Unmarshal(data []byte, v any) error { return jsonFallback{}.Unmarshal(data, v) }
+func (jsonCodec) Name() string                       { return "json" }
+func (jsonCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
+func (jsonCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
 func newRuntime(t *testing.T, worker Worker) (*GoWorkerRuntime, *bus.Mock) {
 	t.Helper()
@@ -82,7 +84,7 @@ func newRuntime(t *testing.T, worker Worker) (*GoWorkerRuntime, *bus.Mock) {
 }
 
 func makeEnvelope(cap string, payload map[string]any) ([]byte, error) {
-	p, err := jsonFallback{}.Marshal(payload)
+	p, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +95,7 @@ func makeEnvelope(cap string, payload map[string]any) ([]byte, error) {
 	env.Cap = cap
 	env.DeadlineMs = time.Now().Add(5 * time.Second).UnixMilli()
 	env.Payload = p
-	return jsonFallback{}.Marshal(env)
+	return json.Marshal(env)
 }
 
 // New / capabilities
@@ -192,7 +194,7 @@ func TestHandleMessageEcho(t *testing.T) {
 	select {
 	case msg := <-resCh:
 		var resp map[string]any
-		unmarshalErr := jsonFallback{}.Unmarshal(msg.Data, &resp)
+		unmarshalErr := json.Unmarshal(msg.Data, &resp)
 		if unmarshalErr != nil {
 			t.Fatalf("unmarshal response: %v", unmarshalErr)
 		}
@@ -219,7 +221,7 @@ func TestHandleMessageDeadlineExceeded(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// Expired deadline
-	p, _ := jsonFallback{}.Marshal(map[string]any{"x": 1})
+	p, _ := json.Marshal(map[string]any{"x": 1})
 	env := envelope.DefaultEnvelope()
 	env.MsgType = envelope.MsgReq
 	env.CorrID = "corr-dl"
@@ -227,14 +229,14 @@ func TestHandleMessageDeadlineExceeded(t *testing.T) {
 	env.Cap = "echo"
 	env.DeadlineMs = time.Now().Add(-1 * time.Second).UnixMilli() // already expired
 	env.Payload = p
-	data, _ := jsonFallback{}.Marshal(env)
+	data, _ := json.Marshal(env)
 
 	b.Publish(bus.TopicPub("default"), data)
 
 	select {
 	case msg := <-resCh:
 		var resp map[string]any
-		jsonFallback{}.Unmarshal(msg.Data, &resp)
+		json.Unmarshal(msg.Data, &resp)
 		if resp["msg_type"] != string(envelope.MsgErr) {
 			t.Errorf("msg_type = %v, want err", resp["msg_type"])
 		}
@@ -257,7 +259,7 @@ func TestHandleMessageHopLimit(t *testing.T) {
 	resCh, _ := b.Subscribe(ctx, bus.TopicRes("origin-hop"))
 	time.Sleep(20 * time.Millisecond)
 
-	p, _ := jsonFallback{}.Marshal(map[string]any{})
+	p, _ := json.Marshal(map[string]any{})
 	env := envelope.DefaultEnvelope()
 	env.MsgType = envelope.MsgReq
 	env.CorrID = "corr-hop"
@@ -267,14 +269,14 @@ func TestHandleMessageHopLimit(t *testing.T) {
 	env.Hop = 10 // at limit
 	env.MaxHops = 10
 	env.Payload = p
-	data, _ := jsonFallback{}.Marshal(env)
+	data, _ := json.Marshal(env)
 
 	b.Publish(bus.TopicPub("default"), data)
 
 	select {
 	case msg := <-resCh:
 		var resp map[string]any
-		jsonFallback{}.Unmarshal(msg.Data, &resp)
+		json.Unmarshal(msg.Data, &resp)
 		if resp["code"] != string(envelope.ErrHopLimit) {
 			t.Errorf("code = %v, want HOP_LIMIT", resp["code"])
 		}
@@ -303,16 +305,16 @@ func TestHandleMessageExecError(t *testing.T) {
 	env.OriginID = "origin-err"
 	env.Cap = "echo"
 	env.DeadlineMs = time.Now().Add(5 * time.Second).UnixMilli()
-	p, _ := jsonFallback{}.Marshal(map[string]any{})
+	p, _ := json.Marshal(map[string]any{})
 	env.Payload = p
-	data, _ = jsonFallback{}.Marshal(env)
+	data, _ = json.Marshal(env)
 
 	b.Publish(bus.TopicPub("default"), data)
 
 	select {
 	case msg := <-resCh:
 		var resp map[string]any
-		jsonFallback{}.Unmarshal(msg.Data, &resp)
+		json.Unmarshal(msg.Data, &resp)
 		if resp["msg_type"] != string(envelope.MsgErr) {
 			t.Errorf("msg_type = %v, want err", resp["msg_type"])
 		}
@@ -362,7 +364,7 @@ func TestBroadcastCancelStopsLongRunningWork(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// Dispatch a slow request
-	p, _ := jsonFallback{}.Marshal(map[string]any{})
+	p, _ := json.Marshal(map[string]any{})
 	env := envelope.DefaultEnvelope()
 	env.MsgType = envelope.MsgReq
 	env.CorrID = "corr-cancel"
@@ -370,7 +372,7 @@ func TestBroadcastCancelStopsLongRunningWork(t *testing.T) {
 	env.Cap = "echo"
 	env.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
 	env.Payload = p
-	data, _ := jsonFallback{}.Marshal(env)
+	data, _ := json.Marshal(env)
 	b.Publish(bus.TopicPub("default"), data)
 
 	time.Sleep(50 * time.Millisecond)
@@ -380,7 +382,7 @@ func TestBroadcastCancelStopsLongRunningWork(t *testing.T) {
 		"msg_type":  "cancel",
 		"origin_id": "origin-cancel",
 	}
-	cancelData, _ := jsonFallback{}.Marshal(cancelMsg)
+	cancelData, _ := json.Marshal(cancelMsg)
 	b.Publish(bus.TopicBroadcast, cancelData)
 
 	select {
@@ -420,7 +422,7 @@ func TestConcurrentRequests(t *testing.T) {
 			}
 		}(resCh)
 
-		p, _ := jsonFallback{}.Marshal(map[string]any{"i": i})
+		p, _ := json.Marshal(map[string]any{"i": i})
 		env := envelope.DefaultEnvelope()
 		env.MsgType = envelope.MsgReq
 		env.CorrID = corrID
@@ -428,7 +430,7 @@ func TestConcurrentRequests(t *testing.T) {
 		env.Cap = "echo"
 		env.DeadlineMs = time.Now().Add(5 * time.Second).UnixMilli()
 		env.Payload = p
-		data, _ := jsonFallback{}.Marshal(env)
+		data, _ := json.Marshal(env)
 		b.Publish(bus.TopicPub("default"), data)
 	}
 
@@ -449,10 +451,10 @@ func TestChanCap(t *testing.T) {
 	}
 }
 
-// jsonFallback codec
+// jsonCodec roundtrip
 
-func TestJsonFallbackRoundtrip(t *testing.T) {
-	c := jsonFallback{}
+func TestJsonCodecRoundtrip(t *testing.T) {
+	c := jsonCodec{}
 	in := map[string]any{"key": "value", "num": float64(42)}
 	data, err := c.Marshal(in)
 	if err != nil {

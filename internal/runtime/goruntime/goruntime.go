@@ -19,14 +19,15 @@ package goruntime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/agberohq/pepper/internal/bus"
+	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/envelope"
+	"github.com/agberohq/pepper/internal/runtime/adapter"
 	"github.com/olekukonko/ll"
 )
 
@@ -52,12 +53,6 @@ type OptionalWorker interface {
 	Stream(ctx context.Context, cap string, in map[string]any) (<-chan map[string]any, error)
 }
 
-// Codec is the minimal encode/decode interface the runtime needs.
-type Codec interface {
-	Marshal(v any) ([]byte, error)
-	Unmarshal(data []byte, v any) error
-}
-
 // GoWorkerRuntime wraps a Worker, manages its lifecycle, and connects it to the bus.
 type GoWorkerRuntime struct {
 	id     string
@@ -73,7 +68,7 @@ type GoWorkerRuntime struct {
 	load           atomic.Uint32 // 0–100
 
 	bus    bus.Bus
-	codec  Codec
+	codec  codec.Codec
 	logger *ll.Logger
 
 	// per-request cancel functions for context cancellation propagation
@@ -82,7 +77,7 @@ type GoWorkerRuntime struct {
 }
 
 // New creates a GoWorkerRuntime.
-func New(id string, worker Worker, groups []string, b bus.Bus, c Codec, logger *ll.Logger) *GoWorkerRuntime {
+func New(id string, worker Worker, groups []string, b bus.Bus, c codec.Codec, logger *ll.Logger) *GoWorkerRuntime {
 	caps := worker.Capabilities()
 	sems := make(map[string]chan struct{}, len(caps))
 	for _, spec := range caps {
@@ -196,6 +191,15 @@ func (r *GoWorkerRuntime) handleMessage(ctx context.Context, msg bus.Message) {
 	if in == nil {
 		in = map[string]any{}
 	}
+
+	// Resolve any BlobRef values to raw bytes so Go workers never handle
+	// local shm paths directly — same guarantee as the adapter layer.
+	resolved, err := adapter.ResolveInputs(in)
+	if err != nil {
+		r.sendError(env, envelope.ErrPayloadInvalid, fmt.Sprintf("resolve blob inputs: %v", err))
+		return
+	}
+	in = resolved
 
 	// Create per-request context with deadline
 	reqCtx, cancel := context.WithDeadline(ctx, time.UnixMilli(env.DeadlineMs))
@@ -380,14 +384,5 @@ func (r *GoWorkerRuntime) Stop() {
 	r.logger.Info("go worker stopped")
 }
 
-// Helpers
-
 // chanCap returns the capacity of a channel without shadowing the builtin.
 func chanCap[T any](ch chan T) int { return cap(ch) }
-
-// jsonFallback provides a fallback codec using encoding/json.
-// Used when no codec is injected (tests, standalone use).
-type jsonFallback struct{}
-
-func (jsonFallback) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
-func (jsonFallback) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }

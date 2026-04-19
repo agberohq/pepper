@@ -325,6 +325,66 @@ def load_capability(cap_load: dict) -> LoadedCap:
         return LoadedCap({**form_a_meta, **cap_load}, module, is_class=False)
 
 
+# ── Stream registry ───────────────────────────────────────────────────────────
+# Tracks active bidirectional streams opened via pp.OpenStream().
+# Each entry is a queue that the message loop feeds with incoming chunks;
+# the capability reads from it via pepper.stream_chunks() (or a generator).
+
+class _StreamState:
+    def __init__(self):
+        self.queue: queue.Queue = queue.Queue()
+        self.closed = threading.Event()
+
+    def feed(self, payload: bytes) -> None:
+        self.queue.put(payload)
+
+    def close_input(self) -> None:
+        self.closed.set()
+        self.queue.put(None)  # sentinel to unblock readers
+
+    def chunks(self):
+        """Yield decoded payloads until the input stream is closed."""
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            yield item
+
+
+class _StreamRegistry:
+    _streams: Dict[str, _StreamState] = {}
+    _lock = threading.Lock()
+
+    @classmethod
+    def open(cls, stream_id: str) -> _StreamState:
+        state = _StreamState()
+        with cls._lock:
+            cls._streams[stream_id] = state
+        return state
+
+    @classmethod
+    def feed(cls, stream_id: str, payload: bytes) -> None:
+        with cls._lock:
+            state = cls._streams.get(stream_id)
+        if state:
+            state.feed(payload)
+
+    @classmethod
+    def close(cls, stream_id: str) -> None:
+        with cls._lock:
+            state = cls._streams.pop(stream_id, None)
+        if state:
+            state.close_input()
+
+    @classmethod
+    def remove(cls, stream_id: str) -> None:
+        with cls._lock:
+            cls._streams.pop(stream_id, None)
+
+
+import queue  # noqa: E402 — placed here to keep top imports clean
+
+
 # ── Worker ────────────────────────────────────────────────────────────────────
 class Worker:
     def __init__(self):
@@ -361,7 +421,20 @@ class Worker:
         _PipeForwarder.init(self._conn)
         _CallbackDispatcher.init(self)
 
-        # Send hello with empty caps (will be populated after cap_load)
+        # Announce subscription topics to Mula router.
+        # pepper.push.{group} must be included so handleConn starts the
+        # drainPushToSubscriber goroutine for DispatchAny requests.
+        # pepper.pub.{group} is for fan-out dispatch modes.
+        topics = ["pepper.control", "pepper.broadcast"]
+        if self.worker_id:
+            topics.append(f"pepper.control.{self.worker_id}")
+        for g in self.groups:
+            topics.append(f"pepper.push.{g}")
+            topics.append(f"pepper.pub.{g}")
+        topic_frame = "|".join(topics).encode("utf-8")
+        self._send_frame(topic_frame)
+
+        # Send worker_hello
         self._send_envelope(self._make_hello())
 
         hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -411,6 +484,20 @@ class Worker:
                 error = env.get("error")
                 if cb_id:
                     _CallbackDispatcher.handle_response(cb_id, payload, error)
+            elif msg_type == "stream_open":
+                # A new bidirectional stream has been opened (§11.2).
+                # Dispatch the capability in streaming mode; the cap returns a
+                # generator and we forward each yielded value as res_chunk.
+                self.executor.submit(self._handle_stream_open, env)
+            elif msg_type == "stream_chunk":
+                # An input chunk arriving on an existing stream.
+                stream_id = env.get("stream_id", "")
+                if stream_id:
+                    _StreamRegistry.feed(stream_id, env.get("payload") or b"")
+            elif msg_type == "stream_close":
+                stream_id = env.get("stream_id", "")
+                if stream_id:
+                    _StreamRegistry.close(stream_id)
 
         self.executor.shutdown(wait=True)
         for cap in self.caps.values():
@@ -440,13 +527,114 @@ class Worker:
         if result_env:
             self._send_envelope(result_env)
 
+    def _handle_stream_open(self, env: dict):
+        """Handle stream_open: run the capability in streaming mode (§11.2).
+
+        If the capability's run() returns a generator, each yielded value is
+        forwarded as a res_chunk. A final res_end closes the stream.
+        If run() returns a plain dict, it is sent as a single res_chunk + res_end.
+        """
+        cap_name = env.get("cap", "")
+        stream_id = env.get("stream_id", "")
+        corr_id = env.get("corr_id", "")
+        origin_id = env.get("origin_id", "")
+
+        loaded = self.caps.get(cap_name)
+        if not loaded:
+            self._send_envelope(self._err(env, "CAP_NOT_FOUND",
+                                          f"capability {cap_name!r} not loaded"))
+            return
+
+        _corr_id_var.set(corr_id)
+        _origin_id_var.set(origin_id)
+        _meta_var.set(dict(env.get("meta") or {}))
+        _config_var.set(loaded.spec.get("config") or {})
+
+        # Register the stream so incoming stream_chunk messages are queued.
+        stream_state = _StreamRegistry.open(stream_id)
+
+        payload_bytes = env.get("payload") or b""
+        inputs = self._codec.unmarshal(payload_bytes) if payload_bytes else {}
+        # Inject stream chunk iterator so the cap can consume input chunks.
+        inputs["_stream_chunks"] = stream_state.chunks()
+
+        def _send_chunk(result: dict):
+            self._send_envelope({
+                "proto_ver": 1, "msg_type": "res_chunk",
+                "corr_id": corr_id, "origin_id": origin_id,
+                "worker_id": self.worker_id, "cap": cap_name,
+                "stream_id": stream_id,
+                "payload": self._codec.marshal(result),
+            })
+
+        def _send_end():
+            self._send_envelope({
+                "proto_ver": 1, "msg_type": "res_end",
+                "corr_id": corr_id, "origin_id": origin_id,
+                "worker_id": self.worker_id, "cap": cap_name,
+                "stream_id": stream_id,
+            })
+
+        try:
+            with loaded.semaphore:
+                result = loaded.run(inputs)
+
+            if inspect.isgenerator(result):
+                for chunk in result:
+                    with _cancelled_lock:
+                        if origin_id in _cancelled_ids:
+                            break
+                    if isinstance(chunk, dict):
+                        _send_chunk(chunk)
+                    else:
+                        _send_chunk({"value": chunk})
+            elif isinstance(result, dict):
+                _send_chunk(result)
+
+            _send_end()
+        except Exception as exc:
+            log.exception("stream exec error in %s", cap_name)
+            self._send_envelope(self._err(env, "EXEC_ERROR", str(exc)))
+        finally:
+            _StreamRegistry.remove(stream_id)
+
     def _handle_request(self, env: dict) -> dict | None:
         cap_name = env.get("cap", "")
+        origin_id = env.get("origin_id", "")
+
+        # ── pepper.inline: raw snippet execution (§16.3) ──────────────────────
+        # The router sends cap="pepper.inline" with _snippet in the payload.
+        # We handle it here natively — it is never registered via cap_load.
+        if cap_name == "pepper.inline":
+            payload_bytes = env.get("payload") or b""
+            inputs = self._codec.unmarshal(payload_bytes) if payload_bytes else {}
+            snippet = inputs.pop("_snippet", "")
+            _corr_id_var.set(env.get("corr_id", ""))
+            _origin_id_var.set(origin_id)
+            _meta_var.set(dict(env.get("meta") or {}))
+            try:
+                local_scope = dict(inputs)
+                exec(snippet, {}, local_scope)  # noqa: S102
+                result = local_scope.get("result", {k: v for k, v in local_scope.items()
+                                                    if not k.startswith("_")})
+                if not isinstance(result, dict):
+                    result = {"result": result}
+                return {
+                    "proto_ver": 1, "msg_type": "res",
+                    "corr_id": env.get("corr_id", ""),
+                    "origin_id": origin_id, "worker_id": self.worker_id,
+                    "cap": cap_name, "cap_ver": "",
+                    "payload": self._codec.marshal(result),
+                    "meta": _meta_var.get(),
+                }
+            except Exception as exc:
+                log.exception("pepper.inline exec error")
+                return self._err(env, "EXEC_ERROR", str(exc))
+
         loaded = self.caps.get(cap_name)
         if not loaded:
             return self._err(env, "CAP_NOT_FOUND", f"capability {cap_name!r} not loaded")
 
-        origin_id = env.get("origin_id", "")
         with _cancelled_lock:
             if origin_id in _cancelled_ids:
                 return self._err(env, "CANCELLED", "request cancelled")

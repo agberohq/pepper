@@ -41,6 +41,8 @@ class MockRouter:
         while True:
             assert self.conn is not None
             data = self._recv_frame()
+            if b"|" in data and data.startswith(b"pepper."):
+                continue
             tl = int.from_bytes(data[:2], "big")
             topic = data[2:2 + tl].decode()
             payload = data[2 + tl:]

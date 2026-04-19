@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from runtime import (
     Worker, _Codec, _parse_bus_url, _encode_msg, _reply_topic,
-    _recv_exact, BlobWriter,
+    _recv_exact, BlobWriter, BusTransport,
     pepper, _origin_id_var, _cancelled_ids, _cancelled_lock,
 )
 
@@ -395,3 +395,200 @@ class TestBlobWriter:
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
+
+# ── Transport tests ───────────────────────────────────────────────────────────
+# These test the BusTransport class that Python workers use to connect to the
+# Pepper router bus.  Redis and NATS tests skip automatically when the service
+# is not reachable — no mocks, no secrets required.
+
+import socket as _socket
+import os as _os
+
+
+def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
+    """Return True if TCP host:port is reachable within timeout."""
+    try:
+        with _socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+_REDIS_HOST = _os.environ.get("PEPPER_TEST_REDIS_HOST", "127.0.0.1")
+_REDIS_PORT = int(_os.environ.get("PEPPER_TEST_REDIS_PORT", "6379"))
+_NATS_HOST  = _os.environ.get("PEPPER_TEST_NATS_HOST", "127.0.0.1")
+_NATS_PORT  = int(_os.environ.get("PEPPER_TEST_NATS_PORT", "4222"))
+
+
+class TestBusTransportParsing:
+    """URL parsing is pure logic — no network required."""
+
+    def test_mula_scheme(self):
+        t = BusTransport("mula://127.0.0.1:7731")
+        assert t.scheme == "mula"
+        assert t.host == "127.0.0.1"
+        assert t.port == 7731
+
+    def test_tcp_scheme(self):
+        t = BusTransport("tcp://10.0.0.1:9000")
+        assert t.scheme == "tcp"
+        assert t.port == 9000
+
+    def test_bare_host_port(self):
+        t = BusTransport("127.0.0.1:7731")
+        assert t.scheme == "mula"
+        assert t.port == 7731
+
+    def test_redis_scheme_raises_not_implemented(self):
+        """Redis transport is stubbed — must raise NotImplementedError, not silently mis-connect."""
+        import pytest
+        with pytest.raises(NotImplementedError, match="redis"):
+            BusTransport("redis://127.0.0.1:6379")
+
+    def test_nats_scheme_raises_not_implemented(self):
+        """NATS transport is stubbed — must raise NotImplementedError, not silently mis-connect."""
+        import pytest
+        with pytest.raises(NotImplementedError, match="nats"):
+            BusTransport("nats://127.0.0.1:4222")
+
+
+class TestBusTransportTCP:
+    """Verifies the mula/TCP transport against a real local echo server."""
+
+    def test_connect_and_send_frame(self):
+        received = []
+        ready = threading.Event()
+
+        def _server():
+            srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            ready.port = srv.getsockname()[1]
+            ready.set()
+            conn, _ = srv.accept()
+            hdr = conn.recv(4)
+            if hdr:
+                size = int.from_bytes(hdr, "big")
+                data = b""
+                while len(data) < size:
+                    chunk = conn.recv(size - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+                received.append(data)
+            conn.close()
+            srv.close()
+
+        t = threading.Thread(target=_server, daemon=True)
+        t.start()
+        ready.wait(timeout=2.0)
+
+        transport = BusTransport(f"tcp://127.0.0.1:{ready.port}")
+        transport.connect(retries=3)
+        transport.send_frame(b"hello-pepper")
+        transport.close()
+        t.join(timeout=2.0)
+
+        assert received == [b"hello-pepper"]
+
+
+class TestRedisWorkerConnectivity:
+    """
+    Verifies that a Python worker could reach Redis when PEPPER_BUS_URL points
+    to a redis:// address.  Currently raises NotImplementedError (transport
+    is stubbed); these tests document the expected future behaviour and prove
+    the port is open when Redis is running.
+
+    All tests in this class skip automatically when Redis is not reachable.
+    """
+
+    def _require_redis(self):
+        import pytest
+        if not _port_open(_REDIS_HOST, _REDIS_PORT):
+            pytest.skip(f"Redis not available at {_REDIS_HOST}:{_REDIS_PORT}")
+
+    def test_redis_port_open(self):
+        self._require_redis()
+        # Just proving the port is reachable — the skip guard above handles the rest.
+
+    def test_redis_ping(self):
+        """Raw RESP PING/PONG proves the server is a real Redis instance."""
+        self._require_redis()
+        with _socket.create_connection((_REDIS_HOST, _REDIS_PORT), timeout=2.0) as conn:
+            conn.sendall(b"*1\r\n$4\r\nPING\r\n")
+            conn.settimeout(2.0)
+            resp = conn.recv(128)
+        assert resp.startswith(b"+PONG"), f"unexpected Redis response: {resp!r}"
+
+    def test_redis_url_raises_not_implemented(self):
+        """
+        Until the Python runtime implements redis://, BusTransport must raise
+        NotImplementedError so workers fail fast with a clear message rather
+        than connecting to the wrong port.
+        """
+        self._require_redis()
+        import pytest
+        url = f"redis://{_REDIS_HOST}:{_REDIS_PORT}"
+        with pytest.raises(NotImplementedError, match="redis"):
+            BusTransport(url)
+
+
+class TestNATSWorkerConnectivity:
+    """
+    Verifies that a Python worker could reach NATS when PEPPER_BUS_URL points
+    to a nats:// address.  Currently raises NotImplementedError (transport is
+    stubbed); these tests document expected future behaviour and prove the INFO
+    handshake works when NATS is running.
+
+    All tests in this class skip automatically when NATS is not reachable.
+    """
+
+    def _require_nats(self):
+        import pytest
+        if not _port_open(_NATS_HOST, _NATS_PORT):
+            pytest.skip(f"NATS not available at {_NATS_HOST}:{_NATS_PORT}")
+
+    def test_nats_port_open(self):
+        self._require_nats()
+
+    def test_nats_info_handshake(self):
+        """NATS sends an INFO JSON banner on connect — parse and validate it."""
+        self._require_nats()
+        with _socket.create_connection((_NATS_HOST, _NATS_PORT), timeout=2.0) as conn:
+            conn.settimeout(2.0)
+            data = b""
+            while b"\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        assert data.startswith(b"INFO "), f"expected NATS INFO banner, got: {data[:80]!r}"
+        info_line = data.split(b"\r\n", 1)[0]
+        import json as _json
+        info = _json.loads(info_line[5:])  # strip "INFO "
+        assert "version" in info
+        assert "max_payload" in info
+
+    def test_nats_ping_pong(self):
+        """NATS PING/PONG health check — same mechanism client libraries use."""
+        self._require_nats()
+        with _socket.create_connection((_NATS_HOST, _NATS_PORT), timeout=2.0) as conn:
+            conn.settimeout(2.0)
+            banner = b""
+            while b"\r\n" not in banner:
+                banner += conn.recv(4096)
+            conn.sendall(b"PING\r\n")
+            resp = conn.recv(64)
+        assert b"PONG" in resp, f"expected PONG, got: {resp!r}"
+
+    def test_nats_url_raises_not_implemented(self):
+        """
+        Until the Python runtime implements nats://, BusTransport must raise
+        NotImplementedError so workers fail fast with a clear message.
+        """
+        self._require_nats()
+        import pytest
+        url = f"nats://{_NATS_HOST}:{_NATS_PORT}"
+        with pytest.raises(NotImplementedError, match="nats"):
+            BusTransport(url)

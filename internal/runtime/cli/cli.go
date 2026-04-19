@@ -25,7 +25,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/agberohq/pepper/internal/blob"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -130,10 +132,12 @@ func (b *Builder) Build() CMDSpec { return b.spec }
 
 // Runner executes CLI capabilities.
 type Runner struct {
-	spec   CMDSpec
-	tmpDir string
-	mu     sync.Mutex
-	pool   []*poolWorker // non-nil when Pool > 0
+	spec    CMDSpec
+	tmpDir  string
+	mu      sync.Mutex
+	pool    []*poolWorker // non-nil when Pool > 0
+	blobs   *blob.Manager
+	blobTTL time.Duration
 }
 
 type poolWorker struct {
@@ -145,8 +149,10 @@ type poolWorker struct {
 }
 
 // NewRunner creates a Runner for the given spec.
-func NewRunner(spec CMDSpec, tmpDir string) *Runner {
-	return &Runner{spec: spec, tmpDir: tmpDir}
+// blobMgr may be nil — if set, OutputTempFile results are registered as
+// zero-copy BlobRefs instead of being read fully into memory.
+func NewRunner(spec CMDSpec, tmpDir string, blobMgr *blob.Manager, blobTTL time.Duration) *Runner {
+	return &Runner{spec: spec, tmpDir: tmpDir, blobs: blobMgr, blobTTL: blobTTL}
 }
 
 // Run executes the CLI tool with the given inputs and returns the result.
@@ -252,6 +258,21 @@ func (r *Runner) writeTempFile(in map[string]any) (string, error) {
 func (r *Runner) parseOutput(stdout []byte, outputPath string, in map[string]any) (map[string]any, error) {
 	switch r.spec.OutputMode {
 	case OutputTempFile:
+		// Zero-copy path: register the file as a blob so the next pipeline
+		// stage receives a pointer, not the entire file contents in RAM.
+		if r.blobs != nil && outputPath != "" {
+			ttl := r.blobTTL
+			if ttl <= 0 {
+				ttl = 5 * time.Minute
+			}
+			b, err := r.blobs.WriteFile(outputPath, ttl)
+			if err != nil {
+				return nil, fmt.Errorf("cli.Run: register output blob: %w", err)
+			}
+			ref := b.Ref()
+			return map[string]any{"output": ref}, nil
+		}
+		// Fallback (no blob manager): read the file — only used in tests.
 		data, err := os.ReadFile(outputPath)
 		if err != nil {
 			return nil, fmt.Errorf("cli.Run: read output file: %w", err)

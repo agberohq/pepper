@@ -111,7 +111,7 @@ func TestRunnerJSONStdin(t *testing.T) {
 		Stdout(JSONStdout).
 		Build()
 
-	r := NewRunner(spec, t.TempDir())
+	r := NewRunner(spec, t.TempDir(), nil, 0)
 	out, err := r.Run(context.Background(), map[string]any{"msg": "hello"})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -127,7 +127,7 @@ func TestRunnerEchoStdout(t *testing.T) {
 		Args:       []string{"-c", "printf 'hello-pepper'"},
 		OutputMode: OutputMode(3),
 	}
-	r := NewRunner(spec, t.TempDir())
+	r := NewRunner(spec, t.TempDir(), nil, 0)
 	out, err := r.Run(context.Background(), map[string]any{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -140,7 +140,7 @@ func TestRunnerEchoStdout(t *testing.T) {
 
 func TestRunnerCommandNotFound(t *testing.T) {
 	spec := CMDSpec{Command: "this-command-does-not-exist-pepper", OutputMode: OutputMode(3)}
-	r := NewRunner(spec, t.TempDir())
+	r := NewRunner(spec, t.TempDir(), nil, 0)
 	_, err := r.Run(context.Background(), map[string]any{})
 	if err == nil {
 		t.Error("expected error for missing command")
@@ -149,7 +149,7 @@ func TestRunnerCommandNotFound(t *testing.T) {
 
 func TestRunnerContextCancellation(t *testing.T) {
 	spec := CMDSpec{Command: "sleep", Args: []string{"10"}, OutputMode: OutputMode(3)}
-	r := NewRunner(spec, t.TempDir())
+	r := NewRunner(spec, t.TempDir(), nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := r.Run(ctx, map[string]any{})
@@ -167,7 +167,7 @@ func TestRunnerTempFileInput(t *testing.T) {
 		InputGlob:  "input-*.bin",
 		OutputMode: OutputMode(3),
 	}
-	r := NewRunner(spec, t.TempDir())
+	r := NewRunner(spec, t.TempDir(), nil, 0)
 	out, err := r.Run(context.Background(), map[string]any{
 		"data": []byte("hello"),
 	})
@@ -191,7 +191,7 @@ func TestRunnerTempFileOutput(t *testing.T) {
 		Args:       []string{outFile},
 		OutputMode: OutputMode(3),
 	}
-	r := NewRunner(spec, dir)
+	r := NewRunner(spec, dir, nil, 0)
 	out, err := r.Run(context.Background(), map[string]any{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)

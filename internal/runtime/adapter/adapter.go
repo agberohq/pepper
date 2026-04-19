@@ -22,12 +22,74 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
+
+// IsBlobRef reports whether v is a Pepper zero-copy blob reference dict.
+func IsBlobRef(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	isPepper, _ := m["_pepper_blob"].(bool)
+	return isPepper
+}
+
+// ResolveBlobBytes reads the raw bytes from a BlobRef's /dev/shm path.
+// If v is not a BlobRef the call returns nil, false.
+// Use this just-in-time before encoding an HTTP request body.
+func ResolveBlobBytes(v any) ([]byte, bool, error) {
+	m, ok := v.(map[string]any)
+	if !ok || !IsBlobRef(v) {
+		return nil, false, nil
+	}
+	path, _ := m["path"].(string)
+	if path == "" {
+		return nil, true, fmt.Errorf("adapter: blob ref missing path field")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, true, fmt.Errorf("adapter: read blob %q: %w", path, err)
+	}
+	return data, true, nil
+}
+
+// ResolveBlobBase64 resolves a BlobRef to a base64-encoded string suitable
+// for embedding in JSON API bodies (e.g. OpenAI vision, Anthropic images).
+func ResolveBlobBase64(v any) (string, bool, error) {
+	data, isBlobRef, err := ResolveBlobBytes(v)
+	if !isBlobRef || err != nil {
+		return "", isBlobRef, err
+	}
+	return base64.StdEncoding.EncodeToString(data), true, nil
+}
+
+// ResolveInputs walks an input map and resolves any top-level BlobRef values
+// to their base64 representation under a "_b64" suffixed key, leaving the
+// original key pointing to the resolved bytes so adapters can choose either.
+// Fields that are not BlobRefs are passed through unchanged.
+func ResolveInputs(in map[string]any) (map[string]any, error) {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		data, isBlobRef, err := ResolveBlobBytes(v)
+		if err != nil {
+			return nil, err
+		}
+		if isBlobRef {
+			out[k] = data
+			out[k+"_b64"] = base64.StdEncoding.EncodeToString(data)
+		} else {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
 
 // Adapter translates between Pepper In/Out and an external service's protocol.
 type Adapter interface {
@@ -121,6 +183,17 @@ func MCP(serverURL string) *MCPBuilder {
 func (b *MCPBuilder) Tool(name string) *MCPBuilder        { b.tool = name; return b }
 func (b *MCPBuilder) Groups(groups ...string) *MCPBuilder { b.groups = groups; return b }
 
+// Accessors for the wiring layer in pepper_runtime.go.
+func (b *HTTPBuilder) GetAdapter() Adapter       { return b.adapter }
+func (b *HTTPBuilder) GetAuth() AuthProvider     { return b.auth }
+func (b *HTTPBuilder) GetBaseURL() string        { return b.baseURL }
+func (b *HTTPBuilder) GetTimeout() time.Duration { return b.timeout }
+func (b *HTTPBuilder) GetGroups() []string       { return b.groups }
+
+func (b *MCPBuilder) GetServerURL() string { return b.serverURL }
+func (b *MCPBuilder) GetTool() string      { return b.tool }
+func (b *MCPBuilder) GetGroups() []string  { return b.groups }
+
 // Auth providers
 
 // AuthProvider adds authentication to HTTP requests.
@@ -173,8 +246,15 @@ func NewRunner(baseURL string, a Adapter, auth AuthProvider, timeout time.Durati
 }
 
 // Run calls the external service with the given inputs.
+// Any BlobRef values in `in` are resolved to raw bytes (and a _b64 variant)
+// before being passed to BuildRequest — adapters never see local file paths.
 func (r *Runner) Run(ctx context.Context, in map[string]any) (map[string]any, error) {
-	req, err := r.adapter.BuildRequest(ctx, in)
+	resolved, err := ResolveInputs(in)
+	if err != nil {
+		return nil, fmt.Errorf("adapter.Run: resolve blobs: %w", err)
+	}
+
+	req, err := r.adapter.BuildRequest(ctx, resolved)
 	if err != nil {
 		return nil, fmt.Errorf("adapter.Run: build request: %w", err)
 	}

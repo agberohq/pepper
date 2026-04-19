@@ -22,6 +22,7 @@ import (
 	"github.com/agberohq/pepper/internal/runtime/adapter"
 	"github.com/agberohq/pepper/internal/runtime/cli"
 	"github.com/agberohq/pepper/internal/runtime/goruntime"
+	"github.com/agberohq/pepper/internal/sub"
 	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/jack"
 )
@@ -54,6 +55,19 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	rt.bgCtx = bgCtx
 	rt.bgCancel = bgCancel
+
+	// Initialise the cross-platform child-process lifecycle manager.
+	// Must happen before any Python worker is spawned so that Configure and
+	// Track are available. Dispose is called when the background context is
+	// cancelled (i.e. when Stop() fires bgCancel).
+	if err := sub.Init(); err != nil {
+		bgCancel()
+		return fmt.Errorf("pepper: sub manager: %w", err)
+	}
+	go func() {
+		<-bgCtx.Done()
+		_ = sub.Dispose()
+	}()
 
 	busURL := p.cfg.TransportURL
 	if busURL == "" {
@@ -564,7 +578,14 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	cmd.Env = append(os.Environ(), envVars...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr // raw process errors only — structured logs go to fd 3
-	setPdeathsig(cmd)
+
+	// Configure cross-platform child-process lifecycle (replaces the old
+	// pdeathsig_*.go build-tag files). On Linux this sets Pdeathsig=SIGKILL;
+	// on macOS/BSD it sets Setpgid so we can kill the process group; on Windows
+	// the Job Object (created in sub.Init) handles it.
+	if err := sub.Configure(cmd); err != nil {
+		return fmt.Errorf("sub.Configure: %w", err)
+	}
 
 	// Open a pipe for Python structured log output (fd 3 in the child).
 	// Python writes one JSON line per record; Go re-emits via rt.logger so all
@@ -580,6 +601,11 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 			logW.Close()
 		}
 		return err
+	}
+	// Register the started process with the sub manager so it is tracked for
+	// cleanup on abnormal parent exit (relevant on macOS/Windows).
+	if err := sub.Track(cmd.Process); err != nil {
+		p.logger.Fields("worker", workerID, "error", err).Warn("sub.Track failed")
 	}
 	if pipeErr == nil {
 		logW.Close() // parent closes write end; child holds the only reference

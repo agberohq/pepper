@@ -145,6 +145,10 @@ func New(transport string, cfg Config) (Bus, error) {
 		return NewNano(cfg)
 	case "mula", "tcp":
 		return NewMula(cfg)
+	case "redis":
+		return NewRedis(cfg)
+	case "nats":
+		return NewNATS(cfg)
 	case "mock":
 		return NewMock(), nil
 	default:

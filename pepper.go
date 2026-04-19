@@ -57,7 +57,7 @@ func New(opts ...Option) (*Pepper, error) {
 
 	logger := cfg.logger
 	if logger == nil {
-		logger = ll.New("pepper").Disable().Suspend()
+		logger = ll.New("pepper").Enable()
 	}
 	return &Pepper{
 		cfg: cfg, codec: c, reg: registry.New(), pending: pending.New(),

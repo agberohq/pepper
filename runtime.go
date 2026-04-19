@@ -147,26 +147,35 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 			}
 		}
 		// Wait for at least one worker to become ready.
-		// Honour the caller's ctx deadline so test contexts (--timeout 30s)
-		// are not outlasted by the DefaultTimeout (also 30 s) wait loop.
-		waitDeadline := time.Now().Add(p.cfg.DefaultTimeout)
-		if dl, ok := ctx.Deadline(); ok && dl.Before(waitDeadline) {
-			waitDeadline = dl
+		//
+		// We deliberately use an independent internal deadline (bootTimeout)
+		// rather than the caller's ctx. The caller's ctx is reused for Do()
+		// calls after Start() returns; if we consumed most of that deadline
+		// waiting for Python to boot, Do() would immediately time out.
+		//
+		// bootTimeout defaults to DefaultTimeout (usually 30 s). It is
+		// bounded above by bgCtx (the process-lifetime context) so we still
+		// stop promptly on shutdown.
+		bootTimeout := p.cfg.DefaultTimeout
+		if bootTimeout <= 0 {
+			bootTimeout = 30 * time.Second
 		}
-		for time.Now().Before(waitDeadline) {
+		bootCtx, bootCancel := context.WithTimeout(bgCtx, bootTimeout)
+		defer bootCancel()
+		for {
 			if rt.readyWorkers.Load() > 0 {
 				break
 			}
 			select {
-			case <-ctx.Done():
+			case <-bootCtx.Done():
 				goto doneWaiting
 			case <-time.After(30 * time.Millisecond):
 			}
 		}
 	doneWaiting:
-		if rt.readyWorkers.Load() == 0 && ctx.Err() != nil {
+		if rt.readyWorkers.Load() == 0 {
 			bgCancel()
-			return fmt.Errorf("pepper: boot: %w", ctx.Err())
+			return fmt.Errorf("pepper: boot: timed out waiting for a worker to become ready")
 		}
 	}
 

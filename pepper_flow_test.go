@@ -38,14 +38,20 @@ func TestFlowEchoRoundTrip(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	// Start gets its own context so Python subprocess startup time does not
+	// consume the budget that Do() needs. 15 s is generous for cold Python boot.
+	startCtx, startCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer startCancel()
 
-	if err := pp.Start(ctx); err != nil {
+	if err := pp.Start(startCtx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
-	result, err := pp.Do(ctx, "echo", core.In{"msg": "hello"})
+	// Do gets a fresh, independent deadline.
+	doCtx, doCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer doCancel()
+
+	result, err := pp.Do(doCtx, "echo", core.In{"msg": "hello"})
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
@@ -84,17 +90,23 @@ func TestFlowTypedDo(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	// Start gets its own context so Python subprocess startup time does not
+	// consume the budget that Do() needs. 15 s is generous for cold Python boot.
+	startCtx, startCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer startCancel()
 
-	if err := pp.Start(ctx); err != nil {
+	if err := pp.Start(startCtx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+
+	// Do gets a fresh, independent deadline.
+	doCtx, doCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer doCancel()
 
 	type EchoResult struct {
 		Msg string `msgpack:"msg"`
 	}
-	out, err := Do[EchoResult](ctx, pp, "echo", core.In{"msg": "typed"})
+	out, err := Do[EchoResult](doCtx, pp, "echo", core.In{"msg": "typed"})
 	if err != nil {
 		t.Fatalf("Do[EchoResult]: %v", err)
 	}

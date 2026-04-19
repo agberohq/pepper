@@ -121,6 +121,12 @@ func buildCapLoad(spec *registry.Spec) map[string]any {
 			source = abs
 		}
 	}
+
+	mc := spec.MaxConcurrent
+	if mc <= 0 {
+		mc = 4
+	}
+
 	return map[string]any{
 		"proto_ver":      uint8(1),
 		"msg_type":       "cap_load",
@@ -129,11 +135,12 @@ func buildCapLoad(spec *registry.Spec) map[string]any {
 		"source":         source,
 		"deps":           spec.Deps,
 		"timeout_ms":     spec.Timeout.Milliseconds(),
-		"max_concurrent": spec.MaxConcurrent,
+		"max_concurrent": mc,
 		"groups":         spec.Groups,
 		"config":         spec.Config,
 	}
 }
+
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -143,6 +150,7 @@ func freePort() int {
 	ln.Close()
 	return port
 }
+
 func sanitizeName(name string) string {
 	out := make([]byte, len(name))
 	for i, c := range name {
@@ -154,6 +162,7 @@ func sanitizeName(name string) string {
 	}
 	return string(out)
 }
+
 func groupsOverlap(a, b []string) bool {
 	for _, x := range a {
 		for _, y := range b {
@@ -164,12 +173,15 @@ func groupsOverlap(a, b []string) bool {
 	}
 	return false
 }
+
 func responseToResult(resp pending.Response, c codec.Codec, latency time.Duration) Result {
 	return Result{payload: resp.Payload, codec: c, WorkerID: resp.WorkerID, Cap: resp.Cap, CapVer: resp.CapVer, Hop: resp.Hop, Latency: latency, Meta: resp.Meta, Err: resp.Err}
 }
+
 func toResult(hr hooks.Result, c codec.Codec) Result {
 	return Result{payload: hr.Payload, codec: c, WorkerID: hr.WorkerID, Cap: hr.Cap, CapVer: hr.CapVer, Hop: hr.Hop, Meta: hr.Meta, Err: hr.Err}
 }
+
 func buildEnvelope(corrID, originID, cap string, in core.In, o callOpts, defaultTimeout time.Duration) envelope.Envelope {
 	env := envelope.DefaultEnvelope()
 	env.CorrID = corrID
@@ -194,6 +206,7 @@ func buildEnvelope(corrID, originID, cap string, in core.In, o callOpts, default
 	env.DeadlineMs = deadlineMs
 	return env
 }
+
 func buildPipelineSpec(name string, dag any) (*registry.Spec, error) {
 	return &registry.Spec{Name: name, Runtime: registry.RuntimePipeline, Pipeline: dag, Version: "0.0.0"}, nil
 }

@@ -49,6 +49,17 @@ func (m *Manager) Write(data []byte, ttl time.Duration, opts ...WriteOption) (*B
 	return m.register(blobID, path, int64(len(data)), ttl, cfg), nil
 }
 
+// WriteFile copies a file from disk into the blob directory.
+// The original file is not modified.
+func (m *Manager) WriteFile(srcPath string, ttl time.Duration, opts ...WriteOption) (*Blob, error) {
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return nil, fmt.Errorf("blob.WriteFile: open %q: %w", srcPath, err)
+	}
+	defer f.Close()
+	return m.WriteFromReader(f, ttl, opts...)
+}
+
 func (m *Manager) WriteFromReader(r io.Reader, ttl time.Duration, opts ...WriteOption) (*Blob, error) {
 	cfg := writeConfig{}
 	for _, o := range opts {

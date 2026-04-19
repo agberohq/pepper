@@ -19,7 +19,7 @@ type Mula struct {
 	baseAddr   string
 	mu         sync.RWMutex
 	subs       map[string][]*subscriber
-	localSubs  map[string][]chan Message
+	localSubs  map[string][]*localSub
 	prefixSubs []prefixSub
 	pushQs     map[string]*pushQueue
 	closed     atomic.Bool
@@ -36,8 +36,14 @@ type subscriber struct {
 }
 
 type prefixSub struct {
-	prefix string
-	ch     chan Message
+	prefix    string
+	ch        chan Message
+	closeOnce *sync.Once
+}
+
+type localSub struct {
+	ch        chan Message
+	closeOnce sync.Once
 }
 
 type pushQueue struct {
@@ -57,7 +63,7 @@ func NewMula(cfg Config) (*Mula, error) {
 		cfg:       cfg,
 		baseAddr:  host,
 		subs:      make(map[string][]*subscriber),
-		localSubs: make(map[string][]chan Message),
+		localSubs: make(map[string][]*localSub),
 		pushQs:    make(map[string]*pushQueue),
 		listener:  ln,
 		port:      ln.Addr().(*net.TCPAddr).Port,
@@ -80,8 +86,8 @@ func (b *Mula) Publish(topic string, data []byte) error {
 	b.mu.RLock()
 	remoteSubs := make([]*subscriber, len(b.subs[topic]))
 	copy(remoteSubs, b.subs[topic])
-	localChans := make([]chan Message, len(b.localSubs[topic]))
-	copy(localChans, b.localSubs[topic])
+	localEntries := make([]*localSub, len(b.localSubs[topic]))
+	copy(localEntries, b.localSubs[topic])
 	prefixCopy := make([]prefixSub, len(b.prefixSubs))
 	copy(prefixCopy, b.prefixSubs)
 	b.mu.RUnlock()
@@ -97,8 +103,8 @@ func (b *Mula) Publish(topic string, data []byte) error {
 	}
 
 	m := Message{Topic: topic, Data: data}
-	for _, ch := range localChans {
-		_ = sendWithTimeout(ch, m, 50*time.Millisecond)
+	for _, ls := range localEntries {
+		_ = sendWithTimeout(ls.ch, m, 50*time.Millisecond)
 	}
 	for _, ps := range prefixCopy {
 		if strings.HasPrefix(topic, ps.prefix) {
@@ -134,20 +140,22 @@ func (b *Mula) SubscribePrefix(ctx context.Context, prefix string) (<-chan Messa
 		bufSize = 64
 	}
 	ch := make(chan Message, bufSize)
+	once := &sync.Once{}
+	ps := prefixSub{prefix: prefix, ch: ch, closeOnce: once}
 	b.mu.Lock()
-	b.prefixSubs = append(b.prefixSubs, prefixSub{prefix: prefix, ch: ch})
+	b.prefixSubs = append(b.prefixSubs, ps)
 	b.mu.Unlock()
 	go func() {
 		<-ctx.Done()
 		b.mu.Lock()
-		for i, ps := range b.prefixSubs {
-			if ps.ch == ch {
+		for i, s := range b.prefixSubs {
+			if s.ch == ch {
 				b.prefixSubs = append(b.prefixSubs[:i], b.prefixSubs[i+1:]...)
 				break
 			}
 		}
 		b.mu.Unlock()
-		close(ch)
+		once.Do(func() { close(ch) })
 	}()
 	return ch, nil
 }
@@ -160,24 +168,24 @@ func (b *Mula) subscribe(ctx context.Context, topic string) (<-chan Message, err
 	if bufSize <= 0 {
 		bufSize = 64
 	}
-	ch := make(chan Message, bufSize)
+	ls := &localSub{ch: make(chan Message, bufSize)}
 	b.mu.Lock()
-	b.localSubs[topic] = append(b.localSubs[topic], ch)
+	b.localSubs[topic] = append(b.localSubs[topic], ls)
 	b.mu.Unlock()
 	go func() {
 		<-ctx.Done()
 		b.mu.Lock()
 		subs := b.localSubs[topic]
 		for i, s := range subs {
-			if s == ch {
+			if s == ls {
 				b.localSubs[topic] = append(subs[:i], subs[i+1:]...)
 				break
 			}
 		}
 		b.mu.Unlock()
-		close(ch)
+		ls.closeOnce.Do(func() { close(ls.ch) })
 	}()
-	return ch, nil
+	return ls.ch, nil
 }
 
 func (b *Mula) Close() error {
@@ -194,12 +202,13 @@ func (b *Mula) Close() error {
 		}
 	}
 	for _, lsubs := range b.localSubs {
-		for _, ch := range lsubs {
-			close(ch)
+		for _, ls := range lsubs {
+			ls.closeOnce.Do(func() { close(ls.ch) })
 		}
 	}
-	for _, ps := range b.prefixSubs {
-		close(ps.ch)
+	for i := range b.prefixSubs {
+		ch := b.prefixSubs[i].ch
+		b.prefixSubs[i].closeOnce.Do(func() { close(ch) })
 	}
 	return nil
 }
@@ -251,6 +260,17 @@ func (b *Mula) handleConn(conn net.Conn) {
 			}
 		}
 	}()
+
+	// For any pepper.push.{group} topics in the subscription list, also drain
+	// that group's push queue into this subscriber's sendCh.
+	// This allows regular TCP subscribers (Python workers) to receive DispatchAny
+	// requests that arrive via PushOne without needing a separate pull connection.
+	for _, t := range topics {
+		if strings.HasPrefix(t, "pepper.push.") {
+			topic := t // capture for closure
+			go b.drainPushToSubscriber(sub, topic)
+		}
+	}
 	for {
 		data, err := readFrame(conn)
 		if err != nil {
@@ -273,6 +293,48 @@ func (b *Mula) handleConn(conn net.Conn) {
 	b.mu.Unlock()
 }
 
+// drainPushToSubscriber reads from the push queue for a topic and forwards
+// each message to the subscriber's sendCh, wrapped with the topic prefix so
+// the recipient can decode it with the same path as pub/sub messages.
+// This allows Python workers that subscribe to pepper.push.{group} to receive
+// DispatchAny requests without needing a separate pull connection.
+func (b *Mula) drainPushToSubscriber(sub *subscriber, topic string) {
+	q := b.getOrCreatePushQ(topic)
+	for {
+		select {
+		case <-b.stopCh:
+			return
+		case data := <-q.ch:
+			// Wrap with topic prefix so the subscriber can decode it the same
+			// way as regular pub/sub messages: [2-byte-topic-len][topic][payload]
+			wrapped := encodeMsg(topic, data)
+			for {
+				if sub.closed.Load() {
+					// Put back and exit
+					select {
+					case q.ch <- data:
+					default:
+					}
+					return
+				}
+				select {
+				case sub.sendCh <- wrapped:
+					goto nextMsg
+				case <-time.After(100 * time.Millisecond):
+					// loop around to check sub.closed again
+				case <-b.stopCh:
+					select {
+					case q.ch <- data:
+					default:
+					}
+					return
+				}
+			}
+		nextMsg:
+		}
+	}
+}
+
 func (b *Mula) servePuller(conn net.Conn, topic string) {
 	q := b.getOrCreatePushQ(topic)
 	for {
@@ -293,15 +355,15 @@ func (b *Mula) servePuller(conn net.Conn, topic string) {
 
 func (b *Mula) deliverToLocal(topic string, data []byte) {
 	b.mu.RLock()
-	exactSubs := make([]chan Message, len(b.localSubs[topic]))
-	copy(exactSubs, b.localSubs[topic])
+	exactEntries := make([]*localSub, len(b.localSubs[topic]))
+	copy(exactEntries, b.localSubs[topic])
 	prefixSubs := make([]prefixSub, len(b.prefixSubs))
 	copy(prefixSubs, b.prefixSubs)
 	b.mu.RUnlock()
 
 	msg := Message{Topic: topic, Data: data}
-	for _, ch := range exactSubs {
-		_ = sendWithTimeout(ch, msg, 50*time.Millisecond)
+	for _, ls := range exactEntries {
+		_ = sendWithTimeout(ls.ch, msg, 50*time.Millisecond)
 	}
 	for _, ps := range prefixSubs {
 		if strings.HasPrefix(topic, ps.prefix) {

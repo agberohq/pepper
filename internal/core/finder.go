@@ -1,4 +1,4 @@
-package pepper
+package core
 
 import (
 	"os"
@@ -50,7 +50,7 @@ func (f *RuntimeFinder) Python() string {
 func (f *RuntimeFinder) Runtime(specs []*registry.Spec) string {
 	// Check cache
 	if cached := f.cache.Load(); cached != nil {
-		if path := cached.(string); path != "" && fileExists(path) {
+		if path := cached.(string); path != "" && f.fileExists(path) {
 			return path
 		}
 		f.cache.Store((*string)(nil))
@@ -188,15 +188,15 @@ func (f *RuntimeFinder) systemPaths() string {
 func (f *RuntimeFinder) validRuntimeDir(dir string) bool {
 	runtime := filepath.Join(dir, "runtime.py")
 	cap := filepath.Join(dir, "cap.py")
-	return fileExists(runtime) && fileExists(cap)
+	return f.fileExists(runtime) && f.fileExists(cap)
 }
 
 func (f *RuntimeFinder) legacyFallback(specs []*registry.Spec) string {
 	// Original logic preserved exactly
-	if fileExists("internal/runtime/python/runtime.py") {
+	if f.fileExists("internal/runtime/python/runtime.py") {
 		return "internal/runtime/python/runtime.py"
 	}
-	if fileExists("../internal/runtime/python/runtime.py") {
+	if f.fileExists("../internal/runtime/python/runtime.py") {
 		return "../internal/runtime/python/runtime.py"
 	}
 
@@ -216,24 +216,15 @@ func (f *RuntimeFinder) legacyFallback(specs []*registry.Spec) string {
 	}
 
 	if exe, err := os.Executable(); err == nil {
-		if c := filepath.Join(filepath.Dir(exe), "runtime.py"); fileExists(c) {
+		if c := filepath.Join(filepath.Dir(exe), "runtime.py"); f.fileExists(c) {
 			return c
 		}
 	}
 
-	if fileExists("runtime.py") {
+	if f.fileExists("runtime.py") {
 		return "runtime.py"
 	}
 	return ""
 }
 
-// Backward compatibility
-var defaultFinder = NewRuntimeFinder()
-
-func findPython() string {
-	return defaultFinder.Python()
-}
-
-func findRuntimePy(specs []*registry.Spec) string {
-	return defaultFinder.Runtime(specs)
-}
+func (f *RuntimeFinder) fileExists(path string) bool { _, err := os.Stat(path); return err == nil }

@@ -207,6 +207,13 @@ func (r *Router) Dispatch(ctx context.Context, env envelope.Envelope) error {
 	default:
 	}
 
+	// Normalize: empty group means "default" — workers register in "default" group
+	// and Python subscribes to pepper.push.default, so an empty group produces a
+	// topic mismatch that silently drops the message.
+	if env.Group == "" {
+		env.Group = "default"
+	}
+
 	env.MsgType = envelope.MsgReq
 	if env.ReplyTo == "" {
 		env.ReplyTo = "pepper.res." + env.OriginID

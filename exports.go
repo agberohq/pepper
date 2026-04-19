@@ -14,6 +14,8 @@ package pepper
 import (
 	"time"
 
+	"github.com/agberohq/pepper/internal/blob"
+	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/dlq"
 	"github.com/agberohq/pepper/internal/hooks"
 	"github.com/agberohq/pepper/internal/metrics"
@@ -23,10 +25,10 @@ import (
 // Metrics
 
 // Prometheus returns a MetricsSink backed by the default Prometheus registry.
-func Prometheus() MetricsSink { return metrics.Prometheus() }
+func Prometheus() core.MetricsSink { return metrics.Prometheus() }
 
 // Noop returns a zero-overhead MetricsSink that discards all observations.
-func Noop() MetricsSink { return metrics.Noop() }
+func Noop() core.MetricsSink { return metrics.Noop() }
 
 // DLQ
 
@@ -58,3 +60,18 @@ var ShortCircuit = hooks.ShortCircuit
 func CachedResult(payload []byte) hooks.Result {
 	return hooks.Result{Payload: payload}
 }
+
+// BlobRef is the wire representation of a zero-copy blob.
+// Embed in In when passing large binary payloads (images, audio, tensors).
+// Workers mmap the file directly — zero copies into numpy/torch/cv2.
+type BlobRef = blob.Ref
+
+// SessionStore is the pluggable session persistence backend.
+type SessionStore = storage.Store
+
+// DLQBackend is the dead-letter queue storage interface.
+// Receives poison pill entries for investigation and replay.
+type DLQBackend = dlq.Backend
+
+// DLQEntry is one poison pill record written to the DLQ.
+type DLQEntry = dlq.Entry

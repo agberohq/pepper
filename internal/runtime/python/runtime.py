@@ -17,6 +17,41 @@ from pathlib import Path
 from typing import Any, Dict, Generator
 import socket
 
+# ── Logging — structured JSON to fd 3 (Go reads it), fallback to stderr ──────
+# Python MUST NOT write human-readable text to stderr when stdout is used by
+# a CLI capability (e.g. ffmpeg pipe). Go opens fd 3 on the subprocess for
+# structured log lines; if fd 3 is not available we fall back to stderr.
+# Format: one JSON object per line with fields: ts, level, logger, msg, **extra
+
+class _StructuredHandler(logging.Handler):
+    """Emits one JSON line per log record to fd 3 or stderr."""
+
+    def __init__(self):
+        super().__init__()
+        try:
+            self._fd = open(3, "w", buffering=1, closefd=False)  # fd 3 = Go log pipe
+        except OSError:
+            self._fd = sys.stderr  # fallback: fd 3 not provided (local dev / tests)
+
+    def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
+        try:
+            entry = {
+                "ts": record.created,
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            }
+            if record.exc_info:
+                entry["exc"] = self.formatException(record.exc_info)
+            print(json.dumps(entry, separators=(",", ":")), file=self._fd, flush=True)
+        except Exception:  # noqa: BLE001
+            pass  # never crash the worker because of a log failure
+
+
+_handler = _StructuredHandler()
+logging.root.addHandler(_handler)
+logging.root.setLevel(logging.DEBUG if os.environ.get("PEPPER_LOG_DEBUG") else logging.INFO)
+
 log = logging.getLogger("pepper.runtime")
 
 # ── Context variables ─────────────────────────────────────────────────────────
@@ -400,23 +435,14 @@ class Worker:
         self._running = True
         self._conn: socket.socket | None = None
         self._send_lock = threading.Lock()
+        self._transport: BusTransport | None = None
         self._codec = _make_codec()  # read PEPPER_CODEC at construction time
 
     def run(self):
         log.info("pepper worker %s starting, bus=%s", self.worker_id, self.bus_url)
-        host, port = _parse_bus_url(self.bus_url)
-
-        for attempt in range(10):
-            try:
-                self._conn = socket.create_connection((host, port), timeout=5)
-                self._conn.settimeout(None)
-                self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                break
-            except OSError:
-                time.sleep(0.1 * (2 ** attempt))
-        else:
-            log.error("worker %s: could not connect to router", self.worker_id)
-            sys.exit(1)
+        self._transport = BusTransport(self.bus_url)
+        self._transport.connect()
+        self._conn = self._transport.raw_conn
 
         _PipeForwarder.init(self._conn)
         _CallbackDispatcher.init(self)
@@ -504,8 +530,8 @@ class Worker:
             cap.teardown()
         from cap import close_resources
         close_resources()
-        if self._conn:
-            self._conn.close()
+        if hasattr(self, "_transport"):
+            self._transport.close()
 
     def _handle_cap_load(self, env: dict):
         cap_name = env.get("cap", "")
@@ -707,19 +733,10 @@ class Worker:
         self._send_frame(frame)
 
     def _send_frame(self, data: bytes):
-        with self._send_lock:
-            self._conn.sendall(len(data).to_bytes(4, "big") + data)
+        self._transport.send_frame(data)
 
     def _recv_frame(self) -> bytes | None:
-        hdr = _recv_exact(self._conn, 4)
-        if hdr is None:
-            raise ConnectionResetError("router closed connection")
-        size = int.from_bytes(hdr, "big")
-        if size == 0:
-            return None  # keepalive ping
-        if size > 64 * 1024 * 1024:
-            raise ValueError(f"frame too large: {size} bytes")
-        return _recv_exact(self._conn, size)
+        return self._transport.recv_frame()
 
     def _make_hello(self) -> dict:
         return {
@@ -767,15 +784,101 @@ def _reply_topic(env: dict) -> str:
     return "pepper.control"
 
 
+# ── Bus transport abstraction ─────────────────────────────────────────────────
+# The scheme in PEPPER_BUS_URL selects the transport:
+#   mula://host:port   — Pepper's pure-Go TCP bus (default for all runtimes)
+#   tcp://host:port    — alias for mula://
+#   nanomsg://host:port — mangos/nanomsg (Go-only; Python falls back to mula framing)
+#   redis://...        — future: publish/subscribe via Redis Streams
+#   nats://...         — future: NATS core or JetStream
+#
+# Go passes PEPPER_BUS_URL with the full scheme so the runtime can choose the
+# right transport without any guessing.  Adding a new backend only requires:
+#   1. A new elif branch in BusTransport.connect()
+#   2. Overriding send_frame / recv_frame if the framing differs
+
+class BusTransport:
+    """Pluggable bus transport.  Current implementation: Mula plain-TCP."""
+
+    SUPPORTED = ("mula", "tcp", "nanomsg")  # nanomsg uses same framing via mula compat
+
+    def __init__(self, url: str):
+        self.url = url.strip()
+        self.scheme, self.host, self.port = self._parse(self.url)
+        self._conn: socket.socket | None = None
+        self._send_lock = threading.Lock()
+
+    @staticmethod
+    def _parse(url: str) -> tuple[str, str, int]:
+        if "://" not in url:
+            # bare host:port — treat as mula
+            host, _, port = url.rpartition(":")
+            return "mula", host or "127.0.0.1", int(port) if port else 7731
+        scheme, rest = url.split("://", 1)
+        scheme = scheme.lower()
+        if scheme in ("redis", "nats"):
+            raise NotImplementedError(
+                f"Transport {scheme!r} is not yet implemented in the Python runtime. "
+                f"Set PEPPER_BUS_URL to a mula:// or tcp:// address."
+            )
+        host, _, port_str = rest.rpartition(":")
+        return scheme, host or "127.0.0.1", int(port_str) if port_str else 7731
+
+    def connect(self, retries: int = 10) -> None:
+        """Connect to the bus.  Raises SystemExit on failure."""
+        if self.scheme in self.SUPPORTED:
+            self._connect_tcp(retries)
+        else:
+            raise NotImplementedError(f"unsupported bus scheme: {self.scheme!r}")
+
+    def _connect_tcp(self, retries: int) -> None:
+        for attempt in range(retries):
+            try:
+                conn = socket.create_connection((self.host, self.port), timeout=5)
+                conn.settimeout(None)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._conn = conn
+                log.info("bus connected [scheme=%s addr=%s:%s]", self.scheme, self.host, self.port)
+                return
+            except OSError as exc:
+                log.debug("bus connect attempt %d failed: %s", attempt + 1, exc)
+                time.sleep(0.1 * (2 ** attempt))
+        log.error("bus: could not connect to %s:%s after %d attempts", self.host, self.port, retries)
+        sys.exit(1)
+
+    def send_frame(self, data: bytes) -> None:
+        assert self._conn is not None, "not connected"
+        with self._send_lock:
+            self._conn.sendall(len(data).to_bytes(4, "big") + data)
+
+    def recv_frame(self) -> bytes | None:
+        hdr = _recv_exact(self._conn, 4)
+        if hdr is None:
+            raise ConnectionResetError("router closed connection")
+        size = int.from_bytes(hdr, "big")
+        if size == 0:
+            return None  # keepalive ping
+        if size > 64 * 1024 * 1024:
+            raise ValueError(f"frame too large: {size} bytes")
+        return _recv_exact(self._conn, size)
+
+    @property
+    def raw_conn(self) -> socket.socket | None:
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+
+
 def _parse_bus_url(url: str) -> tuple[str, int]:
-    url = url.strip()
-    if url.startswith("tcp://"):
-        addr = url[6:]
-        host, _, port = addr.rpartition(":")
-        return host or "127.0.0.1", int(port)
-    if url.startswith("ipc://"):
-        return "127.0.0.1", 7731
-    raise ValueError(f"unsupported bus URL: {url!r}")
+    """Legacy helper kept for compatibility — prefer BusTransport."""
+    t = BusTransport(url)
+    return t.host, t.port
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	pepper "github.com/agberohq/pepper"
+	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/hooks"
 )
@@ -24,7 +25,7 @@ type UpperWorker struct{}
 
 func (w *UpperWorker) Setup(cap string, config map[string]any) error { return nil }
 
-func (w *UpperWorker) Run(ctx context.Context, cap string, in pepper.In) (pepper.In, error) {
+func (w *UpperWorker) Run(ctx context.Context, cap string, in core.In) (core.In, error) {
 	text, _ := in["text"].(string)
 	result := ""
 	for _, c := range text {
@@ -34,11 +35,11 @@ func (w *UpperWorker) Run(ctx context.Context, cap string, in pepper.In) (pepper
 			result += string(c)
 		}
 	}
-	return pepper.In{"text": result}, nil
+	return core.In{"text": result}, nil
 }
 
-func (w *UpperWorker) Capabilities() []pepper.CapSpec {
-	return []pepper.CapSpec{{
+func (w *UpperWorker) Capabilities() []core.Capability {
+	return []core.Capability{{
 		Name:    "text.upper",
 		Version: "1.0.0",
 		Groups:  []string{"cpu"},
@@ -72,8 +73,8 @@ func main() {
 	pp.Hooks().Global().Before("logger", func(
 		ctx context.Context,
 		env *envelope.Envelope,
-		in pepper.In,
-	) (pepper.In, error) {
+		in core.In,
+	) (core.In, error) {
 		fmt.Printf("[hook:before] cap=%s\n", env.Cap)
 		return nil, nil
 	})
@@ -82,7 +83,7 @@ func main() {
 	pp.Hooks().Global().After("logger", func(
 		ctx context.Context,
 		env *envelope.Envelope,
-		in pepper.In,
+		in core.In,
 		result hooks.Result,
 	) (hooks.Result, error) {
 		fmt.Printf("[hook:after] cap=%s err=%v\n", result.Cap, result.Err)
@@ -97,14 +98,14 @@ func main() {
 	}
 	fmt.Println("pepper started")
 
-	r1, err := pp.Do(ctx, "echo", pepper.In{"msg": "hello from Go"})
+	r1, err := pp.Do(ctx, "echo", core.In{"msg": "hello from Go"})
 	if err != nil {
 		log.Printf("echo error: %v", err)
 	} else {
 		fmt.Printf("echo result: %v\n", r1.AsJSON())
 	}
 
-	r2, err := pp.Do(ctx, "text.upper", pepper.In{"text": "hello world"})
+	r2, err := pp.Do(ctx, "text.upper", core.In{"text": "hello world"})
 	if err != nil {
 		log.Printf("upper error: %v", err)
 	} else {

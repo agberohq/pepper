@@ -3,6 +3,8 @@ package pepper
 import (
 	"context"
 	"time"
+
+	"github.com/agberohq/pepper/internal/core"
 )
 
 // Session is a stateful handle bound to a named session ID.
@@ -13,7 +15,7 @@ type Session struct {
 }
 
 // Do executes a capability with this session's context injected.
-func (s *Session) Do(ctx context.Context, cap string, in In, opts ...CallOption) (Result, error) {
+func (s *Session) Do(ctx context.Context, cap string, in core.In, opts ...CallOption) (Result, error) {
 	opts = append([]CallOption{WithSession(s.id)}, opts...)
 	return s.pp.Do(ctx, cap, in, opts...)
 }

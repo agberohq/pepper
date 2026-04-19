@@ -9,6 +9,7 @@ import (
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/compose"
+	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/hooks"
 	"github.com/agberohq/pepper/internal/metrics"
@@ -17,18 +18,21 @@ import (
 	"github.com/agberohq/pepper/internal/storage"
 	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/jack"
+	"github.com/olekukonko/ll"
 )
 
 type Pepper struct {
 	cfg      Config
 	codec    codec.Codec
+	sessions storage.Store
+	mu       sync.RWMutex
+
 	reg      *registry.Registry
 	pending  *pending.Map
 	hooks    *hooks.Registry
-	sessions storage.Store
 	rt       *runtimeState
 	shutdown *jack.Shutdown
-	mu       sync.RWMutex
+	logger   *ll.Logger
 	started  bool
 	stopped  bool
 }
@@ -50,9 +54,15 @@ func New(opts ...Option) (*Pepper, error) {
 		jack.ShutdownWithTimeout(cfg.ShutdownTimeout),
 		jack.ShutdownWithSignals(),
 	)
+
+	logger := cfg.logger
+	if logger == nil {
+		logger = ll.New("pepper").Enable()
+	}
 	return &Pepper{
 		cfg: cfg, codec: c, reg: registry.New(), pending: pending.New(),
 		hooks: hooks.NewRegistry(), sessions: sess, shutdown: sd,
+		logger: logger,
 	}, nil
 }
 
@@ -71,7 +81,7 @@ func (p *Pepper) RegisterDir(dir string, opts ...CapOption) error {
 	})
 }
 
-func (p *Pepper) Include(name string, worker Worker, opts ...CapOption) error {
+func (p *Pepper) Include(name string, worker core.Worker, opts ...CapOption) error {
 	spec, err := buildGoSpec(name, worker, opts...)
 	if err != nil {
 		return fmt.Errorf("include %q: %w", name, err)
@@ -140,21 +150,21 @@ func (p *Pepper) Stop() error {
 
 func (p *Pepper) Hooks() *hooks.Registry { return p.hooks }
 
-func (p *Pepper) Do(ctx context.Context, cap string, in In, opts ...CallOption) (Result, error) {
+func (p *Pepper) Do(ctx context.Context, cap string, in core.In, opts ...CallOption) (Result, error) {
 	if err := p.ensureStarted(); err != nil {
 		return Result{}, err
 	}
 	return p.dispatch(ctx, cap, in, opts...)
 }
 
-func (p *Pepper) Stream(ctx context.Context, cap string, in In, opts ...CallOption) (*Stream, error) {
+func (p *Pepper) Stream(ctx context.Context, cap string, in core.In, opts ...CallOption) (*Stream, error) {
 	if err := p.ensureStarted(); err != nil {
 		return nil, err
 	}
 	return p.dispatchStream(ctx, cap, in, opts...)
 }
 
-func (p *Pepper) Group(ctx context.Context, group string, dispatch string, cap string, in In, opts ...CallOption) ([]Result, error) {
+func (p *Pepper) Group(ctx context.Context, group string, dispatch string, cap string, in core.In, opts ...CallOption) ([]Result, error) {
 	if err := p.ensureStarted(); err != nil {
 		return nil, err
 	}
@@ -162,7 +172,7 @@ func (p *Pepper) Group(ctx context.Context, group string, dispatch string, cap s
 	return p.dispatchMulti(ctx, cap, in, opts...)
 }
 
-func (p *Pepper) Broadcast(ctx context.Context, cap string, in In, opts ...CallOption) ([]Result, error) {
+func (p *Pepper) Broadcast(ctx context.Context, cap string, in core.In, opts ...CallOption) ([]Result, error) {
 	if err := p.ensureStarted(); err != nil {
 		return nil, err
 	}
@@ -189,11 +199,7 @@ func (p *Pepper) ensureStarted() error {
 	return p.Start(context.Background())
 }
 
-type WorkerError struct{ Code, Message string }
-
-func (e *WorkerError) Error() string { return fmt.Sprintf("worker error [%s]: %s", e.Code, e.Message) }
-
-func (p *Pepper) dispatch(ctx context.Context, cap string, in In, opts ...CallOption) (Result, error) {
+func (p *Pepper) dispatch(ctx context.Context, cap string, in core.In, opts ...CallOption) (Result, error) {
 	o := defaultCallOpts()
 	for _, opt := range opts {
 		opt(&o)
@@ -284,7 +290,7 @@ func (p *Pepper) dispatch(ctx context.Context, cap string, in In, opts ...CallOp
 	return Result{}, fmt.Errorf("max retries exceeded")
 }
 
-func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in In, opts ...CallOption) ([]Result, error) {
+func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in core.In, opts ...CallOption) ([]Result, error) {
 	o := defaultCallOpts()
 	for _, opt := range opts {
 		opt(&o)
@@ -328,7 +334,7 @@ func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in In, opts ...C
 		}(ch)
 	}
 	data, _ := p.codec.Marshal(env)
-	if err := p.rt.nngBus.Publish(bus.TopicPub(env.Group), data); err != nil {
+	if err := p.rt.bus.Publish(bus.TopicPub(env.Group), data); err != nil {
 		for _, cID := range corrIDs {
 			p.pending.Fail(cID, err)
 		}
@@ -338,7 +344,7 @@ func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in In, opts ...C
 	return results, nil
 }
 
-func (p *Pepper) dispatchStream(ctx context.Context, cap string, in In, opts ...CallOption) (*Stream, error) {
+func (p *Pepper) dispatchStream(ctx context.Context, cap string, in core.In, opts ...CallOption) (*Stream, error) {
 	o := defaultCallOpts()
 	for _, opt := range opts {
 		opt(&o)
@@ -360,35 +366,4 @@ func (p *Pepper) dispatchStream(ctx context.Context, cap string, in In, opts ...
 		return nil, err
 	}
 	return &Stream{ch: ch, c: p.codec}, nil
-}
-
-func responseToResult(resp pending.Response, c codec.Codec, latency time.Duration) Result {
-	return Result{payload: resp.Payload, codec: c, WorkerID: resp.WorkerID, Cap: resp.Cap, CapVer: resp.CapVer, Hop: resp.Hop, Latency: latency, Meta: resp.Meta, Err: resp.Err}
-}
-func toResult(hr hooks.Result, c codec.Codec) Result {
-	return Result{payload: hr.Payload, codec: c, WorkerID: hr.WorkerID, Cap: hr.Cap, CapVer: hr.CapVer, Hop: hr.Hop, Meta: hr.Meta, Err: hr.Err}
-}
-func buildEnvelope(corrID, originID, cap string, in In, o callOpts, defaultTimeout time.Duration) envelope.Envelope {
-	env := envelope.DefaultEnvelope()
-	env.CorrID = corrID
-	env.OriginID = originID
-	env.Cap = cap
-	env.Group = o.group
-	env.Dispatch = envelope.Dispatch(o.dispatch)
-	env.Quorum = o.quorum
-	env.CapVer = o.capVer
-	env.WorkerID = o.workerID
-	env.SessionID = o.sessionID
-	env.MaxHops = o.maxHops
-	env.MaxCbDepth = o.maxCbDepth
-	env.ReplyTo = "pepper.res." + originID
-	deadlineMs := o.deadlineMs
-	if deadlineMs == 0 {
-		deadlineMs = time.Now().Add(defaultTimeout).UnixMilli()
-	}
-	env.DeadlineMs = deadlineMs
-	return env
-}
-func buildPipelineSpec(name string, dag any) (*registry.Spec, error) {
-	return &registry.Spec{Name: name, Runtime: registry.RuntimePipeline, Pipeline: dag, Version: "0.0.0"}, nil
 }

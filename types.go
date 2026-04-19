@@ -1,35 +1,48 @@
 package pepper
 
 import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
 	"github.com/agberohq/pepper/internal/blob"
-	"github.com/agberohq/pepper/internal/dlq"
-	"github.com/agberohq/pepper/internal/storage"
+	"github.com/agberohq/pepper/internal/bus"
+	"github.com/agberohq/pepper/internal/core"
+	"github.com/agberohq/pepper/internal/router"
+	"github.com/olekukonko/jack"
 )
 
-// In is the map-based capability input used at the wire level.
-// All internal routing, encoding, and Python/CLI workers use this type.
-// For type-safe Go calls use pepper.Do[O] or pepper.All[O].
-type In = map[string]any
+// Vars is the input map for pp.Run() raw snippet execution.
+type Vars = map[string]any
 
-// BlobRef is the wire representation of a zero-copy blob.
-// Embed in In when passing large binary payloads (images, audio, tensors).
-// Workers mmap the file directly — zero copies into numpy/torch/cv2.
-type BlobRef = blob.Ref
+// Backward compatibility
+var defaultFinder = core.NewRuntimeFinder()
 
-// SessionStore is the pluggable session persistence backend.
-type SessionStore = storage.Store
-
-// DLQBackend is the dead-letter queue storage interface.
-// Receives poison pill entries for investigation and replay.
-type DLQBackend = dlq.Backend
-
-// DLQEntry is one poison pill record written to the DLQ.
-type DLQEntry = dlq.Entry
-
-// MetricsSink is the pluggable metrics backend.
-// All methods must be safe for concurrent use.
-type MetricsSink interface {
-	Counter(name string, val int64, tags map[string]string)
-	Gauge(name string, val float64, tags map[string]string)
-	Histogram(name string, val float64, tags map[string]string)
+type runtimeState struct {
+	bus          bus.Bus
+	sessionLM    interface{}
+	readyWorkers atomic.Int32
+	workerStates sync.Map
+	loopers      sync.Map
+	bgCtx        context.Context
+	bgCancel     context.CancelFunc
+	router       *router.Router
+	blob         *blob.Manager
+	reqReaper    *jack.Reaper
+	blobReaper   *jack.Reaper
+	doctor       *jack.Doctor
 }
+
+type workerEntry struct {
+	id, busAddr string
+	pid         int
+	groups      []string
+	caps        []string
+	ready       bool
+	wc          WorkerConfig
+}
+
+type WorkerError struct{ Code, Message string }
+
+func (e *WorkerError) Error() string { return fmt.Sprintf("worker error [%s]: %s", e.Code, e.Message) }

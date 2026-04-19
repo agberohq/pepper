@@ -3,6 +3,9 @@ package pepper
 import (
 	"crypto/tls"
 	"time"
+
+	"github.com/agberohq/pepper/internal/core"
+	"github.com/olekukonko/ll"
 )
 
 // Serializer identifies the wire codec.
@@ -78,13 +81,16 @@ type Config struct {
 	SessionStore SessionStore
 	DLQ          DLQBackend
 	// Metrics is the pluggable sink — field renamed from MetricsSink.
-	Metrics MetricsSink
+	Metrics core.MetricsSink
 
 	// Resources for Python @resource decorator
 	Resources map[string]map[string]any
 
 	// Strategy controls worker selection for DispatchAny. Default: CapAffinity.
 	Strategy StrategyType
+
+	// Logger
+	logger *ll.Logger
 }
 
 // WorkerConfig describes a single worker process or goroutine.
@@ -135,10 +141,16 @@ func WithSerializer(s Serializer) Option {
 	return func(c *Config) { c.Serializer = s }
 }
 
-// TLS sets mutual TLS for cross-node deployments.
+// WithTLS sets mutual WithTLS for cross-node deployments.
 // Not needed for same-machine ipc:// or tcp://127.0.0.1.
-func TLS(cfg *tls.Config) Option {
+func WithTLS(cfg *tls.Config) Option {
 	return func(c *Config) { c.TLS = cfg }
+}
+
+func WithLogger(logger *ll.Logger) Option {
+	return func(c *Config) {
+		c.logger = logger
+	}
 }
 
 // WorkerArg is satisfied by WorkerConfig and *WorkerBuilder.
@@ -255,7 +267,7 @@ func DLQ(dlq DLQBackend) Option {
 
 // Metrics sets the pluggable metrics sink.
 // Default: noop (zero overhead).
-func Metrics(sink MetricsSink) Option {
+func Metrics(sink core.MetricsSink) Option {
 	return func(c *Config) { c.Metrics = sink }
 }
 

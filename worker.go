@@ -19,41 +19,9 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"github.com/agberohq/pepper/internal/core"
 )
-
-// Worker is the interface Go native workers must implement.
-// All methods must be safe for concurrent use.
-// See runtime/goruntime for the runtime wrapper that connects Worker to the bus.
-type Worker interface {
-	// Setup is called once at boot per capability. Load models, open pools.
-	// Blocking — worker does not accept requests until Setup returns.
-	Setup(cap string, config map[string]any) error
-
-	// Run executes one capability invocation.
-	// ctx is cancelled when deadline passes or Go caller cancels.
-	// Must be goroutine-safe — called concurrently up to MaxConcurrent.
-	Run(ctx context.Context, cap string, in In) (In, error)
-
-	// Capabilities returns metadata for capabilities this worker provides.
-	Capabilities() []CapSpec
-}
-
-// CapSpec describes one capability exported by a Go Worker.
-type CapSpec struct {
-	Name          string
-	Version       string
-	Groups        []string
-	MaxConcurrent int
-}
-
-// OptionalWorker is implemented by Workers that support extended features.
-// The runtime checks for this interface at registration time.
-type OptionalWorker interface {
-	// Teardown is called on worker_bye before the goroutine exits.
-	Teardown(cap string) error
-	// Stream returns a channel of output chunks for streaming capabilities.
-	Stream(ctx context.Context, cap string, in In) (<-chan In, error)
-}
 
 // Do executes a capability and decodes the result into O.
 // Input stays as map[string]any (In) — only the output is typed.
@@ -61,7 +29,7 @@ type OptionalWorker interface {
 //
 //	type FaceResult struct{ Matches []Match `msgpack:"matches"` }
 //	result, err := pepper.Do[FaceResult](ctx, pp, "face.recognize", pepper.In{"image": blob})
-func Do[O any](ctx context.Context, pp *Pepper, cap string, in In, opts ...CallOption) (O, error) {
+func Do[O any](ctx context.Context, pp *Pepper, cap string, in core.In, opts ...CallOption) (O, error) {
 	var zero O
 	res, err := pp.Do(ctx, cap, in, opts...)
 	if err != nil {

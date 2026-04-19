@@ -3,6 +3,7 @@ package pepper
 import (
 	"time"
 
+	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/envelope"
 )
 
@@ -10,12 +11,12 @@ import (
 // the typed pepper.All[O]() free function.
 type Call struct {
 	Cap  string
-	In   In
+	In   core.In
 	Opts []CallOption
 }
 
 // MakeCall constructs a Call for use with All().
-func MakeCall(cap string, in In, opts ...CallOption) Call {
+func MakeCall(cap string, in core.In, opts ...CallOption) Call {
 	return Call{Cap: cap, In: in, Opts: opts}
 }
 

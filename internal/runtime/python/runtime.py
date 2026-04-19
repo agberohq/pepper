@@ -454,6 +454,9 @@ class Worker:
         topics = ["pepper.control", "pepper.broadcast"]
         if self.worker_id:
             topics.append(f"pepper.control.{self.worker_id}")
+            # Per-worker direct push topic — receives requests pinned directly
+            # to this worker by the router's cap affinity selection.
+            topics.append(f"pepper.push.{self.worker_id}")
         for g in self.groups:
             topics.append(f"pepper.push.{g}")
             topics.append(f"pepper.pub.{g}")
@@ -490,6 +493,9 @@ class Worker:
             if msg_type == "cap_load":
                 self._handle_cap_load(env)
             elif msg_type == "req":
+                log.debug("req received [cap=%s corr_id=%s worker=%s hop=%s]",
+                          env.get("cap", ""), env.get("corr_id", ""),
+                          self.worker_id, env.get("hop", 0))
                 self.executor.submit(self._handle_request_and_reply, env)
             elif msg_type == "worker_bye":
                 self._running = False
@@ -536,16 +542,22 @@ class Worker:
     def _handle_cap_load(self, env: dict):
         cap_name = env.get("cap", "")
         error_msg = ""
+        t_start = time.monotonic()
+        log.info("cap_load start [cap=%s worker=%s]", cap_name, self.worker_id)
         try:
             self.caps[cap_name] = load_capability(env)
         except Exception as exc:
             error_msg = str(exc)
-            log.exception("cap_load %s failed", cap_name)
+            log.exception("cap_load failed [cap=%s worker=%s error=%s]", cap_name, self.worker_id, exc)
+
+        setup_ms = int((time.monotonic() - t_start) * 1000)
+        if not error_msg:
+            log.info("cap_load done [cap=%s worker=%s setup_ms=%d]", cap_name, self.worker_id, setup_ms)
 
         self._send_envelope({
             "proto_ver": 1, "msg_type": "cap_ready", "worker_id": self.worker_id,
             "cap": cap_name, "cap_ver": env.get("cap_ver", ""),
-            "setup_ms": 0, "error": error_msg,
+            "setup_ms": setup_ms, "error": error_msg,
         })
 
     def _handle_request_and_reply(self, env: dict):
@@ -627,6 +639,7 @@ class Worker:
     def _handle_request(self, env: dict) -> dict | None:
         cap_name = env.get("cap", "")
         origin_id = env.get("origin_id", "")
+        corr_id = env.get("corr_id", "")
 
         # ── pepper.inline: raw snippet execution (§16.3) ──────────────────────
         # The router sends cap="pepper.inline" with _snippet in the payload.
@@ -635,7 +648,7 @@ class Worker:
             payload_bytes = env.get("payload") or b""
             inputs = self._codec.unmarshal(payload_bytes) if payload_bytes else {}
             snippet = inputs.pop("_snippet", "")
-            _corr_id_var.set(env.get("corr_id", ""))
+            _corr_id_var.set(corr_id)
             _origin_id_var.set(origin_id)
             _meta_var.set(dict(env.get("meta") or {}))
             try:
@@ -647,7 +660,7 @@ class Worker:
                     result = {"result": result}
                 return {
                     "proto_ver": 1, "msg_type": "res",
-                    "corr_id": env.get("corr_id", ""),
+                    "corr_id": corr_id,
                     "origin_id": origin_id, "worker_id": self.worker_id,
                     "cap": cap_name, "cap_ver": "",
                     "payload": self._codec.marshal(result),
@@ -659,18 +672,24 @@ class Worker:
 
         loaded = self.caps.get(cap_name)
         if not loaded:
+            log.error("cap not found [cap=%s corr_id=%s worker=%s]", cap_name, corr_id, self.worker_id)
             return self._err(env, "CAP_NOT_FOUND", f"capability {cap_name!r} not loaded")
 
         with _cancelled_lock:
             if origin_id in _cancelled_ids:
+                log.info("request cancelled before exec [cap=%s corr_id=%s]", cap_name, corr_id)
                 return self._err(env, "CANCELLED", "request cancelled")
 
-        _corr_id_var.set(env.get("corr_id", ""))
+        _corr_id_var.set(corr_id)
         _origin_id_var.set(origin_id)
         _meta_var.set(dict(env.get("meta") or {}))
         _config_var.set(loaded.spec.get("config") or {})
         _delivery_var.set(env.get("delivery_count", 0))
         _session_var.set(env.get("_session_data") or {})
+
+        t_start = time.monotonic()
+        log.info("exec start [cap=%s corr_id=%s worker=%s hop=%s]",
+                 cap_name, corr_id, self.worker_id, env.get("hop", 0))
 
         try:
             payload_bytes = env.get("payload") or b""
@@ -678,20 +697,27 @@ class Worker:
             with loaded.semaphore:
                 result = loaded.run(inputs)
             self.requests_served += 1
+            duration_ms = int((time.monotonic() - t_start) * 1000)
 
             # If cancelled while running, discard result and return CANCELLED.
             with _cancelled_lock:
                 if origin_id in _cancelled_ids:
+                    log.info("request cancelled after exec [cap=%s corr_id=%s duration_ms=%d]",
+                             cap_name, corr_id, duration_ms)
                     return self._err(env, "CANCELLED", "request cancelled")
 
             # Handle pipe forward: if forward_to is set, publish there and return None
             forward_to = env.get("forward_to", "")
             if forward_to:
+                log.info("exec done — forwarding [cap=%s corr_id=%s duration_ms=%d forward_to=%s]",
+                         cap_name, corr_id, duration_ms, forward_to)
                 fwd_env = {
                     "proto_ver": 1, "msg_type": "pipe",
-                    "corr_id": env["corr_id"], "origin_id": origin_id,
+                    "corr_id": corr_id, "origin_id": origin_id,
                     "worker_id": self.worker_id, "cap": cap_name,
                     "hop": env.get("hop", 0) + 1,
+                    "forward_to": forward_to,
+                    "topic": forward_to,
                     "payload": self._codec.marshal(result) if result is not None else b"",
                     "meta": _meta_var.get(),
                 }
@@ -699,16 +725,22 @@ class Worker:
                 return None
 
             if result is None:
+                log.info("exec done — no result [cap=%s corr_id=%s duration_ms=%d]",
+                         cap_name, corr_id, duration_ms)
                 return {}
 
+            log.info("exec done [cap=%s corr_id=%s worker=%s duration_ms=%d]",
+                     cap_name, corr_id, self.worker_id, duration_ms)
             return {
-                "proto_ver": 1, "msg_type": "res", "corr_id": env["corr_id"],
+                "proto_ver": 1, "msg_type": "res", "corr_id": corr_id,
                 "origin_id": origin_id, "worker_id": self.worker_id,
                 "cap": cap_name, "cap_ver": loaded.spec.get("cap_ver", ""),
                 "payload": self._codec.marshal(result), "meta": _meta_var.get(),
             }
         except Exception as exc:
-            log.exception("exec error in %s", cap_name)
+            duration_ms = int((time.monotonic() - t_start) * 1000)
+            log.exception("exec error [cap=%s corr_id=%s worker=%s duration_ms=%d error=%s]",
+                          cap_name, corr_id, self.worker_id, duration_ms, exc)
             return self._err(env, "EXEC_ERROR", str(exc))
 
     def _heartbeat_loop(self):

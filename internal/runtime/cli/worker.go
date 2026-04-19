@@ -81,6 +81,14 @@ func (w *BusWorker) Start(ctx context.Context) error {
 		return fmt.Errorf("cli.BusWorker %s: subscribe broadcast: %w", w.id, err)
 	}
 	go w.broadcastLoop(ctx, bcastCh)
+
+	// Per-worker direct push topic — receives requests pinned to this worker by the router.
+	directCh, err := w.bus.Subscribe(ctx, bus.TopicPush(w.id))
+	if err != nil {
+		return fmt.Errorf("cli.BusWorker %s: subscribe direct push: %w", w.id, err)
+	}
+	go w.serveLoop(ctx, directCh)
+
 	go w.heartbeatLoop(ctx)
 
 	w.logger.Fields("cap", w.capName, "groups", w.groups).Info("cli worker ready")
@@ -153,6 +161,26 @@ func (w *BusWorker) sendResult(env envelope.Envelope, out map[string]any) {
 		w.sendErr(env, envelope.ErrExecError, fmt.Sprintf("encode result: %v", err))
 		return
 	}
+
+	if env.ForwardTo != "" {
+		fwd := map[string]any{
+			"proto_ver":  uint8(1),
+			"msg_type":   "pipe",
+			"corr_id":    env.CorrID,
+			"origin_id":  env.OriginID,
+			"worker_id":  w.id,
+			"cap":        env.Cap,
+			"hop":        env.Hop + 1,
+			"forward_to": env.ForwardTo,
+			"topic":      env.ForwardTo,
+			"payload":    payload,
+			"meta":       env.Meta,
+		}
+		data, _ := w.codec.Marshal(fwd)
+		_ = w.bus.Publish(env.ForwardTo, data)
+		return
+	}
+
 	resp := map[string]any{
 		"proto_ver": uint8(1),
 		"msg_type":  string(envelope.MsgRes),
@@ -182,7 +210,11 @@ func (w *BusWorker) sendErr(env envelope.Envelope, code envelope.Code, msg strin
 		"retryable": code.Retryable(),
 	}
 	data, _ := w.codec.Marshal(errEnv)
-	_ = w.bus.Publish(bus.TopicRes(env.OriginID), data)
+	if env.ForwardTo != "" {
+		_ = w.bus.Publish(env.ForwardTo, data)
+	} else {
+		_ = w.bus.Publish(bus.TopicRes(env.OriginID), data)
+	}
 }
 
 func (w *BusWorker) broadcastLoop(ctx context.Context, ch <-chan bus.Message) {

@@ -521,20 +521,23 @@ func TestRealFullPipeline(t *testing.T) {
 		t.Fatalf("Compose: %v", err)
 	}
 
-	startCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	t.Log("Starting runtime (may download Whisper model on first run)...")
 	t0 := time.Now()
+	t.Log("Starting runtime (may download Whisper model on first run)...")
+	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer startCancel()
 	if err := pp.Start(startCtx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Logf("Runtime ready in %s", time.Since(t0).Round(time.Millisecond))
-	if err := waitForCaps(t, pp, startCtx, "audio.denoise", "speech.transcribe"); err != nil {
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer waitCancel()
+	if err := waitForCaps(t, pp, waitCtx, "audio.denoise", "speech.transcribe"); err != nil {
 		t.Fatalf("Python workers did not become ready: %v", err)
 	}
 
 	doCtx, doCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer doCancel()
 	defer doCancel()
 
 	t.Log("Executing full pipeline...")
@@ -697,21 +700,19 @@ def run(inputs: dict) -> dict:
 	}
 }
 
-// waitForCaps polls pp.Capabilities() until all named caps appear as registered,
-// or ctx is cancelled. This is needed because Start() returns as soon as ANY
-// worker is ready (including in-process adapter workers), but Python subprocess
-// workers take a few seconds to boot and send their cap_ready message.
+// waitForCaps polls pp.WorkerReady() until a live worker has announced cap_ready
+// for every named cap, or ctx is cancelled.
+//
+// Start() exits as soon as any worker is ready — including in-process adapter
+// workers (Ollama, HTTP) which register synchronously. Python subprocess workers
+// take a few extra seconds to boot, connect, and send cap_ready. Without this
+// wait, Do() races against worker startup and gets ErrNoWorkers.
 func waitForCaps(t *testing.T, pp *Pepper, ctx context.Context, caps ...string) error {
 	t.Helper()
 	for {
-		schemas := pp.Capabilities(ctx)
-		got := make(map[string]bool, len(schemas))
-		for _, s := range schemas {
-			got[s.Name] = true
-		}
 		all := true
 		for _, cap := range caps {
-			if !got[cap] {
+			if !pp.WorkerReady(cap) {
 				all = false
 				break
 			}
@@ -721,13 +722,14 @@ func waitForCaps(t *testing.T, pp *Pepper, ctx context.Context, caps ...string) 
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timed out waiting for caps %v (have: %v)", caps, func() []string {
-				keys := make([]string, 0, len(got))
-				for k := range got {
-					keys = append(keys, k)
+			// Report which caps are still missing.
+			missing := make([]string, 0, len(caps))
+			for _, cap := range caps {
+				if !pp.WorkerReady(cap) {
+					missing = append(missing, cap)
 				}
-				return keys
-			}())
+			}
+			return fmt.Errorf("timed out — caps still not ready: %v", missing)
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
@@ -861,6 +863,7 @@ func TestRealSongAnalysis(t *testing.T) {
 		),
 		WithDefaultTimeout(180*time.Second),
 		WithShutdownTimeout(15*time.Second),
+		WithTracking(true),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -962,54 +965,93 @@ func TestRealSongAnalysis(t *testing.T) {
 	}
 
 	// Start
-	startCtx, startCancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer startCancel()
-
-	t.Log("Starting runtime (may download Whisper model on first run)...")
 	t0 := time.Now()
+	t.Log("Starting runtime (may download Whisper model on first run)...")
+	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer startCancel()
 	if err := pp.Start(startCtx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Logf("Runtime ready in %s", time.Since(t0).Round(time.Millisecond))
 
-	// Wait for Python workers to register their caps. Start() returns as soon as
-	// any worker is ready (including the in-process Ollama adapter), but Python
-	// workers need a few seconds to boot and send cap_ready. Poll until both
-	// audio.convert and speech.transcribe appear as registered capabilities.
-	if err := waitForCaps(t, pp, startCtx, "audio.convert", "speech.transcribe"); err != nil {
+	// Wait for Python workers with a separate budget — up to 120 s covers cold
+	// model download. Fresh context so pipeline execution gets its full timeout.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer waitCancel()
+	if err := waitForCaps(t, pp, waitCtx, "audio.convert", "speech.transcribe"); err != nil {
 		t.Fatalf("Python workers did not become ready: %v", err)
 	}
 	t.Logf("Python workers ready in %s", time.Since(t0).Round(time.Millisecond))
 
-	// Execute
+	// Fresh 180 s budget starting from when workers are confirmed ready.
 	doCtx, doCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer doCancel()
 
 	t.Logf("Running pipeline on: %s", mp3Path)
 	p0 := time.Now()
-	result, err := pp.Do(doCtx, "song.pipeline", core.In{
+
+	processID, err := pp.Track(doCtx, "song.pipeline", core.In{
 		"audio_path": mp3Path,
 	})
+	if err != nil {
+		t.Fatalf("Track song.pipeline: %v", err)
+	}
+	t.Logf("Process ID: %s", processID)
+
+	// Stream stage events live as they happen.
+	stageCh := pp.WatchProcess(processID)
+	if stageCh != nil {
+		go func() {
+			for action := range stageCh {
+				switch action.Status {
+				case "running":
+					t.Logf("  → stage started  : %-24s worker=%s", action.Stage, action.WorkerID)
+				case "done":
+					t.Logf("  ✓ stage done     : %-24s worker=%s duration=%dms", action.Stage, action.WorkerID, action.DurationMs)
+				case "failed":
+					t.Logf("  ✗ stage failed   : %-24s worker=%s duration=%dms error=%s", action.Stage, action.WorkerID, action.DurationMs, action.Error)
+				}
+			}
+		}()
+	}
+
+	// Block until the pipeline result is available or the context expires.
+	result, err := pp.ResultOf(doCtx, processID)
 	pipelineLatency := time.Since(p0)
 
+	// Always snapshot the tracker state for the timeline — useful even on failure.
+	finalState, _ := pp.CheckProcess(processID)
+	t.Logf("── Pipeline timeline ────────────────────────────")
+	t.Logf("Process status  : %s", finalState.Status)
+	t.Logf("Total latency   : %s", pipelineLatency.Round(time.Millisecond))
+	t.Logf("Percent done    : %d%%", finalState.PercentDone)
+	if len(finalState.Actions) == 0 {
+		t.Logf("  (no stages recorded — pipeline may not have reached any worker)")
+	}
+	for i, a := range finalState.Actions {
+		if a.Status == "running" {
+			t.Logf("  stage[%d] %-24s STILL RUNNING (started %s ago)",
+				i, a.Stage, time.Since(a.StartedAt).Round(time.Millisecond))
+		} else {
+			t.Logf("  stage[%d] %-24s %-8s %dms  worker=%s",
+				i, a.Stage, a.Status, a.DurationMs, a.WorkerID)
+		}
+	}
+	t.Logf("────────────────────────────────────────────────")
+
 	if err != nil {
-		t.Fatalf("Do song.pipeline: %v", err)
+		t.Fatalf("ResultOf: %v", err)
 	}
 
 	out := result.AsJSON()
-	t.Logf("── Song analysis result ─────────────────────────")
-	t.Logf("Total latency : %s", pipelineLatency.Round(time.Millisecond))
-	t.Logf("Hops          : %d", result.Hop)
-
-	// Print the analysis — this is the value: seeing what the LLM says.
+	t.Logf("Hops            : %d", result.Hop)
 	for _, key := range []string{"analysis", "response", "message"} {
 		if v, ok := out[key]; ok {
-			t.Logf("LLM analysis  :\n%v", v)
+			t.Logf("LLM analysis    :\n%v", v)
 			break
 		}
 	}
 
-	// Soft assertion: we got something back from the LLM.
 	hasOutput := false
 	for _, key := range []string{"analysis", "response", "message"} {
 		if _, ok := out[key]; ok {
@@ -1018,13 +1060,11 @@ func TestRealSongAnalysis(t *testing.T) {
 		}
 	}
 	if !hasOutput {
-		t.Errorf("expected analysis/response/message in output, got keys: %v", func() []string {
-			keys := make([]string, 0, len(out))
-			for k := range out {
-				keys = append(keys, k)
-			}
-			return keys
-		}())
+		keys := make([]string, 0, len(out))
+		for k := range out {
+			keys = append(keys, k)
+		}
+		t.Errorf("expected analysis/response/message in output, got keys: %v", keys)
 	}
 }
 

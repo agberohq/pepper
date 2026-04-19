@@ -92,6 +92,10 @@ type Config struct {
 	// Strategy controls worker selection for DispatchAny. Default: CapAffinity.
 	Strategy StrategyType
 
+	// Tracking enables the built-in ProcessTracker.
+	// When true, pp.Track(), pp.CheckProcess(), and pp.WatchProcess() are available.
+	Tracking bool
+
 	// Logger
 	logger *ll.Logger
 }
@@ -271,6 +275,13 @@ const (
 	// RoundRobin cycles through available workers in registration order.
 	RoundRobin StrategyType = "round_robin"
 )
+
+// WithTracking enables the built-in ProcessTracker.
+// When true, pp.Track(), pp.CheckProcess(), and pp.WatchProcess() become available.
+// The tracker is registered as a global hook automatically — no manual hook wiring needed.
+func WithTracking(enabled bool) Option {
+	return func(c *Config) { c.Tracking = enabled }
+}
 
 // WithStrategy sets the worker selection strategy used for DispatchAny.
 // Default: CapAffinity.

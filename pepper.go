@@ -16,9 +16,11 @@ import (
 	"github.com/agberohq/pepper/internal/pending"
 	"github.com/agberohq/pepper/internal/registry"
 	"github.com/agberohq/pepper/internal/storage"
+	"github.com/agberohq/pepper/internal/tracker"
 	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
+	"github.com/olekukonko/mappo"
 )
 
 type Pepper struct {
@@ -27,14 +29,16 @@ type Pepper struct {
 	sessions storage.Store
 	mu       sync.RWMutex
 
-	reg      *registry.Registry
-	pending  *pending.Map
-	hooks    *hooks.Registry
-	rt       *runtimeState
-	shutdown *jack.Shutdown
-	logger   *ll.Logger
-	started  bool
-	stopped  bool
+	reg            *registry.Registry
+	pending        *pending.Map
+	hooks          *hooks.Registry
+	tracker        *tracker.Tracker                  // nil when WithTracking(false)
+	processResults *mappo.Concurrent[string, Result] // nil when WithTracking(false)
+	rt             *runtimeState
+	shutdown       *jack.Shutdown
+	logger         *ll.Logger
+	started        bool
+	stopped        bool
 }
 
 func New(opts ...Option) (*Pepper, error) {
@@ -59,9 +63,19 @@ func New(opts ...Option) (*Pepper, error) {
 	if logger == nil {
 		logger = ll.New("pepper").Enable()
 	}
+
+	hooksReg := hooks.NewRegistry()
+	var trk *tracker.Tracker
+	var procResults *mappo.Concurrent[string, Result]
+	if cfg.Tracking {
+		trk = tracker.New()
+		hooksReg.Global().Add(trk.Hook())
+		procResults = mappo.NewConcurrent[string, Result]()
+	}
+
 	return &Pepper{
 		cfg: cfg, codec: c, reg: registry.New(), pending: pending.New(),
-		hooks: hooks.NewRegistry(), sessions: sess, shutdown: sd,
+		hooks: hooksReg, tracker: trk, processResults: procResults, sessions: sess, shutdown: sd,
 		logger: logger,
 	}, nil
 }
@@ -214,6 +228,21 @@ func (p *Pepper) Session(id string) *Session { return &Session{id: id, pp: p} }
 
 func (p *Pepper) Capabilities(ctx context.Context, filters ...registry.Filter) []registry.Schema {
 	return p.reg.Schemas(filters...)
+}
+
+// WorkerReady reports whether at least one live worker has announced it is ready
+// to handle cap. This becomes true only after the worker connects, receives
+// cap_load, and replies with cap_ready — it is false for specs that are merely
+// registered but whose worker process has not yet started.
+//
+// Use this to wait for Python subprocess workers after Start() returns, since
+// Start() exits as soon as any worker (including in-process adapter workers)
+// is ready, which may precede Python worker startup.
+func (p *Pepper) WorkerReady(cap string) bool {
+	if p.rt == nil || p.rt.router == nil {
+		return false
+	}
+	return p.rt.router.HasCapWorker(cap)
 }
 
 func (p *Pepper) ensureStarted() error {
@@ -446,3 +475,94 @@ func (p *Pepper) dispatchStream(ctx context.Context, cap string, in core.In, opt
 	p.logger.Fields("cap", cap, "corr_id", corrID).Debug("stream established")
 	return &Stream{ch: ch, c: p.codec}, nil
 }
+
+// Process Tracking
+
+// Track dispatches cap with the given inputs and returns a processID immediately.
+// The process runs asynchronously. Use CheckProcess or WatchProcess to observe it.
+// Requires WithTracking(true) — returns ("", ErrTrackingDisabled) otherwise.
+func (p *Pepper) Track(ctx context.Context, cap string, in core.In, opts ...CallOption) (string, error) {
+	if p.tracker == nil {
+		return "", ErrTrackingDisabled
+	}
+
+	processID := ulid.Make().String()
+
+	// Inject _process_id into call meta so hooks can find this process.
+	opts = append(opts, WithMeta("_process_id", processID))
+
+	// Determine total stages: 1 for plain caps, worker-dispatched stage count for pipelines.
+	totalStages := 1
+	if spec := p.reg.Get(cap); spec != nil {
+		if dag, ok := spec.Pipeline.(*compose.DAG); ok {
+			totalStages = dag.WorkerStageCount()
+		}
+	}
+
+	p.tracker.RegisterProcess(processID, cap, totalStages)
+
+	go func() {
+		result, err := p.Do(ctx, cap, in, opts...)
+		if err != nil {
+			p.tracker.FailProcess(processID, err)
+			return
+		}
+		// Store the result so ResultOf() can retrieve it without re-running.
+		p.processResults.Set(processID, result)
+	}()
+
+	return processID, nil
+}
+
+// ResultOf returns the Result from a completed tracked process.
+// Blocks until the process is done or ctx is cancelled.
+// Returns ErrTrackingDisabled if tracking is off, or an error if the
+// process failed or the context expired before completion.
+func (p *Pepper) ResultOf(ctx context.Context, processID string) (Result, error) {
+	if p.tracker == nil {
+		return Result{}, ErrTrackingDisabled
+	}
+	for {
+		if r, ok := p.processResults.Get(processID); ok {
+			return r, nil
+		}
+		// Check if process failed.
+		if state, ok := p.tracker.Check(processID); ok {
+			if state.Status == "failed" {
+				return Result{}, fmt.Errorf("%s", state.Error)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// CheckProcess returns a point-in-time snapshot of a tracked process.
+// Returns zero Process and false if processID is unknown or tracking is disabled.
+func (p *Pepper) CheckProcess(processID string) (tracker.Process, bool) {
+	if p.tracker == nil {
+		return tracker.Process{}, false
+	}
+	return p.tracker.Check(processID)
+}
+
+// WatchProcess returns a channel that receives one tracker.Action per stage event.
+// The channel is closed when the process reaches StatusDone or StatusFailed.
+// Returns nil if processID is unknown or tracking is disabled.
+//
+//	ch := pp.WatchProcess(id)
+//	for action := range ch {
+//	    fmt.Printf("%s → %s (%dms)\n", action.Stage, action.Status, action.DurationMs)
+//	}
+func (p *Pepper) WatchProcess(processID string) <-chan tracker.Action {
+	if p.tracker == nil {
+		return nil
+	}
+	return p.tracker.Watch(processID)
+}
+
+// ErrTrackingDisabled is returned by Track when WithTracking(true) was not set.
+var ErrTrackingDisabled = fmt.Errorf("pepper: process tracking is disabled — use WithTracking(true)")

@@ -204,6 +204,15 @@ func buildEnvelope(corrID, originID, cap string, in core.In, o callOpts, default
 		deadlineMs = time.Now().Add(defaultTimeout).UnixMilli()
 	}
 	env.DeadlineMs = deadlineMs
+	// Merge per-call meta (e.g. "_process_id" injected by Track()).
+	if len(o.meta) > 0 {
+		if env.Meta == nil {
+			env.Meta = make(map[string]any, len(o.meta))
+		}
+		for k, v := range o.meta {
+			env.Meta[k] = v
+		}
+	}
 	return env
 }
 

@@ -1,3 +1,5 @@
+> WARNING: This project is under active development.
+
 # 🌶️ Pepper
 
 **The high-performance, zero-copy distributed runtime for the AI era.**

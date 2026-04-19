@@ -74,6 +74,16 @@ func (w *BusWorker) Start(ctx context.Context) error {
 		}
 		go w.serveLoop(ctx, pubCh)
 	}
+
+	// Subscribe to a per-worker push topic so the router can route directly
+	// to this adapter without competing with Python workers on the group queue.
+	// The router uses pepper.push.{workerID} when WorkerID is set in the envelope.
+	directCh, err := w.bus.Subscribe(ctx, bus.TopicPush(w.id))
+	if err != nil {
+		return fmt.Errorf("adapter.BusWorker %s: subscribe direct push: %w", w.id, err)
+	}
+	go w.serveLoop(ctx, directCh)
+
 	bcastCh, err := w.bus.Subscribe(ctx, bus.TopicBroadcast)
 	if err != nil {
 		return fmt.Errorf("adapter.BusWorker %s: subscribe broadcast: %w", w.id, err)
@@ -96,6 +106,15 @@ func (w *BusWorker) serveLoop(ctx context.Context, ch <-chan bus.Message) {
 			if !ok {
 				return
 			}
+			// Peek at cap before spawning goroutine — log non-matching silently.
+			var peek struct {
+				Cap string `msgpack:"cap"`
+			}
+			if w.codec.Unmarshal(msg.Data, &peek) == nil && peek.Cap != "" && peek.Cap != w.capName {
+				// Not for us — another cap on a shared group topic.
+				continue
+			}
+			w.logger.Fields("cap", peek.Cap).Debug("adapter message dequeued")
 			go w.handle(ctx, msg)
 		}
 	}
@@ -124,15 +143,20 @@ func (w *BusWorker) handle(ctx context.Context, msg bus.Message) {
 	if in == nil {
 		in = map[string]any{}
 	}
+	w.logger.Fields("cap", env.Cap, "corr_id", env.CorrID, "forward_to", env.ForwardTo).Info("adapter exec start")
+
 	reqCtx, cancel := context.WithDeadline(ctx, time.UnixMilli(env.DeadlineMs))
 	defer cancel()
 
+	t0 := time.Now()
 	w.load.Add(1)
 	out, err := w.runner.Run(reqCtx, in)
 	w.load.Add(-1)
 	w.requestsServed.Add(1)
+	durationMs := time.Since(t0).Milliseconds()
 
 	if err != nil {
+		w.logger.Fields("cap", env.Cap, "corr_id", env.CorrID, "duration_ms", durationMs, "error", err).Warn("adapter exec error")
 		code := envelope.ErrExecError
 		if reqCtx.Err() != nil {
 			code = envelope.ErrDeadlineExceeded
@@ -140,6 +164,7 @@ func (w *BusWorker) handle(ctx context.Context, msg bus.Message) {
 		w.sendErr(env, code, err.Error())
 		return
 	}
+	w.logger.Fields("cap", env.Cap, "corr_id", env.CorrID, "duration_ms", durationMs, "forward_to", env.ForwardTo).Info("adapter exec done")
 	w.sendResult(env, out)
 }
 
@@ -149,6 +174,26 @@ func (w *BusWorker) sendResult(env envelope.Envelope, out map[string]any) {
 		w.sendErr(env, envelope.ErrExecError, fmt.Sprintf("encode result: %v", err))
 		return
 	}
+
+	if env.ForwardTo != "" {
+		fwd := map[string]any{
+			"proto_ver":  uint8(1),
+			"msg_type":   "pipe",
+			"corr_id":    env.CorrID,
+			"origin_id":  env.OriginID,
+			"worker_id":  w.id,
+			"cap":        env.Cap,
+			"hop":        env.Hop + 1,
+			"forward_to": env.ForwardTo,
+			"topic":      env.ForwardTo,
+			"payload":    payload,
+			"meta":       env.Meta,
+		}
+		data, _ := w.codec.Marshal(fwd)
+		_ = w.bus.Publish(env.ForwardTo, data)
+		return
+	}
+
 	resp := map[string]any{
 		"proto_ver": uint8(1), "msg_type": string(envelope.MsgRes),
 		"corr_id": env.CorrID, "origin_id": env.OriginID,
@@ -167,7 +212,11 @@ func (w *BusWorker) sendErr(env envelope.Envelope, code envelope.Code, msg strin
 		"code": string(code), "message": msg, "retryable": code.Retryable(),
 	}
 	data, _ := w.codec.Marshal(errEnv)
-	_ = w.bus.Publish(bus.TopicRes(env.OriginID), data)
+	if env.ForwardTo != "" {
+		_ = w.bus.Publish(env.ForwardTo, data)
+	} else {
+		_ = w.bus.Publish(bus.TopicRes(env.OriginID), data)
+	}
 }
 
 func (w *BusWorker) broadcastLoop(ctx context.Context, ch <-chan bus.Message) {

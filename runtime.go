@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -349,6 +350,7 @@ func (p *Pepper) handleControl(data []byte) {
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: env.Groups()})
 		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Groups: env.Groups()})
 		p.registerWorkerPatient(wid)
+		p.logger.Fields("worker", wid, "groups", env.Groups(), "runtime", env["runtime"]).Info("worker connected")
 
 		if p.cfg.Metrics != nil {
 			p.cfg.Metrics.Gauge(metrics.MetricWorkersCount, 1, map[string]string{"worker": wid})
@@ -376,6 +378,7 @@ func (p *Pepper) handleControl(data []byte) {
 				e.caps = append(e.caps, env.Cap())
 				e.ready = true
 			}
+			p.logger.Fields("worker", env.WorkerID(), "cap", env.Cap()).Info("capability ready")
 		} else {
 			p.logger.Fields("worker", env.WorkerID(), "cap", env.Cap(), "error", errStr).Error("capability failed to load")
 		}
@@ -410,22 +413,93 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 		return Result{}, err
 	}
 
-	// Initial stage
+	p.logger.Fields(
+		"pipeline", name,
+		"origin_id", originID,
+		"stages", dag.StageCount(),
+		"group", o.group,
+	).Debug("dispatching pipeline request")
+
+	// processID for per-stage tracker events — extracted once from call meta.
+	processID, _ := o.meta["_process_id"].(string)
+
+	// advanceStage runs router-side stages (Transform, Return) inline and
+	// dispatches the next worker-side stage. Returns when a worker stage is
+	// dispatched (done=false) or the pipeline is complete (done=true).
+	advanceStage := func(env envelope.Envelope, startIdx int) (Result, int, bool, error) {
+		stageIdx := startIdx
+		for stageIdx < dag.StageCount() {
+			err := dag.DispatchEnvelope(&env, stageIdx)
+			if err == nil {
+				// Worker-side stage — send to bus.
+				env.CorrID = ulid.Make().String()
+				env.MsgType = envelope.MsgReq
+				if env.Dispatch == "" {
+					env.Dispatch = envelope.DispatchAny
+				}
+				// If this is the final stage, ForwardTo is empty — the worker
+				// would reply to pepper.res.* which dispatchPipeline doesn't
+				// listen on. Force a final pipe topic so the result still
+				// arrives on stageCh.
+				if env.ForwardTo == "" {
+					env.ForwardTo = "pepper.pipe." + sanitizeName(name) + ".final"
+				}
+				// Record stage dispatch in tracker.
+				if p.tracker != nil && processID != "" {
+					p.tracker.RecordStageDispatched(processID, env.Cap, env.CorrID)
+				}
+				if err := p.rt.router.Dispatch(ctx, env); err != nil {
+					return Result{}, stageIdx, false, err
+				}
+				p.logger.Fields("pipeline", name, "origin_id", originID, "stage", stageIdx, "cap", env.Cap, "forward_to", env.ForwardTo).Debug("pipeline stage dispatched")
+				return Result{}, stageIdx + 1, false, nil
+			}
+
+			if !errors.Is(err, compose.ErrRouterSideStage) {
+				return Result{}, stageIdx, false, err
+			}
+
+			// Router-side stage — execute inline.
+			kind, _ := dag.StageKind(stageIdx)
+			switch kind {
+			case compose.StageTransform:
+				fn, _ := dag.TransformFn(stageIdx)
+				var inMap map[string]any
+				if uerr := p.codec.Unmarshal(env.Payload, &inMap); uerr != nil {
+					return Result{}, stageIdx, false, fmt.Errorf("pipeline %q stage %d transform unmarshal: %w", name, stageIdx, uerr)
+				}
+				outMap, terr := fn(env, inMap)
+				if terr != nil {
+					return Result{}, stageIdx, false, fmt.Errorf("pipeline %q stage %d transform: %w", name, stageIdx, terr)
+				}
+				env.Payload, _ = p.codec.Marshal(outMap)
+				p.logger.Fields("pipeline", name, "origin_id", originID, "stage", stageIdx).Debug("pipeline transform stage executed")
+
+			case compose.StageReturn:
+				val, _ := dag.ReturnValue(stageIdx)
+				env.Payload, _ = p.codec.Marshal(val)
+				return Result{payload: env.Payload, codec: p.codec, Cap: env.Cap, Meta: env.Meta, Hop: env.Hop}, stageIdx, true, nil
+			}
+			stageIdx++
+		}
+
+		// All stages consumed — pipeline is done.
+		return Result{payload: env.Payload, codec: p.codec, Cap: env.Cap, Meta: env.Meta, Hop: env.Hop}, stageIdx, true, nil
+	}
+
+	// Build the initial envelope and run through any leading router-side stages.
 	env := buildEnvelope(ulid.Make().String(), originID, "", in, o, p.cfg.DefaultTimeout)
-	if err := dag.DispatchEnvelope(&env, 0); err != nil {
+	env.Payload, _ = p.codec.Marshal(in)
+
+	res, nextStageIdx, done, err := advanceStage(env, 0)
+	if err != nil {
 		return Result{}, err
 	}
-
-	payload, _ := p.codec.Marshal(in)
-	env.Payload = payload
-	env.MsgType = envelope.MsgReq
-	env.Dispatch = envelope.DispatchAny
-
-	if err := p.rt.router.Dispatch(ctx, env); err != nil {
-		return Result{}, err
+	if done {
+		p.logger.Fields("pipeline", name, "origin_id", originID).Info("pipeline completed (router-only)")
+		return res, nil
 	}
 
-	// Pipeline execution loop
 	var finalResult Result
 	timeout := time.NewTimer(time.Until(time.UnixMilli(env.DeadlineMs)))
 	defer timeout.Stop()
@@ -433,43 +507,84 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	for {
 		select {
 		case <-ctx.Done():
+			p.logger.Fields("pipeline", name, "origin_id", originID, "next_stage", nextStageIdx).Warn("pipeline cancelled by context")
 			return Result{}, ctx.Err()
 		case <-timeout.C:
+			p.logger.Fields("pipeline", name, "origin_id", originID, "next_stage", nextStageIdx, "deadline_ms", env.DeadlineMs).Warn("pipeline deadline exceeded")
 			return Result{}, fmt.Errorf("pipeline deadline exceeded")
 		case msg, ok := <-stageCh:
 			if !ok {
+				p.logger.Fields("pipeline", name, "origin_id", originID, "next_stage", nextStageIdx).Warn("pipeline channel closed unexpectedly")
 				return Result{}, fmt.Errorf("pipeline channel closed")
 			}
 			var raw map[string]any
 			if err := p.codec.Unmarshal(msg.Data, &raw); err != nil {
+				p.logger.Fields("pipeline", name, "origin_id", originID, "error", err).Warn("pipeline stage unmarshal error — skipping")
 				continue
 			}
-			res := envelope.Data(raw)
+			r := envelope.Data(raw)
 
-			// Register blobs
-			for _, bid := range res.Blobs() {
+			// Ignore messages from other concurrent pipeline runs on the same prefix.
+			if r.OriginID() != originID {
+				continue
+			}
+
+			p.logger.Fields(
+				"pipeline", name,
+				"origin_id", originID,
+				"next_stage", nextStageIdx,
+				"cap", r.Cap(),
+				"worker", r.WorkerID(),
+				"hop", r.Hop(),
+				"msg_type", r.MsgType(),
+			).Debug("pipeline stage message received")
+
+			// Register blobs so they live until the pipeline deadline.
+			for _, bid := range r.Blobs() {
 				p.rt.blobReaper.TouchAt(bid, time.UnixMilli(env.DeadlineMs))
 			}
 
-			if res.MsgType() == "err" {
-				return Result{}, &WorkerError{Code: res.Code(), Message: res.Message()}
+			if r.MsgType() == "err" {
+				p.logger.Fields("pipeline", name, "origin_id", originID, "cap", r.Cap(), "code", r.Code(), "error", r.Message()).Error("pipeline stage failed")
+				if p.tracker != nil && processID != "" {
+					p.tracker.RecordStageDone(processID, r.Cap(), r.WorkerID(), true, r.Message())
+				}
+				return Result{}, &WorkerError{Code: r.Code(), Message: r.Message()}
 			}
 
-			if payload := res.Payload(); len(payload) > 0 {
+			if payload := r.Payload(); len(payload) > 0 {
 				finalResult.payload = payload
 				finalResult.codec = p.codec
 			}
-			finalResult.WorkerID = res.WorkerID()
-			finalResult.Cap = res.Cap()
-			finalResult.Meta = res.Meta()
-			finalResult.Hop = res.Hop()
+			finalResult.WorkerID = r.WorkerID()
+			finalResult.Cap = r.Cap()
+			finalResult.Meta = r.Meta()
+			finalResult.Hop = r.Hop()
 
-			if res.ForwardTo() != "" || res.GatherAt() != "" {
-				// Advance stage (simplified for demonstration; full impl tracks state)
-				continue
+			// Record successful stage completion.
+			if p.tracker != nil && processID != "" {
+				p.tracker.RecordStageDone(processID, r.Cap(), r.WorkerID(), false, "")
 			}
-			// Pipeline complete
-			return finalResult, nil
+
+			// Carry worker result into next stage envelope.
+			nextEnv := env
+			nextEnv.Hop = r.Hop()
+			nextEnv.Meta = r.Meta()
+			nextEnv.Payload = r.Payload()
+
+			res, nextIdx, done, err := advanceStage(nextEnv, nextStageIdx)
+			if err != nil {
+				return Result{}, err
+			}
+			if done {
+				// Prefer final worker result over router-only result for WorkerID.
+				if finalResult.WorkerID != "" {
+					res.WorkerID = finalResult.WorkerID
+				}
+				p.logger.Fields("pipeline", name, "origin_id", originID, "worker", res.WorkerID).Info("pipeline completed")
+				return res, nil
+			}
+			nextStageIdx = nextIdx
 		}
 	}
 }

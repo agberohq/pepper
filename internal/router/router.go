@@ -243,7 +243,13 @@ func (r *Router) Dispatch(ctx context.Context, env envelope.Envelope) error {
 	var busErr error
 	switch env.Dispatch {
 	case envelope.DispatchAny:
-		busErr = r.bus.PushOne(ctx, bus.TopicPush(env.Group), data)
+		if env.WorkerID != "" {
+			// Route directly to the pinned worker's own push topic so it
+			// doesn't compete with other workers on the shared group queue.
+			busErr = r.bus.PushOne(ctx, bus.TopicPush(env.WorkerID), data)
+		} else {
+			busErr = r.bus.PushOne(ctx, bus.TopicPush(env.Group), data)
+		}
 	default:
 		busErr = r.bus.Publish(bus.TopicPub(env.Group), data)
 	}
@@ -427,6 +433,23 @@ func (r *Router) WorkersInGroup(group string) []string {
 
 func (r *Router) WorkerCountInGroup(group string) int {
 	return len(r.WorkersInGroup(group))
+}
+
+// HasCapWorker reports whether at least one live worker has sent cap_ready for cap.
+// Used by Pepper.WorkerReady() to let callers poll after Start().
+func (r *Router) HasCapWorker(cap string) bool {
+	r.mu.RLock()
+	affinity := r.capAffinity[cap]
+	r.mu.RUnlock()
+	for _, id := range affinity {
+		r.mu.RLock()
+		ws, ok := r.workers[id]
+		r.mu.RUnlock()
+		if ok && ws.State.Load().(WorkerHealthState) == WorkerStateReady {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Router) addToGroup(group, workerID string) {

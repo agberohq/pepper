@@ -172,6 +172,27 @@ func (b *Mula) subscribe(ctx context.Context, topic string) (<-chan Message, err
 	b.mu.Lock()
 	b.localSubs[topic] = append(b.localSubs[topic], ls)
 	b.mu.Unlock()
+
+	// For push topics, also drain the push queue into this local subscriber
+	// so in-process Go workers (adapter, goruntime, cli) receive PushOne messages
+	// the same way TCP-connected Python workers do via drainPushToSubscriber.
+	if strings.HasPrefix(topic, "pepper.push.") {
+		go func() {
+			q := b.getOrCreatePushQ(topic)
+			for {
+				select {
+				case <-b.stopCh:
+					return
+				case <-ctx.Done():
+					return
+				case data := <-q.ch:
+					msg := Message{Topic: topic, Data: data}
+					_ = sendWithTimeout(ls.ch, msg, 50*time.Millisecond)
+				}
+			}
+		}()
+	}
+
 	go func() {
 		<-ctx.Done()
 		b.mu.Lock()

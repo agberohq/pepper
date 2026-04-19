@@ -33,6 +33,7 @@ type callOpts struct {
 	sessionID  string
 	maxHops    uint8
 	maxCbDepth uint8
+	meta       map[string]any // extra envelope Meta entries
 }
 
 func defaultCallOpts() callOpts {
@@ -102,6 +103,18 @@ func WithCallMaxHops(n uint8) CallOption {
 // WithCallMaxCbDepth overrides the callback nesting limit for this request.
 func WithCallMaxCbDepth(n uint8) CallOption {
 	return func(o *callOpts) { o.maxCbDepth = n }
+}
+
+// WithMeta injects a key/value pair into the envelope Meta for this request.
+// Multiple calls accumulate. Reserved keys prefixed with "_" are used internally
+// (e.g. "_process_id" for the tracker).
+func WithMeta(key string, value any) CallOption {
+	return func(o *callOpts) {
+		if o.meta == nil {
+			o.meta = make(map[string]any)
+		}
+		o.meta[key] = value
+	}
 }
 
 // Dispatch mode constants (re-exported for call sites)

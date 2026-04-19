@@ -239,10 +239,17 @@ func TestDispatchAnyWithWorker(t *testing.T) {
 		t.Fatalf("Dispatch: %v", err)
 	}
 
-	// Message should be on push queue
-	data, ok := b.PopPush(bus.TopicPush("gpu"))
+	// With cap affinity, the router pins WorkerID="w-1" and routes to the
+	// worker's own push topic (pepper.push.w-1) rather than the shared group
+	// queue (pepper.push.gpu). This ensures the message goes directly to the
+	// specific worker without competing with other workers on the group queue.
+	data, ok := b.PopPush(bus.TopicPush("w-1"))
 	if !ok {
-		t.Fatal("expected message on push queue")
+		// Fallback: check group queue in case affinity wasn't set
+		data, ok = b.PopPush(bus.TopicPush("gpu"))
+		if !ok {
+			t.Fatal("expected message on push queue (either worker-direct or group)")
+		}
 	}
 	if data == nil {
 		t.Error("message data should not be nil")

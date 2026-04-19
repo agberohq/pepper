@@ -47,6 +47,20 @@ type DAG struct {
 // StageCount returns the number of stages in the pipeline.
 func (d *DAG) StageCount() int { return len(d.Stages) }
 
+// WorkerStageCount returns the number of stages that require worker dispatch
+// (Dispatch and Scatter). Router-side stages (Transform, Branch, Return,
+// Parallel) are excluded since they never touch the tracker or the bus.
+func (d *DAG) WorkerStageCount() int {
+	count := 0
+	for i := range d.Stages {
+		k, _ := d.StageKind(i)
+		if k == StageDispatch || k == StageScatter {
+			count++
+		}
+	}
+	return count
+}
+
 // StageKind returns the execution kind of the stage at the given index.
 func (d *DAG) StageKind(stageIdx int) (StageKind, error) {
 	if stageIdx < 0 || stageIdx >= len(d.Stages) {

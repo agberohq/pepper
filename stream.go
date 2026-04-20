@@ -16,14 +16,10 @@ type Stream struct {
 }
 
 // Chunks returns a channel that receives decoded Result chunks.
-// The channel is closed when the stream ends (res_end) or ctx is cancelled.
+// Closed when the stream ends or ctx is cancelled.
 // ctx MUST be passed — without it a stopped consumer leaks the goroutine.
 func (s *Stream) Chunks(ctx context.Context) <-chan Result {
-	buf := cap(s.ch)
-	if buf < 1 {
-		buf = 1
-	}
-	out := make(chan Result, buf)
+	out := make(chan Result, DefaultStreamChanBuffer)
 	go func() {
 		defer close(out)
 		for {

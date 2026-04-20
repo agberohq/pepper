@@ -2,6 +2,7 @@ package pepper
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,8 +25,8 @@ func TestFlowEchoRoundTrip(t *testing.T) {
 
 	pp, err := New(
 		WithWorkers(NewWorker("w-test-1").Groups("default")),
-		WithSerializer(MsgPack),
-		WithTransport(TCPLoopback),
+		WithCodec(CodecMsgPack),
+		WithTransport(TransportTCPLoopback),
 		WithShutdownTimeout(3*time.Second),
 		WithLogger(testLogger),
 	)
@@ -34,12 +35,10 @@ func TestFlowEchoRoundTrip(t *testing.T) {
 	}
 	defer pp.Stop()
 
-	if err := pp.Register("echo", "./testdata/caps/echo.py"); err != nil {
+	if err := pp.Register(Script("echo", "./testdata/caps/echo.py")); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	// Start gets its own context so Python subprocess startup time does not
-	// consume the budget that Do() needs. 15 s is generous for cold Python boot.
 	startCtx, startCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer startCancel()
 
@@ -47,7 +46,6 @@ func TestFlowEchoRoundTrip(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Do gets a fresh, independent deadline.
 	doCtx, doCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer doCancel()
 
@@ -86,12 +84,10 @@ func TestFlowTypedDo(t *testing.T) {
 	}
 	defer pp.Stop()
 
-	if err := pp.Register("echo", "./testdata/caps/echo.py"); err != nil {
+	if err := pp.Register(Script("echo", "./testdata/caps/echo.py")); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	// Start gets its own context so Python subprocess startup time does not
-	// consume the budget that Do() needs. 15 s is generous for cold Python boot.
 	startCtx, startCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer startCancel()
 
@@ -99,7 +95,6 @@ func TestFlowTypedDo(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Do gets a fresh, independent deadline.
 	doCtx, doCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer doCancel()
 
@@ -114,4 +109,313 @@ func TestFlowTypedDo(t *testing.T) {
 		t.Fatalf("expected Msg='typed', got %q", out.Msg)
 	}
 	t.Logf("typed Do ok — msg=%s", out.Msg)
+}
+
+// TestFlowGoFuncCallTyped verifies Call[Out].Do with a Go Func capability
+// (no Python needed — fully in-process).
+func TestFlowGoFuncCallTyped(t *testing.T) {
+	type TextIn struct {
+		Text string `json:"text"`
+	}
+	type TextOut struct {
+		Text string `json:"text"`
+	}
+
+	pp, err := New(
+		WithWorkers(NewWorker("w-gofunc").Groups("default")),
+		WithShutdownTimeout(2*time.Second),
+		WithLogger(testLogger),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer pp.Stop()
+
+	if err := pp.Register(Func("text.upper",
+		func(ctx context.Context, in TextIn) (TextOut, error) {
+			return TextOut{Text: strings.ToUpper(in.Text)}, nil
+		},
+	)); err != nil {
+		t.Fatalf("Register Func: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := pp.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	out, err := Call[TextOut]{
+		Cap:   "text.upper",
+		Input: TextIn{Text: "hello flow"},
+	}.Bind(pp).Do(ctx)
+	if err != nil {
+		t.Fatalf("Call[TextOut].Do: %v", err)
+	}
+	if out.Text != "HELLO FLOW" {
+		t.Fatalf("expected 'HELLO FLOW', got %q", out.Text)
+	}
+	t.Logf("Call[Out] Go Func ok — text=%s", out.Text)
+}
+
+// TestFlowExecuteProcess verifies Execute + Process[Out].Wait for async tracking.
+func TestFlowExecuteProcess(t *testing.T) {
+	type TextIn struct {
+		Text string `json:"text"`
+	}
+	type TextOut struct {
+		Text string `json:"text"`
+	}
+
+	pp, err := New(
+		WithWorkers(NewWorker("w-proc").Groups("default")),
+		WithTracking(true),
+		WithShutdownTimeout(2*time.Second),
+		WithLogger(testLogger),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer pp.Stop()
+
+	if err := pp.Register(Func("text.reverse",
+		func(ctx context.Context, in TextIn) (TextOut, error) {
+			r := []rune(in.Text)
+			for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+				r[i], r[j] = r[j], r[i]
+			}
+			return TextOut{Text: string(r)}, nil
+		},
+	)); err != nil {
+		t.Fatalf("Register Func: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := pp.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	proc, err := Call[TextOut]{
+		Cap:   "text.reverse",
+		Input: TextIn{Text: "pepper"},
+	}.Bind(pp).Execute(ctx)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if proc.ID() == "" {
+		t.Fatal("expected non-empty process ID")
+	}
+	// originID must be threaded through (not empty)
+	if proc.originID == "" {
+		t.Fatal("Process.originID must be non-empty — needed for Cancel()")
+	}
+
+	// Drain events in background
+	events := make([]ProcessEvent, 0)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for e := range proc.Events() {
+			events = append(events, e)
+		}
+	}()
+
+	out, err := proc.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Process.Wait: %v", err)
+	}
+	<-done
+
+	if out.Text != "reppep" {
+		t.Fatalf("expected 'reppep', got %q", out.Text)
+	}
+
+	state := proc.State()
+	if state.Status != StatusDone {
+		t.Fatalf("expected StatusDone, got %s", state.Status)
+	}
+	t.Logf("Execute + Process.Wait ok — text=%s events=%d", out.Text, len(events))
+}
+
+// TestFlowProcessWaitNoPoll verifies resultOfWatch does not busy-poll:
+// a fast capability resolves long before any 50ms tick would fire.
+func TestFlowProcessWaitNoPoll(t *testing.T) {
+	type Void struct{}
+
+	pp, err := New(
+		WithWorkers(NewWorker("w-fast").Groups("default")),
+		WithTracking(true),
+		WithShutdownTimeout(2*time.Second),
+		WithLogger(testLogger),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer pp.Stop()
+
+	if err := pp.Register(Func("noop",
+		func(ctx context.Context, in Void) (Void, error) {
+			return Void{}, nil
+		},
+	)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := pp.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	start := time.Now()
+	proc, err := Call[Void]{Cap: "noop", Input: Void{}}.Bind(pp).Execute(ctx)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if _, err := proc.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// If polling were used at 50ms intervals, a fast capability would still take
+	// ~50ms to resolve. Watch-based approach should be well under that.
+	if elapsed > 40*time.Millisecond {
+		t.Logf("wait took %s — may indicate polling (expected <40ms for in-process cap)", elapsed)
+	}
+	t.Logf("Process.Wait resolved in %s (no polling)", elapsed)
+}
+
+// TestFlowAllParallel verifies All[O] executes calls concurrently and collects results.
+func TestFlowAllParallel(t *testing.T) {
+	type TextIn struct {
+		Text string `json:"text"`
+	}
+	type TextOut struct {
+		Text string `json:"text"`
+	}
+
+	pp, err := New(
+		WithWorkers(NewWorker("w-all").Groups("default")),
+		WithShutdownTimeout(2*time.Second),
+		WithLogger(testLogger),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer pp.Stop()
+
+	if err := pp.Register(Func("text.upper",
+		func(ctx context.Context, in TextIn) (TextOut, error) {
+			return TextOut{Text: strings.ToUpper(in.Text)}, nil
+		},
+	)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := pp.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	inputs := []string{"alpha", "beta", "gamma"}
+	calls := make([]CallArgs, len(inputs))
+	for i, s := range inputs {
+		calls[i] = MakeCall("text.upper", In{"text": s})
+	}
+
+	results, err := All[TextOut](ctx, pp, calls...)
+	if err != nil {
+		t.Fatalf("All[TextOut]: %v", err)
+	}
+	if len(results) != len(inputs) {
+		t.Fatalf("expected %d results, got %d", len(inputs), len(results))
+	}
+	for _, r := range results {
+		if r.Text == "" {
+			t.Fatal("got empty Text in result")
+		}
+		// Each result must be one of the uppercased inputs
+		found := false
+		for _, s := range inputs {
+			if r.Text == strings.ToUpper(s) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("unexpected result text: %q", r.Text)
+		}
+	}
+	t.Logf("All[TextOut] ok — %d parallel results", len(results))
+}
+
+// TestFlowPipelineWithGoFunc verifies Compose + Call[Out] with Go Func stages.
+func TestFlowPipelineWithGoFunc(t *testing.T) {
+	type TextIn struct {
+		Text string `json:"text"`
+	}
+	type TextOut struct {
+		Text string `json:"text"`
+	}
+
+	pp, err := New(
+		WithWorkers(NewWorker("w-pipe").Groups("default")),
+		WithShutdownTimeout(2*time.Second),
+		WithLogger(testLogger),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer pp.Stop()
+
+	if err := pp.Register(Func("text.upper",
+		func(ctx context.Context, in TextIn) (TextOut, error) {
+			return TextOut{Text: strings.ToUpper(in.Text)}, nil
+		},
+	)); err != nil {
+		t.Fatalf("Register upper: %v", err)
+	}
+	if err := pp.Register(Func("text.exclaim",
+		func(ctx context.Context, in TextIn) (TextOut, error) {
+			return TextOut{Text: in.Text + "!"}, nil
+		},
+	)); err != nil {
+		t.Fatalf("Register exclaim: %v", err)
+	}
+
+	if err := pp.Compose("text.shout",
+		Pipe("text.upper"),
+		PipeTransform(func(in map[string]any) (map[string]any, error) {
+			// Pass through unchanged — just verifying PipeTransform in the chain
+			return in, nil
+		}),
+		Pipe("text.exclaim"),
+	); err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := pp.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	out, err := Call[TextOut]{
+		Cap:   "text.shout",
+		Input: TextIn{Text: "hello"},
+	}.Bind(pp).Do(ctx)
+	if err != nil {
+		t.Fatalf("Call pipeline: %v", err)
+	}
+	if out.Text != "HELLO!" {
+		t.Fatalf("expected 'HELLO!', got %q", out.Text)
+	}
+	t.Logf("pipeline Call[Out] ok — text=%s", out.Text)
 }

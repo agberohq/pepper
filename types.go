@@ -8,7 +8,7 @@ import (
 
 	"github.com/agberohq/pepper/internal/blob"
 	"github.com/agberohq/pepper/internal/bus"
-	"github.com/agberohq/pepper/internal/core"
+	"github.com/agberohq/pepper/internal/pending"
 	"github.com/agberohq/pepper/internal/router"
 	"github.com/olekukonko/jack"
 )
@@ -16,12 +16,8 @@ import (
 // Vars is the input map for pp.Run() raw snippet execution.
 type Vars = map[string]any
 
-// Backward compatibility
-var defaultFinder = core.NewRuntimeFinder()
-
 type runtimeState struct {
 	bus          bus.Bus
-	sessionLM    interface{}
 	readyWorkers atomic.Int32
 	workerStates sync.Map
 	loopers      sync.Map
@@ -36,13 +32,22 @@ type runtimeState struct {
 
 type workerEntry struct {
 	id, busAddr string
-	pid         int
 	groups      []string
 	caps        []string
 	ready       bool
 	wc          WorkerConfig
 }
 
+// WorkerError is returned when a worker process reports a typed error code.
 type WorkerError struct{ Code, Message string }
 
 func (e *WorkerError) Error() string { return fmt.Sprintf("worker error [%s]: %s", e.Code, e.Message) }
+
+// rawBidiStream is the untyped handle returned by openRawStream.
+// BidiStream[In, Out] wraps it.
+type rawBidiStream struct {
+	streamID string
+	corrID   string
+	outCh    <-chan pending.Response
+	pp       *Pepper
+}

@@ -1,14 +1,3 @@
-// for common constructors.
-//
-//	pepper.New(
-//	    pepper.Metrics(pepper.Prometheus()),
-//	    pepper.DLQ(pepper.FileDLQ("/var/log/pepper/dlq")),
-//	    pepper.Storage(pepper.InMemoryStore(24*time.Hour)),
-//	)
-//
-// Hook short-circuit:
-//
-//	return nil, pepper.ShortCircuit(pepper.CachedResult(payload))
 package pepper
 
 import (

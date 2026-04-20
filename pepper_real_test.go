@@ -48,9 +48,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agberohq/pepper/internal/compose"
 	"github.com/agberohq/pepper/internal/core"
-	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/runtime/adapter"
 )
 
@@ -325,7 +323,7 @@ func TestRealDenoisePassthrough(t *testing.T) {
 	}
 	defer pp.Stop()
 
-	if err := pp.Register("audio.denoise", denoisePath); err != nil {
+	if err := pp.Register(Script("audio.denoise", denoisePath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -382,9 +380,7 @@ func TestRealWhisperColdWarm(t *testing.T) {
 	}
 	defer pp.Stop()
 
-	if err := pp.Register("speech.transcribe", transcribePath,
-		WithConfig(map[string]any{"model_size": modelSize}),
-	); err != nil {
+	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -480,33 +476,30 @@ func TestRealFullPipeline(t *testing.T) {
 	defer pp.Stop()
 
 	// Stage 1: CPU denoise via Python runtime
-	if err := pp.Register("audio.denoise", denoisePath); err != nil {
+	if err := pp.Register(Script("audio.denoise", denoisePath)); err != nil {
 		t.Fatalf("Register audio.denoise: %v", err)
 	}
 
 	// Stage 2: Whisper transcription via Python runtime
-	if err := pp.Register("speech.transcribe", transcribePath,
-		WithConfig(map[string]any{"model_size": modelSize}),
-	); err != nil {
+	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register speech.transcribe: %v", err)
 	}
 
 	// Stage 3: LLM response via Ollama HTTP adapter
-	if err := pp.Adapt("chat.respond",
-		adapter.HTTP("http://localhost:11434").
-			With(adapter.Ollama).
-			Groups("llm", "default").
-			Timeout(60*time.Second),
+	if err := pp.Register(HTTP("chat.respond", "http://localhost:11434").
+		With(adapter.Ollama).
+		Groups("llm", "default").
+		Timeout(60*time.Second),
 		WithConfig(map[string]any{"model": model}),
 	); err != nil {
-		t.Fatalf("Adapt chat.respond: %v", err)
+		t.Fatalf("Use chat.respond: %v", err)
 	}
 
 	// Compose: denoise → transcribe → transform → chat
 	if err := pp.Compose("audio.process",
-		compose.Pipe("audio.denoise").WithGroup("cpu"),
-		compose.Pipe("speech.transcribe").WithGroup("gpu"),
-		compose.Transform(func(_ envelope.Envelope, in map[string]any) (map[string]any, error) {
+		Pipe("audio.denoise").WithGroup("cpu"),
+		Pipe("speech.transcribe").WithGroup("gpu"),
+		PipeTransform(func(in map[string]any) (map[string]any, error) {
 			text, _ := in["text"].(string)
 			if text == "" {
 				text = "[silence or inaudible audio]"
@@ -516,7 +509,7 @@ func TestRealFullPipeline(t *testing.T) {
 				"prompt": fmt.Sprintf("The user said: %q — respond briefly and helpfully.", text),
 			}, nil
 		}),
-		compose.Pipe("chat.respond").WithGroup("default"),
+		Pipe("chat.respond").WithGroup("default"),
 	); err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -600,9 +593,7 @@ func TestRealWorkerRecycle(t *testing.T) {
 	}
 	defer pp.Stop()
 
-	if err := pp.Register("speech.transcribe", transcribePath,
-		WithConfig(map[string]any{"model_size": modelSize}),
-	); err != nil {
+	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -674,7 +665,7 @@ def run(inputs: dict) -> dict:
 		t.Fatalf("write probe cap: %v", err)
 	}
 
-	if err := pp.Register("audio.probe", probeCapPath); err != nil {
+	if err := pp.Register(Script("audio.probe", probeCapPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -871,14 +862,12 @@ func TestRealSongAnalysis(t *testing.T) {
 	defer pp.Stop()
 
 	// Stage 1 — ffmpeg conversion (Python subprocess)
-	if err := pp.Register("audio.convert", convertPath); err != nil {
+	if err := pp.Register(Script("audio.convert", convertPath)); err != nil {
 		t.Fatalf("Register audio.convert: %v", err)
 	}
 
 	// Stage 2 — Whisper transcription
-	if err := pp.Register("speech.transcribe", transcribePath,
-		WithConfig(map[string]any{"model_size": modelSize}),
-	); err != nil {
+	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register speech.transcribe: %v", err)
 	}
 
@@ -886,66 +875,64 @@ func TestRealSongAnalysis(t *testing.T) {
 	if useGemini {
 		// Gemini 1.5 Flash via REST — no local GPU needed.
 		apiKey := os.Getenv("PEPPER_GEMINI_KEY")
-		if err := pp.Adapt("song.analyze",
-			adapter.HTTP("https://generativelanguage.googleapis.com").
-				Auth(adapter.APIKey("x-goog-api-key", apiKey)).
-				Timeout(60*time.Second).
-				Groups("default").
-				MapRequest(func(in map[string]any) (*adapter.Request, error) {
-					transcript, _ := in["transcript"].(string)
-					prompt := buildSongPrompt(transcript)
-					body, _ := json.Marshal(map[string]any{
-						"contents": []map[string]any{
-							{"parts": []map[string]any{{"text": prompt}}},
-						},
-					})
-					return &adapter.Request{
-						Method: "POST",
-						URL:    "/v1beta/models/gemini-1.5-flash:generateContent",
-						Headers: map[string]string{
-							"Content-Type": "application/json",
-						},
-						Body: body,
-					}, nil
-				}).
-				MapResponse(func(r *adapter.Response) (map[string]any, error) {
-					var resp struct {
-						Candidates []struct {
-							Content struct {
-								Parts []struct{ Text string }
-							}
+		if err := pp.Register(HTTP("song.analyze", "https://generativelanguage.googleapis.com").
+			Auth(adapter.APIKey("x-goog-api-key", apiKey)).
+			Timeout(60 * time.Second).
+			Groups("default").
+			MapRequest(func(in map[string]any) (*adapter.Request, error) {
+				transcript, _ := in["transcript"].(string)
+				prompt := buildSongPrompt(transcript)
+				body, _ := json.Marshal(map[string]any{
+					"contents": []map[string]any{
+						{"parts": []map[string]any{{"text": prompt}}},
+					},
+				})
+				return &adapter.Request{
+					Method: "POST",
+					URL:    "/v1beta/models/gemini-1.5-flash:generateContent",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Body: body,
+				}, nil
+			}).
+			MapResponse(func(r *adapter.Response) (map[string]any, error) {
+				var resp struct {
+					Candidates []struct {
+						Content struct {
+							Parts []struct{ Text string }
 						}
 					}
-					if err := json.Unmarshal(r.Body, &resp); err != nil {
-						return map[string]any{"raw": string(r.Body)}, nil
-					}
-					text := ""
-					if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
-						text = resp.Candidates[0].Content.Parts[0].Text
-					}
-					return map[string]any{"analysis": text}, nil
-				}),
+				}
+				if err := json.Unmarshal(r.Body, &resp); err != nil {
+					return map[string]any{"raw": string(r.Body)}, nil
+				}
+				text := ""
+				if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+					text = resp.Candidates[0].Content.Parts[0].Text
+				}
+				return map[string]any{"analysis": text}, nil
+			}),
 		); err != nil {
 			t.Fatalf("Adapt song.analyze (Gemini): %v", err)
 		}
 	} else {
 		// Ollama local model.
-		if err := pp.Adapt("song.analyze",
-			adapter.HTTP("http://localhost:11434").
-				With(adapter.Ollama).
-				Groups("default").
-				Timeout(90*time.Second),
+		if err := pp.Register(HTTP("song.analyze", "http://localhost:11434").
+			With(adapter.Ollama).
+			Groups("default").
+			Timeout(90*time.Second),
 			WithConfig(map[string]any{"model": llmModel}),
 		); err != nil {
-			t.Fatalf("Adapt song.analyze (Ollama): %v", err)
+			t.Fatalf("Use song.analyze (Ollama): %v", err)
 		}
 	}
 
 	// Compose the four stages.
 	if err := pp.Compose("song.pipeline",
-		compose.Pipe("audio.convert").WithGroup("cpu"),
-		compose.Pipe("speech.transcribe").WithGroup("cpu"),
-		compose.Transform(func(_ envelope.Envelope, in map[string]any) (map[string]any, error) {
+		Pipe("audio.convert").WithGroup("cpu"),
+		Pipe("speech.transcribe").WithGroup("cpu"),
+		PipeTransform(func(in map[string]any) (map[string]any, error) {
 			transcript, _ := in["text"].(string)
 			language, _ := in["language"].(string)
 			duration, _ := in["duration"].(float64)
@@ -959,7 +946,7 @@ func TestRealSongAnalysis(t *testing.T) {
 				"prompt": buildSongPrompt(transcript),
 			}, nil
 		}),
-		compose.Pipe("song.analyze").WithGroup("default"),
+		Pipe("song.analyze").WithGroup("default"),
 	); err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -990,37 +977,35 @@ func TestRealSongAnalysis(t *testing.T) {
 	t.Logf("Running pipeline on: %s", mp3Path)
 	p0 := time.Now()
 
-	processID, err := pp.Track(doCtx, "song.pipeline", core.In{
-		"audio_path": mp3Path,
-	})
+	proc, err := Call[map[string]any]{
+		Cap:   "song.pipeline",
+		Input: core.In{"audio_path": mp3Path},
+	}.Bind(pp).Execute(doCtx)
 	if err != nil {
-		t.Fatalf("Track song.pipeline: %v", err)
+		t.Fatalf("Execute song.pipeline: %v", err)
 	}
-	t.Logf("Process ID: %s", processID)
+	t.Logf("Process ID: %s", proc.ID())
 
 	// Stream stage events live as they happen.
-	stageCh := pp.WatchProcess(processID)
-	if stageCh != nil {
-		go func() {
-			for action := range stageCh {
-				switch action.Status {
-				case "running":
-					t.Logf("  → stage started  : %-24s worker=%s", action.Stage, action.WorkerID)
-				case "done":
-					t.Logf("  ✓ stage done     : %-24s worker=%s duration=%dms", action.Stage, action.WorkerID, action.DurationMs)
-				case "failed":
-					t.Logf("  ✗ stage failed   : %-24s worker=%s duration=%dms error=%s", action.Stage, action.WorkerID, action.DurationMs, action.Error)
-				}
+	go func() {
+		for event := range proc.Events() {
+			switch event.Status {
+			case StatusRunning:
+				t.Logf("  → stage started  : %-24s worker=%s", event.Stage, event.WorkerID)
+			case StatusDone:
+				t.Logf("  ✓ stage done     : %-24s worker=%s duration=%dms", event.Stage, event.WorkerID, event.DurationMs)
+			case StatusFailed:
+				t.Logf("  ✗ stage failed   : %-24s worker=%s duration=%dms error=%s", event.Stage, event.WorkerID, event.DurationMs, event.Error)
 			}
-		}()
-	}
+		}
+	}()
 
 	// Block until the pipeline result is available or the context expires.
-	result, err := pp.ResultOf(doCtx, processID)
+	out, err := proc.Wait(doCtx)
 	pipelineLatency := time.Since(p0)
 
 	// Always snapshot the tracker state for the timeline — useful even on failure.
-	finalState, _ := pp.CheckProcess(processID)
+	finalState := proc.State()
 	t.Logf("── Pipeline timeline ────────────────────────────")
 	t.Logf("Process status  : %s", finalState.Status)
 	t.Logf("Total latency   : %s", pipelineLatency.Round(time.Millisecond))
@@ -1029,22 +1014,15 @@ func TestRealSongAnalysis(t *testing.T) {
 		t.Logf("  (no stages recorded — pipeline may not have reached any worker)")
 	}
 	for i, a := range finalState.Actions {
-		if a.Status == "running" {
-			t.Logf("  stage[%d] %-24s STILL RUNNING (started %s ago)",
-				i, a.Stage, time.Since(a.StartedAt).Round(time.Millisecond))
-		} else {
-			t.Logf("  stage[%d] %-24s %-8s %dms  worker=%s",
-				i, a.Stage, a.Status, a.DurationMs, a.WorkerID)
-		}
+		t.Logf("  stage[%d] %-24s %-8s %dms  worker=%s", i, a.Stage, a.Status, a.DurationMs, a.WorkerID)
 	}
 	t.Logf("────────────────────────────────────────────────")
 
 	if err != nil {
-		t.Fatalf("ResultOf: %v", err)
+		t.Fatalf("Wait: %v", err)
 	}
 
-	out := result.AsJSON()
-	t.Logf("Hops            : %d", result.Hop)
+	t.Logf("Hops            : (see result)")
 	for _, key := range []string{"analysis", "response", "message"} {
 		if v, ok := out[key]; ok {
 			t.Logf("LLM analysis    :\n%v", v)

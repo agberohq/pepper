@@ -6,45 +6,45 @@ import (
 	"sync/atomic"
 
 	"github.com/agberohq/pepper/internal/bus"
-	"github.com/agberohq/pepper/internal/core"
+	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/pending"
 )
 
-// BidiStream is a bidirectional streaming handle (§11.2).
-type BidiStream struct {
+// BidiStream is a typed bidirectional streaming handle.
+// Obtained via OpenStream[In, Out].
+type BidiStream[In any, Out any] struct {
 	streamID string
 	corrID   string
-	group    string
 	outCh    <-chan pending.Response
 	pp       *Pepper
-	codec    interface {
-		Marshal(v any) ([]byte, error)
-		Unmarshal(data []byte, v any) error
-	}
-	seqNum uint64
-	closed atomic.Bool
+	seqNum   uint64
+	closed   atomic.Bool
 }
 
 // Write sends one input chunk to the worker.
-func (s *BidiStream) Write(chunk core.In) error {
+func (s *BidiStream[In, Out]) Write(chunk In) error {
 	if s.closed.Load() {
 		return fmt.Errorf("stream closed")
 	}
-	s.seqNum++
-	env := map[string]any{
-		"proto_ver": uint8(1),
-		"msg_type":  string(envelope.MsgStreamChunk),
-		"stream_id": s.streamID,
-		"corr_id":   s.corrID,
-		"seq":       s.seqNum,
+	m, err := toWireInput(chunk)
+	if err != nil {
+		return fmt.Errorf("pepper.BidiStream.Write: encode chunk: %w", err)
 	}
-	payload, err := s.codec.Marshal(chunk)
+	s.seqNum++
+	msg := envelope.StreamChunk{
+		ProtoVer: envelope.ProtoVer,
+		MsgType:  envelope.MsgStreamChunk,
+		StreamID: s.streamID,
+		CorrID:   s.corrID,
+		Seq:      s.seqNum,
+	}
+	payload, err := s.pp.codec.Marshal(m)
 	if err != nil {
 		return err
 	}
-	env["payload"] = payload
-	data, err := s.codec.Marshal(env)
+	msg.Payload = payload
+	data, err := s.pp.codec.Marshal(msg)
 	if err != nil {
 		return err
 	}
@@ -52,37 +52,77 @@ func (s *BidiStream) Write(chunk core.In) error {
 }
 
 // CloseInput signals that no more input chunks will be sent.
-func (s *BidiStream) CloseInput() error {
+func (s *BidiStream[In, Out]) CloseInput() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
-	env := map[string]any{
-		"proto_ver": uint8(1),
-		"msg_type":  string(envelope.MsgStreamClose),
-		"stream_id": s.streamID,
-		"corr_id":   s.corrID,
+	msg := envelope.StreamClose{
+		ProtoVer: envelope.ProtoVer,
+		MsgType:  envelope.MsgStreamClose,
+		StreamID: s.streamID,
+		CorrID:   s.corrID,
 	}
-	data, _ := s.codec.Marshal(env)
+	data, _ := s.pp.codec.Marshal(msg)
 	return s.pp.rt.bus.Publish(bus.TopicStream(s.streamID), data)
 }
 
-// Chunks returns a channel of output results from the worker.
-// The channel is closed when the stream ends or ctx is cancelled.
-func (s *BidiStream) Chunks(ctx context.Context) <-chan Result {
-	out := make(chan Result, 64)
+// Chunks returns a channel of decoded output chunks.
+// Closed when the stream ends or ctx is cancelled.
+func (s *BidiStream[In, Out]) Chunks(ctx context.Context) <-chan Out {
+	return drainResponses[Out](ctx, s.outCh, s.pp.codec)
+}
+
+// OpenStream opens a typed bidirectional stream to a capability.
+//
+//	type AudioChunk struct{ Data []byte `json:"data"` }
+//	type TranscriptChunk struct{ Text string `json:"text"` }
+//
+//	stream, err := pepper.OpenStream[AudioChunk, TranscriptChunk](ctx, pp,
+//	    "speech.transcribe", pepper.In{"language": "en"},
+//	)
+//	stream.Write(AudioChunk{Data: audioBytes})
+//	stream.CloseInput()
+//	for chunk := range stream.Chunks(ctx) {
+//	    fmt.Print(chunk.Text)
+//	}
+func OpenStream[In any, Out any](ctx context.Context, pp *Pepper, cap string, seed In, opts ...CallOption) (*BidiStream[In, Out], error) {
+	wireIn, err := toWireInput(seed)
+	if err != nil {
+		return nil, fmt.Errorf("pepper.OpenStream: encode seed: %w", err)
+	}
+	raw, err := pp.openRawStream(ctx, cap, wireIn, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &BidiStream[In, Out]{
+		streamID: raw.streamID,
+		corrID:   raw.corrID,
+		outCh:    raw.outCh,
+		pp:       raw.pp,
+	}, nil
+}
+
+// drainResponses fans a pending.Response channel into a decoded typed channel.
+// Used by BidiStream.Chunks and BoundCall.Stream — single implementation.
+func drainResponses[T any](ctx context.Context, src <-chan pending.Response, c codec.Codec) <-chan T {
+	out := make(chan T, DefaultStreamChanBuffer)
 	go func() {
 		defer close(out)
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case r, ok := <-s.outCh:
+			case r, ok := <-src:
 				if !ok {
 					return
 				}
-				res := Result{payload: r.Payload, codec: s.pp.codec, WorkerID: r.WorkerID, Err: r.Err}
+				res := Result{payload: r.Payload, codec: c, WorkerID: r.WorkerID, Err: r.Err}
+				var v T
+				if err := res.Into(&v); err != nil {
+					continue
+				}
 				select {
-				case out <- res:
+				case out <- v:
 				case <-ctx.Done():
 					return
 				}

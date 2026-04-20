@@ -46,13 +46,13 @@ func New(opts ...Option) (*Pepper, error) {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	c, err := codec.Get(string(cfg.Serializer))
+	c, err := codec.Get(string(cfg.Codec))
 	if err != nil {
 		return nil, fmt.Errorf("pepper: codec: %w", err)
 	}
 	sess := cfg.Storage
 	if sess == nil {
-		sess = storage.NewMemory(24 * time.Hour)
+		sess = storage.NewMemory(DefaultSessionTTL)
 	}
 	sd := jack.NewShutdown(
 		jack.ShutdownWithTimeout(cfg.ShutdownTimeout),
@@ -80,76 +80,13 @@ func New(opts ...Option) (*Pepper, error) {
 	}, nil
 }
 
-func (p *Pepper) Register(name string, source any, opts ...CapOption) error {
-	spec, err := buildPythonSpec(name, source, opts...)
-	if err != nil {
-		p.logger.Fields("name", name, "error", err).Error("failed to register Python capability")
-		return fmt.Errorf("register %q: %w", name, err)
-	}
-	p.logger.Fields("name", name, "source", source).Debug("registered Python capability")
-	return p.reg.Add(spec)
-}
-
-func (p *Pepper) RegisterDir(dir string, opts ...CapOption) error {
-	p.logger.Fields("dir", dir).Info("registering capabilities from directory")
-	count := 0
-	err := walkPythonDir(dir, func(path string) error {
-		name := registry.DirNameToCap(path)
-		if err := p.Register(name, path, opts...); err != nil {
-			return err
-		}
-		count++
-		return nil
-	})
-	if err == nil {
-		p.logger.Fields("dir", dir, "count", count).Info("registered capabilities from directory")
-	}
-	return err
-}
-
-func (p *Pepper) Include(name string, worker core.Worker, opts ...CapOption) error {
-	spec, err := buildGoSpec(name, worker, opts...)
-	if err != nil {
-		p.logger.Fields("name", name, "error", err).Error("failed to include Go worker")
-		return fmt.Errorf("include %q: %w", name, err)
-	}
-	p.logger.Fields("name", name).Debug("included Go worker capability")
-	return p.reg.Add(spec)
-}
-
-func (p *Pepper) Adapt(name string, adapter AdapterBuilder, opts ...CapOption) error {
-	spec, err := buildAdapterSpec(name, adapter, opts...)
-	if err != nil {
-		p.logger.Fields("name", name, "error", err).Error("failed to adapt HTTP/MCP capability")
-		return fmt.Errorf("adapt %q: %w", name, err)
-	}
-	p.logger.Fields("name", name).Debug("adapted HTTP/MCP capability")
-	return p.reg.Add(spec)
-}
-
-func (p *Pepper) Prepare(name string, cmd CMDBuilder, opts ...CapOption) error {
-	spec, err := buildCLISpec(name, cmd, opts...)
-	if err != nil {
-		p.logger.Fields("name", name, "error", err).Error("failed to prepare CLI capability")
-		return fmt.Errorf("prepare %q: %w", name, err)
-	}
-	p.logger.Fields("name", name).Debug("prepared CLI capability")
-	return p.reg.Add(spec)
-}
-
-func (p *Pepper) Compose(name string, stages ...compose.Stage) error {
-	p.logger.Fields("name", name, "stages", len(stages)).Debug("composing pipeline")
+func (p *Pepper) Compose(name string, stages ...Stage) error {
 	dag, err := compose.Compile(name, stages)
 	if err != nil {
-		p.logger.Fields("name", name, "error", err).Error("failed to compile pipeline")
 		return fmt.Errorf("compose %q: %w", name, err)
 	}
-	spec, err := buildPipelineSpec(name, dag)
-	if err != nil {
-		p.logger.Fields("name", name, "error", err).Error("failed to build pipeline spec")
-		return fmt.Errorf("compose %q: build spec: %w", name, err)
-	}
-	p.logger.Fields("name", name).Info("composed pipeline capability")
+	spec := &registry.Spec{Name: name, Runtime: registry.RuntimePipeline, Pipeline: dag, Version: defaultCapVersion}
+	p.logger.Fields("name", name, "stages", len(stages)).Info("composed pipeline")
 	return p.reg.Add(spec)
 }
 
@@ -158,7 +95,6 @@ func (p *Pepper) RegisterResource(name string, config map[string]any) {
 		p.cfg.Resources = make(map[string]map[string]any)
 	}
 	p.cfg.Resources[name] = config
-	p.logger.Fields("name", name, "config_keys", len(config)).Debug("registered resource")
 }
 
 func (p *Pepper) Start(ctx context.Context) error {
@@ -201,13 +137,6 @@ func (p *Pepper) Do(ctx context.Context, cap string, in core.In, opts ...CallOpt
 	return p.dispatch(ctx, cap, in, opts...)
 }
 
-func (p *Pepper) Stream(ctx context.Context, cap string, in core.In, opts ...CallOption) (*Stream, error) {
-	if err := p.ensureStarted(); err != nil {
-		return nil, err
-	}
-	return p.dispatchStream(ctx, cap, in, opts...)
-}
-
 func (p *Pepper) Group(ctx context.Context, group string, dispatch string, cap string, in core.In, opts ...CallOption) ([]Result, error) {
 	if err := p.ensureStarted(); err != nil {
 		return nil, err
@@ -220,11 +149,22 @@ func (p *Pepper) Broadcast(ctx context.Context, cap string, in core.In, opts ...
 	if err := p.ensureStarted(); err != nil {
 		return nil, err
 	}
-	opts = append(opts, WithCallGroup("*"), WithCallDispatch("all"))
+	opts = append(opts, WithCallGroup(groupBroadcast), WithCallDispatch(string(DispatchAll)))
 	return p.dispatchMulti(ctx, cap, in, opts...)
 }
 
+// Session binds to an existing session ID.
+// Use when you already have the ID — e.g. from a request header, JWT, or cookie.
 func (p *Pepper) Session(id string) *Session { return &Session{id: id, pp: p} }
+
+// NewSession creates a new session with a generated ID.
+// Call sess.ID() to retrieve the ID and persist it (cookie, JWT, etc.).
+//
+//	sess := pp.NewSession()
+//	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sess.ID()})
+func (p *Pepper) NewSession() *Session {
+	return &Session{id: ulid.Make().String(), pp: p}
+}
 
 func (p *Pepper) Capabilities(ctx context.Context, filters ...registry.Filter) []registry.Schema {
 	return p.reg.Schemas(filters...)
@@ -260,7 +200,7 @@ func (p *Pepper) ensureStarted() error {
 }
 
 func (p *Pepper) dispatch(ctx context.Context, cap string, in core.In, opts ...CallOption) (Result, error) {
-	o := defaultCallOpts()
+	o := p.defaultCallOpts()
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -270,7 +210,10 @@ func (p *Pepper) dispatch(ctx context.Context, cap string, in core.In, opts ...C
 		return p.dispatchPipeline(ctx, spec, cap, in, o)
 	}
 
-	originID := ulid.Make().String()
+	originID := o.originID
+	if originID == "" {
+		originID = ulid.Make().String()
+	}
 	start := time.Now()
 
 	p.logger.Fields("cap", cap, "corr_id", originID, "group", o.group, "timeout_ms", p.cfg.DefaultTimeout.Milliseconds()).Debug("dispatching request")
@@ -283,7 +226,7 @@ func (p *Pepper) dispatch(ctx context.Context, cap string, in core.In, opts ...C
 		defer p.cfg.Metrics.Gauge(metrics.MetricRequestsInflight, -1, capTags)
 	}
 
-	preEnv := buildEnvelope(originID, originID, cap, in, o, p.cfg.DefaultTimeout)
+	preEnv := p.buildEnvelope(originID, originID, cap, in, o)
 	mutatedIn, err := p.hooks.RunBefore(ctx, &preEnv, in)
 	if err != nil {
 		if res, ok := hooks.ShortCircuitResult(err); ok {
@@ -303,7 +246,7 @@ func (p *Pepper) dispatch(ctx context.Context, cap string, in core.In, opts ...C
 		}
 
 		corrID := ulid.Make().String()
-		env := buildEnvelope(corrID, originID, cap, mutatedIn, o, p.cfg.DefaultTimeout)
+		env := p.buildEnvelope(corrID, originID, cap, mutatedIn, o)
 		env.DeliveryCount = uint8(attempt)
 		payload, err := p.codec.Marshal(mutatedIn)
 		if err != nil {
@@ -378,7 +321,7 @@ func (p *Pepper) dispatch(ctx context.Context, cap string, in core.In, opts ...C
 }
 
 func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in core.In, opts ...CallOption) ([]Result, error) {
-	o := defaultCallOpts()
+	o := p.defaultCallOpts()
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -386,7 +329,7 @@ func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in core.In, opts
 
 	p.logger.Fields("cap", cap, "group", o.group, "dispatch", o.dispatch, "origin_id", originID).Debug("dispatching multi request")
 
-	env := buildEnvelope(originID, originID, cap, in, o, p.cfg.DefaultTimeout)
+	env := p.buildEnvelope(originID, originID, cap, in, o)
 	payload, err := p.codec.Marshal(in)
 	if err != nil {
 		p.logger.Fields("cap", cap, "error", err).Error("failed to marshal multi request payload")
@@ -445,51 +388,25 @@ func (p *Pepper) dispatchMulti(ctx context.Context, cap string, in core.In, opts
 	return results, nil
 }
 
-func (p *Pepper) dispatchStream(ctx context.Context, cap string, in core.In, opts ...CallOption) (*Stream, error) {
-	o := defaultCallOpts()
-	for _, opt := range opts {
-		opt(&o)
-	}
-	corrID := ulid.Make().String()
+// Process Tracking (internal)
 
-	p.logger.Fields("cap", cap, "corr_id", corrID, "group", o.group).Debug("dispatching stream request")
-
-	env := buildEnvelope(corrID, corrID, cap, in, o, p.cfg.DefaultTimeout)
-	payload, err := p.codec.Marshal(in)
-	if err != nil {
-		p.logger.Fields("cap", cap, "error", err).Error("failed to marshal stream payload")
-		return nil, err
-	}
-	env.Payload = payload
-	ch, err := p.pending.RegisterStream(corrID, 64)
-	if err != nil {
-		p.logger.Fields("cap", cap, "corr_id", corrID, "error", err).Error("failed to register stream")
-		return nil, err
-	}
-	p.rt.reqReaper.TouchAt(corrID, time.UnixMilli(env.DeadlineMs))
-	if err := p.rt.router.Dispatch(ctx, env); err != nil {
-		p.logger.Fields("cap", cap, "corr_id", corrID, "error", err).Warn("failed to dispatch stream")
-		p.pending.Fail(corrID, err)
-		return nil, err
-	}
-	p.logger.Fields("cap", cap, "corr_id", corrID).Debug("stream established")
-	return &Stream{ch: ch, c: p.codec}, nil
-}
-
-// Process Tracking
-
-// Track dispatches cap with the given inputs and returns a processID immediately.
-// The process runs asynchronously. Use CheckProcess or WatchProcess to observe it.
-// Requires WithTracking(true) — returns ("", ErrTrackingDisabled) otherwise.
-func (p *Pepper) Track(ctx context.Context, cap string, in core.In, opts ...CallOption) (string, error) {
+// track is the internal implementation backing Execute[Out].
+// It returns both the tracker processID and the envelope originID so that
+// Process[Out].Cancel() can call BroadcastCancel with the correct ID.
+func (p *Pepper) track(ctx context.Context, cap string, in core.In, opts ...CallOption) (processID, originID string, err error) {
 	if p.tracker == nil {
-		return "", ErrTrackingDisabled
+		return "", "", ErrTrackingDisabled
 	}
 
-	processID := ulid.Make().String()
+	processID = ulid.Make().String()
+	originID = ulid.Make().String()
 
 	// Inject _process_id into call meta so hooks can find this process.
-	opts = append(opts, WithMeta("_process_id", processID))
+	// Inject _origin_id to pin the envelope OriginID so Cancel() matches.
+	opts = append(opts,
+		WithMeta(MetaKeyProcessID, processID),
+		withOriginID(originID),
+	)
 
 	// Determine total stages: 1 for plain caps, worker-dispatched stage count for pipelines.
 	totalStages := 1
@@ -507,62 +424,60 @@ func (p *Pepper) Track(ctx context.Context, cap string, in core.In, opts ...Call
 			p.tracker.FailProcess(processID, err)
 			return
 		}
-		// Store the result so ResultOf() can retrieve it without re-running.
 		p.processResults.Set(processID, result)
 	}()
 
-	return processID, nil
+	return processID, originID, nil
 }
 
-// ResultOf returns the Result from a completed tracked process.
-// Blocks until the process is done or ctx is cancelled.
-// Returns ErrTrackingDisabled if tracking is off, or an error if the
-// process failed or the context expired before completion.
-func (p *Pepper) ResultOf(ctx context.Context, processID string) (Result, error) {
+// resultOfWatch blocks until a tracked process completes, using the tracker's
+// Watch channel instead of polling. Responds immediately when the process ends.
+func (p *Pepper) resultOfWatch(ctx context.Context, processID string) (Result, error) {
 	if p.tracker == nil {
 		return Result{}, ErrTrackingDisabled
 	}
+
+	// Fast path: result already stored.
+	if r, ok := p.processResults.Get(processID); ok {
+		return r, nil
+	}
+
+	ch := p.tracker.Watch(processID)
+	if ch == nil {
+		return Result{}, fmt.Errorf("pepper: unknown process %s", processID)
+	}
+
+	// Drain events until the channel closes (done or failed), then read result.
 	for {
-		if r, ok := p.processResults.Get(processID); ok {
-			return r, nil
-		}
-		// Check if process failed.
-		if state, ok := p.tracker.Check(processID); ok {
-			if state.Status == "failed" {
-				return Result{}, fmt.Errorf("%s", state.Error)
-			}
-		}
 		select {
+		case _, ok := <-ch:
+			if !ok {
+				// Channel closed — tracker has marked the process terminal.
+				// The goroutine in track() stores the result in processResults
+				// after dispatchPipeline returns, which happens after the tracker
+				// records the final stage done. Poll briefly to let it land.
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					if r, ok := p.processResults.Get(processID); ok {
+						return r, nil
+					}
+					if state, ok := p.tracker.Check(processID); ok && state.Error != "" {
+						return Result{}, fmt.Errorf("%s", state.Error)
+					}
+					select {
+					case <-ctx.Done():
+						return Result{}, ctx.Err()
+					case <-time.After(5 * time.Millisecond):
+					}
+				}
+				return Result{}, fmt.Errorf("pepper: process %s: result not available after timeout", processID)
+			}
+			// Non-terminal event — continue draining.
 		case <-ctx.Done():
 			return Result{}, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
 		}
 	}
 }
 
-// CheckProcess returns a point-in-time snapshot of a tracked process.
-// Returns zero Process and false if processID is unknown or tracking is disabled.
-func (p *Pepper) CheckProcess(processID string) (tracker.Process, bool) {
-	if p.tracker == nil {
-		return tracker.Process{}, false
-	}
-	return p.tracker.Check(processID)
-}
-
-// WatchProcess returns a channel that receives one tracker.Action per stage event.
-// The channel is closed when the process reaches StatusDone or StatusFailed.
-// Returns nil if processID is unknown or tracking is disabled.
-//
-//	ch := pp.WatchProcess(id)
-//	for action := range ch {
-//	    fmt.Printf("%s → %s (%dms)\n", action.Stage, action.Status, action.DurationMs)
-//	}
-func (p *Pepper) WatchProcess(processID string) <-chan tracker.Action {
-	if p.tracker == nil {
-		return nil
-	}
-	return p.tracker.Watch(processID)
-}
-
-// ErrTrackingDisabled is returned by Track when WithTracking(true) was not set.
+// ErrTrackingDisabled is returned by Execute when WithTracking(true) was not set.
 var ErrTrackingDisabled = fmt.Errorf("pepper: process tracking is disabled — use WithTracking(true)")

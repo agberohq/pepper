@@ -28,6 +28,8 @@ import (
 	"github.com/olekukonko/jack"
 )
 
+var defaultFinder = core.NewRuntimeFinder()
+
 // NewBlob creates a zero-copy blob from bytes backed by a shared-memory file.
 // The caller must call Close() after the request completes (or let the reaper
 // collect it via the blobReaper TTL).
@@ -72,7 +74,7 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 
 	busURL := p.cfg.TransportURL
 	if busURL == "" {
-		busURL = fmt.Sprintf("tcp://127.0.0.1:%d", freePort())
+		busURL = fmt.Sprintf("tcp://127.0.0.1:%d", p.freePort())
 	}
 
 	nngBus, err := bus.NewMula(bus.Config{URL: busURL, SendBuf: 256, RecvBuf: 256})
@@ -173,7 +175,7 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		// stop promptly on shutdown.
 		bootTimeout := p.cfg.DefaultTimeout
 		if bootTimeout <= 0 {
-			bootTimeout = 30 * time.Second
+			bootTimeout = DefaultShutdownTimeout
 		}
 		bootCtx, bootCancel := context.WithTimeout(bgCtx, bootTimeout)
 		defer bootCancel()
@@ -200,7 +202,7 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		return nil
 	})
 	p.shutdown.RegisterWithContext("workers.bye", func(_ context.Context) error {
-		bye, _ := p.codec.Marshal(map[string]any{"proto_ver": uint8(1), "msg_type": "worker_bye"})
+		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye})
 		_ = rt.bus.Publish(bus.TopicBroadcast, bye)
 		time.Sleep(200 * time.Millisecond)
 		return nil
@@ -300,16 +302,16 @@ func (p *Pepper) routeResponse(data []byte) {
 				}
 			}
 
-			cbRes := map[string]any{
-				"proto_ver": uint8(1),
-				"msg_type":  "cb_res",
-				"origin_id": env.OriginID(),
-				"cb_id":     cbID,
+			cbRes := envelope.CbRes{
+				ProtoVer: envelope.ProtoVer,
+				MsgType:  envelope.MsgCbRes,
+				OriginID: env.OriginID(),
+				CbID:     cbID,
 			}
 			if err != nil {
-				cbRes["error"] = err.Error()
+				cbRes.Error = err.Error()
 			} else {
-				cbRes["payload"] = res.AsBytes()
+				cbRes.Payload = res.AsBytes()
 			}
 			resData, _ := p.codec.Marshal(cbRes)
 			_ = p.rt.bus.Publish(bus.TopicRes(env.OriginID()), resData)
@@ -343,7 +345,7 @@ func (p *Pepper) handleControl(data []byte) {
 		if wid == "" {
 			return
 		}
-		if cn, _ := env["codec"].(string); cn != "" && cn != string(p.cfg.Serializer) {
+		if cn, _ := env["codec"].(string); cn != "" && cn != string(p.cfg.Codec) {
 			p.cfg.logger.Fields("worker", wid, "codec", cn).Error("CODEC_MISMATCH")
 			return
 		}
@@ -360,8 +362,8 @@ func (p *Pepper) handleControl(data []byte) {
 		runtimeType, _ := raw["runtime"].(string)
 		if runtimeType == "python" || runtimeType == "" {
 			for _, spec := range p.reg.All() {
-				if spec.Runtime == registry.RuntimePython && (len(env.Groups()) == 0 || len(spec.Groups) == 0 || groupsOverlap(spec.Groups, env.Groups())) {
-					payload, _ := p.codec.Marshal(buildCapLoad(spec))
+				if spec.Runtime == registry.RuntimePython && (len(env.Groups()) == 0 || len(spec.Groups) == 0 || p.groupsOverlap(spec.Groups, env.Groups())) {
+					payload, _ := p.codec.Marshal(p.buildCapLoad(spec))
 					_ = p.rt.bus.Publish(bus.TopicControl(wid), payload)
 				}
 			}
@@ -408,7 +410,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	}
 
 	originID := ulid.Make().String()
-	stageCh, err := p.rt.bus.SubscribePrefix(ctx, "pepper.pipe."+sanitizeName(name))
+	stageCh, err := p.rt.bus.SubscribePrefix(ctx, "pepper.pipe."+p.sanitizeName(name))
 	if err != nil {
 		return Result{}, err
 	}
@@ -421,7 +423,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	).Debug("dispatching pipeline request")
 
 	// processID for per-stage tracker events — extracted once from call meta.
-	processID, _ := o.meta["_process_id"].(string)
+	processID, _ := o.meta[MetaKeyProcessID].(string)
 
 	// advanceStage runs router-side stages (Transform, Return) inline and
 	// dispatches the next worker-side stage. Returns when a worker stage is
@@ -442,7 +444,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 				// listen on. Force a final pipe topic so the result still
 				// arrives on stageCh.
 				if env.ForwardTo == "" {
-					env.ForwardTo = "pepper.pipe." + sanitizeName(name) + ".final"
+					env.ForwardTo = "pepper.pipe." + p.sanitizeName(name) + ".final"
 				}
 				// Record stage dispatch in tracker.
 				if p.tracker != nil && processID != "" {
@@ -488,7 +490,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	}
 
 	// Build the initial envelope and run through any leading router-side stages.
-	env := buildEnvelope(ulid.Make().String(), originID, "", in, o, p.cfg.DefaultTimeout)
+	env := p.buildEnvelope(ulid.Make().String(), originID, "", in, o)
 	env.Payload, _ = p.codec.Marshal(in)
 
 	res, nextStageIdx, done, err := advanceStage(env, 0)
@@ -647,7 +649,7 @@ func (p *Pepper) startRespawnLooper(workerID string, wc WorkerConfig, allSpecs [
 
 func (p *Pepper) checkRecycle(workerID string, wc WorkerConfig, served uint64, uptimeMs int64) {
 	if (wc.MaxRequests > 0 && served >= wc.MaxRequests) || (wc.MaxUptime > 0 && time.Duration(uptimeMs)*time.Millisecond >= wc.MaxUptime) {
-		bye, _ := p.codec.Marshal(map[string]any{"proto_ver": uint8(1), "msg_type": "worker_bye", "worker_id": workerID})
+		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye, WorkerID: workerID})
 		_ = p.rt.bus.Publish(bus.TopicBroadcast, bye)
 	}
 }
@@ -655,7 +657,7 @@ func (p *Pepper) checkRecycle(workerID string, wc WorkerConfig, served uint64, u
 func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerID, busAddr string, allSpecs []*registry.Spec) error {
 	var matchedCaps []*registry.Spec
 	for _, spec := range allSpecs {
-		if spec.Runtime == registry.RuntimePython && (len(wc.Groups) == 0 || len(spec.Groups) == 0 || groupsOverlap(spec.Groups, wc.Groups)) {
+		if spec.Runtime == registry.RuntimePython && (len(wc.Groups) == 0 || len(spec.Groups) == 0 || p.groupsOverlap(spec.Groups, wc.Groups)) {
 			matchedCaps = append(matchedCaps, spec)
 		}
 	}
@@ -671,7 +673,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 		blobDir = blobpkg.PlatformDefaultDir()
 	}
 
-	envVars := bus.WorkerEnvVars(workerID, busAddr, string(p.cfg.Serializer), groups, int(p.cfg.HeartbeatInterval.Milliseconds()), p.cfg.MaxConcurrent, blobDir)
+	envVars := bus.WorkerEnvVars(workerID, busAddr, string(p.cfg.Codec), groups, int(p.cfg.HeartbeatInterval.Milliseconds()), p.cfg.MaxConcurrent, blobDir)
 	if len(p.cfg.Resources) > 0 {
 		if enc, err := p.codec.Marshal(p.cfg.Resources); err == nil {
 			envVars = append(envVars, "PEPPER_RESOURCES="+string(enc))
@@ -726,7 +728,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 		logW.Close() // parent closes write end; child holds the only reference
 		go p.pipeWorkerLogs(logR, workerID)
 	}
-	p.rt.workerStates.Store(workerID, &workerEntry{id: workerID, pid: cmd.Process.Pid, groups: groups, wc: wc, busAddr: busAddr})
+	p.rt.workerStates.Store(workerID, &workerEntry{id: workerID, groups: groups, wc: wc, busAddr: busAddr})
 	p.startRespawnLooper(workerID, wc, allSpecs)
 	go func() {
 		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
@@ -750,11 +752,18 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 			return fmt.Errorf("go worker %q: GoWorker does not implement pepper.Worker", spec.Name)
 		}
 		bridge := goruntime.NewBridge(pw)
+		// Inject the wire codec into typedWorkerWrapper so it can encode/decode
+		// typed structs using the same codec as the rest of the pipeline.
+		if cs, ok := pw.(interface {
+			SetCodec(marshal func(any) ([]byte, error), unmarshal func([]byte, any) error)
+		}); ok {
+			cs.SetCodec(p.codec.Marshal, p.codec.Unmarshal)
+		}
 		groups := spec.Groups
 		if len(groups) == 0 {
 			groups = []string{"default"}
 		}
-		wid := "go-" + sanitizeName(spec.Name)
+		wid := "go-" + p.sanitizeName(spec.Name)
 		rt := goruntime.New(wid, bridge, groups, p.rt.bus, p.codec, p.logger)
 		cfg := spec.Config
 		if cfg == nil {
@@ -787,12 +796,12 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		if len(groups) == 0 {
 			groups = []string{"default"}
 		}
-		wid := "http-" + sanitizeName(spec.Name)
+		wid := "http-" + p.sanitizeName(spec.Name)
 
 		var a adapter.Adapter
 		var auth adapter.AuthProvider
 		var baseURL string
-		timeout := 120 * time.Second
+		timeout := DefaultAdapterTimeout
 
 		switch v := spec.AdapterSpec.(type) {
 		case *adapter.HTTPBuilder:
@@ -841,7 +850,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 		if len(groups) == 0 {
 			groups = []string{"default"}
 		}
-		wid := "cli-" + sanitizeName(spec.Name)
+		wid := "cli-" + p.sanitizeName(spec.Name)
 		wrt := cli.NewBusWorker(wid, spec.Name, *cmdSpec, groups, p.rt.bus, p.codec, p.rt.blob, p.cfg.DefaultTimeout+30*time.Second, p.logger)
 		if err := wrt.Start(ctx); err != nil {
 			return fmt.Errorf("cli worker %q start: %w", spec.Name, err)
@@ -855,24 +864,19 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 	return nil
 }
 
-// OpenStream opens a bidirectional stream to a capability (§11.2).
-// The caller writes input chunks via stream.Write() and reads output
-// via stream.Chunks(ctx). Call stream.CloseInput() when input is done.
-//
-//	stream, err := pp.OpenStream(ctx, "speech.transcribe", pepper.In{"language": "en"})
-//	go func() { for frame := range mic { stream.Write(frame) }; stream.CloseInput() }()
-//	for chunk := range stream.Chunks(ctx) { fmt.Print(chunk.AsJSON()["text"]) }
-func (p *Pepper) OpenStream(ctx context.Context, cap string, in core.In, opts ...CallOption) (*BidiStream, error) {
+// openRawStream opens a bidirectional stream and returns an untyped handle.
+// Public callers use the generic OpenStream[In, Out] free function in bidi.go.
+func (p *Pepper) openRawStream(ctx context.Context, cap string, in core.In, opts ...CallOption) (*rawBidiStream, error) {
 	if err := p.ensureStarted(); err != nil {
 		return nil, err
 	}
-	o := defaultCallOpts()
+	o := p.defaultCallOpts()
 	for _, opt := range opts {
 		opt(&o)
 	}
 	streamID := ulid.Make().String()
 	corrID := ulid.Make().String()
-	env := buildEnvelope(corrID, corrID, cap, in, o, p.cfg.DefaultTimeout)
+	env := p.buildEnvelope(corrID, corrID, cap, in, o)
 	env.MsgType = envelope.MsgStreamOpen
 	env.StreamID = streamID
 
@@ -882,7 +886,7 @@ func (p *Pepper) OpenStream(ctx context.Context, cap string, in core.In, opts ..
 	}
 	env.Payload = payload
 
-	outCh, err := p.pending.RegisterStream(corrID, 64)
+	outCh, err := p.pending.RegisterStream(corrID, DefaultStreamChanBuffer)
 	if err != nil {
 		return nil, err
 	}
@@ -897,17 +901,15 @@ func (p *Pepper) OpenStream(ctx context.Context, cap string, in core.In, opts ..
 		return nil, err
 	}
 
-	return &BidiStream{
+	return &rawBidiStream{
 		streamID: streamID,
 		corrID:   corrID,
-		group:    env.Group,
 		outCh:    outCh,
 		pp:       p,
-		codec:    p.codec,
 	}, nil
 }
 
-// Run executes a raw Python snippet as a capability (§16.3).
+// Run executes a raw Python snippet as a capability.
 // The snippet receives vars as the inputs dict and must return a dict.
 //
 //	result, err := pp.Run(ctx, `

@@ -4,163 +4,349 @@
 
 **The high-performance, zero-copy distributed runtime for the AI era.**
 
-Pepper is a polyglot orchestrator that seamlessly bridges the reliability and concurrency of **Go** with the machine learning ecosystem of **Python**. It allows you to treat Python scripts, local CLI binaries (`ffmpeg`), external LLM APIs (OpenAI/Anthropic), and MCP servers as unified, strongly-typed **Capabilities** on a lightning-fast, zero-copy message bus.
+Pepper is a polyglot orchestrator that bridges the reliability and concurrency of Go with the machine learning ecosystem of Python. It lets you treat Python scripts, local CLI binaries, external LLM APIs (OpenAI, Anthropic), and MCP servers as unified, strongly-typed **Capabilities** on a fast, zero-copy message bus.
 
-Stop writing slow FastAPI wrappers around your PyTorch models. Stop base64-encoding 50MB images over HTTP. Use Pepper.
-
----
-
-## ✨ Key Features
-
-*   **⚡ Zero-Copy Binary Passing:** Pass massive tensors, video frames, and audio buffers between Go and Python in nanoseconds using `/dev/shm` shared memory (with graceful fallback to HTTP/S3 for multi-node clusters).
-*   **🐍 First-Class Python DX:** Write ML workers using elegant `@capability` and `@resource` decorators. No boilerplate server code required.
-*   **🧩 Everything is a Capability:** Unify your infrastructure. A Python script, a Go function, a shell command, and an OpenAI API call all share the exact same `MsgPack` routing envelope.
-*   **🕸️ Declarative DAG Pipelines:** Compose multi-step, conditional, and scatter-gather pipelines directly in Go. The router evaluates logic dynamically to save network hops.
-*   **🛡️ Bulletproof Chaos Engineering:** Built for production realities with Poison Pill detection, Dead Letter Queues (DLQ), automated worker respawns, backpressure, and end-to-end deadline propagation.
-*   **🤖 Native LLM Tooling:** Instantly export your entire distributed backend as OpenAI/Anthropic function-calling tools with a single line of code.
+Stop writing FastAPI wrappers around your PyTorch models. Stop base64-encoding 50MB images over HTTP. Use Pepper.
 
 ---
 
-## 🚀 Quick Start
+## Key Features
+
+- **Zero-Copy Binary Passing.** Pass tensors, video frames, and audio buffers between Go and Python using `/dev/shm` shared memory, with graceful fallback to HTTP/S3 for multi-node clusters.
+- **First-Class Python DX.** Write ML workers with `@capability` and `@resource` decorators. No boilerplate server code.
+- **Everything is a Capability.** A Python script, a Go function, a shell command, and an OpenAI API call all share the same MsgPack routing envelope.
+- **Declarative DAG Pipelines.** Compose multi-step, conditional, and scatter-gather pipelines in Go. The router evaluates logic dynamically to save network hops.
+- **Production Resilience.** Poison Pill detection, Dead Letter Queues, automated worker respawns, backpressure, and end-to-end deadline propagation.
+- **Native LLM Tooling.** Export your entire backend as OpenAI or Anthropic function-calling tools with one line.
+
+---
+
+## Quick Start
 
 ### 1. The Python Worker
-Write your machine learning or data-processing code in pure Python. Use the `@capability` decorator to define inputs, outputs, and concurrency limits.
 
 ```python
 # caps/vision.py
-from runtime import pepper, Input, Output, capability, read_blob
+from runtime import Input, Output, capability, read_blob
 
 @capability(name="face.embed", groups=["gpu"], max_concurrent=2)
 class FaceEmbedder:
+    def setup(self):
+        import torch
+        self.model = torch.load("model.pt")
+
     def run(self, image: Input[dict]) -> Output[dict]:
-        # Zero-copy memory map directly from the Go router!
         img_matrix = read_blob(image).as_numpy()
-        
-        # ... run heavy PyTorch model ...
-        
-        return {"embedding": [0.1, 0.5, -0.2], "faces_found": 1}
+        embedding = self.model(img_matrix).tolist()
+        return {"embedding": embedding}
 ```
 
 ### 2. The Go Host
-Initialize the Pepper router, register your capabilities, and dispatch work.
 
 ```go
 package main
 
 import (
-	"context"
-	"log"
-	"time"
-	"github.com/agberohq/pepper"
+    "context"
+    "log"
+
+    "github.com/agberohq/pepper"
 )
 
 func main() {
-	// 1. Initialize the Pepper router
-	pp, _ := pepper.New(
-		pepper.WithWorkers(pepper.NewWorker("gpu-node").Groups("gpu")),
-	)
-	defer pp.Stop()
+    pp, err := pepper.New(
+        pepper.WithWorkers(pepper.NewWorker("gpu-node").Groups("gpu")),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer pp.Stop()
 
-	// 2. Register Capabilities
-	pp.Register("face.embed", "./caps/vision.py")
-	
-	// You can also wrap CLI tools!
-	pp.Prepare("video.extract_audio", pepper.CMD("ffmpeg", "-i", "{input}", "{output}"))
+    if err := pp.Register(pepper.Script("face.embed", "./caps/vision.py")); err != nil {
+        log.Fatal(err)
+    }
 
-	ctx := context.Background()
-	pp.Start(ctx)
+    ctx := context.Background()
+    if err := pp.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
 
-	// 3. Create a Zero-Copy Blob
-	blob, _ := pp.NewBlobFromFile("/tmp/crowd.jpg")
-	defer blob.Close()
+    blob, err := pp.NewBlobFromFile("/path/to/image.jpg")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer blob.Close()
 
-	// 4. Dispatch the request
-	res, err := pp.Do(ctx, "face.embed", map[string]any{"image": blob.Ref()})
-	if err != nil {
-		log.Fatal(err)
-	}
+    type EmbedOut struct {
+        Embedding []float32 `json:"embedding"`
+    }
 
-	log.Printf("Result: %v", res.AsJSON())
+    result, err := pepper.Call[EmbedOut]{
+        Cap:   "face.embed",
+        Input: pepper.In{"image": blob.Ref()},
+    }.Bind(pp).Do(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    log.Printf("embedding: %v", result.Embedding)
 }
 ```
 
 ---
 
-## 🧠 Advanced Architecture
+## Capabilities
 
-### The Zero-Copy `BlobRef`
-Moving rich media between microservices is usually the biggest bottleneck in AI systems. Pepper solves this with the `BlobRef`.
+Pepper unifies different runtimes behind a single `Register` call.
 
-When Go creates a blob, it writes to shared memory (`/dev/shm`) and passes a tiny metadata dictionary over the wire. When Python calls `read_blob().as_numpy()`, it memory-maps the exact same physical RAM.
-
-If your Go router and Python worker are on different physical machines, Pepper gracefully degrades, treating the path as a URI (e.g., `s3://bucket/img.jpg` or `http://...`) and caches it locally on the worker upon the first read.
-
-### Declarative DAG Pipelines
-Stop writing coordinator microservices. Define complex routing logic in Go, and the Pepper router will handle the data flow between workers automatically.
+**Python script** — a single `.py` file with a `@capability` class:
 
 ```go
-// audio.process = Extract Audio -> Transcribe -> Branch (EN vs FR)
-pp.Compose("audio.process",
-    compose.Pipe("video.extract_audio").WithGroup("cpu"),
-    
-    // Scatter to all available GPU workers, gather results
-    compose.Scatter("speech.transcribe").
-        WithGroup("gpu").
-        Gather("transcript.merge", compose.GatherAll),
-        
-    // Route dynamically based on the output of the previous step
-    compose.Branch(
-        compose.When("language == 'en'", compose.Pipe("nlp.summarize_en")),
-        compose.When("language == 'fr'", compose.Pipe("nlp.summarize_fr")),
-        compose.Otherwise(compose.Return(map[string]any{"status": "unsupported"})),
-    ),
+pp.Register(pepper.Script("speech.transcribe", "./caps/transcribe.py"))
+```
+
+**Python directory** — every `.py` file under a directory becomes a capability:
+
+```go
+pp.Register(pepper.Dir("./caps").Groups("gpu"))
+```
+
+**Go function** — inline typed handler, no subprocess:
+
+```go
+type SumIn struct{ Values []float64 `json:"values"` }
+type SumOut struct{ Total float64 `json:"total"` }
+
+pp.Register(pepper.Func("math.sum", func(ctx context.Context, in SumIn) (SumOut, error) {
+    var total float64
+    for _, v := range in.Values {
+        total += v
+    }
+    return SumOut{Total: total}, nil
+}))
+```
+
+**CLI tool** — wrap any binary as a capability:
+
+```go
+pp.Register(pepper.CLI("video.probe", "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format"))
+```
+
+**HTTP adapter** — wrap any REST API:
+
+```go
+pp.Register(pepper.HTTP("sentiment.analyze", "https://api.example.com/sentiment"))
+```
+
+**Built-in LLM adapters:**
+
+```go
+pp.Register(pepper.HTTP("llm.chat", "").With(pepper.OpenAI))
+pp.Register(pepper.HTTP("llm.chat", "").With(pepper.AnthropicAdapter))
+pp.Register(pepper.HTTP("llm.chat", "http://localhost:11434").With(pepper.Ollama))
+```
+
+**MCP server** — expose all tools from an MCP server as capabilities:
+
+```go
+pp.Register(pepper.MCP("tools.browser", "https://mcp.example.com/sse"))
+// or auto-name from URL:
+pp.AdaptMCP("https://mcp.example.com/sse")
+```
+
+---
+
+## Calling Capabilities
+
+**Typed single call:**
+
+```go
+type AnalysisOut struct {
+    Sentiment string  `json:"sentiment"`
+    Score     float64 `json:"score"`
+}
+
+result, err := pepper.Call[AnalysisOut]{
+    Cap:     "sentiment.analyze",
+    Input:   pepper.In{"text": "Pepper is fast"},
+    Timeout: 10 * time.Second,
+}.Bind(pp).Do(ctx)
+```
+
+**Fire-and-forget:**
+
+```go
+err := pepper.Exec{
+    Cap:   "audit.log",
+    Input: pepper.In{"event": "login", "user": "alice"},
+}.Bind(pp).Do(ctx)
+```
+
+**Parallel fan-out:**
+
+```go
+results, err := pepper.All[AnalysisOut](ctx, pp,
+    pepper.MakeCall("sentiment.analyze", pepper.In{"text": "first"}),
+    pepper.MakeCall("sentiment.analyze", pepper.In{"text": "second"}),
 )
 ```
 
-### Auto-Generating LLM Tools
-Because Pepper knows the schema of every registered capability (via Python type hints or Go structs), you can expose your entire infrastructure to an LLM Agent instantly.
+**Streaming output:**
 
 ```go
-// Get all capabilities tagged with the "tools" group
-schemas := pp.Capabilities(ctx, pepper.FilterByGroup("tools"))
+ch, err := pepper.Call[TranscriptChunk]{
+    Cap:   "speech.transcribe",
+    Input: pepper.In{"audio_path": "/tmp/audio.wav"},
+}.Bind(pp).Stream(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+for chunk := range ch {
+    fmt.Print(chunk.Text)
+}
+```
 
-// Export to OpenAI format
-openAITools := pepper.ToOpenAITools(schemas)
+**Bidirectional streaming:**
 
-// Pass directly to the OpenAI SDK
-resp, _ := openaiClient.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-    Model:    openai.GPT4o,
-    Messages: messages,
-    Tools:    openAITools, // Pepper handles the schema bridging!
-})
+```go
+type AudioChunk struct{ Data []byte `json:"data"` }
+type TranscriptChunk struct{ Text string `json:"text"` }
+
+stream, err := pepper.OpenStream[AudioChunk, TranscriptChunk](
+    ctx, pp, "speech.transcribe", pepper.In{"language": "en"},
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+go func() {
+    for _, chunk := range audioChunks {
+        stream.Write(AudioChunk{Data: chunk})
+    }
+    stream.CloseInput()
+}()
+
+for chunk := range stream.Chunks(ctx) {
+    fmt.Print(chunk.Text)
+}
 ```
 
 ---
 
-## 🛡️ Production Resilience
+## DAG Pipelines
 
-AI workloads are notorious for crashing (OOMs, CUDA errors, bad data). Pepper isolates your Go backend from Python's instability.
+Compose multi-step pipelines in Go. The router evaluates routing logic without extra network hops.
 
-*   **Poison Pill DLQ:** If a specific payload crashes a Python worker multiple times, Pepper blacklists the `origin_id`, stops retrying it, and writes the payload to a Dead Letter Queue for debugging.
-*   **Load-Aware Routing:** Requests are routed to the worker with the lowest active pipeline depth.
-*   **Global Timeouts:** A `context.WithTimeout` in Go propagates across the entire message bus. If the deadline passes, the router's `Reaper` drops the message, and a `BroadcastCancel` interrupts the Python thread.
-*   **Resource Management:** Use `@resource` in Python to manage heavy, long-lived objects (like DB pools or LLM weights). Pepper initializes them once at boot and cleans them up cleanly on teardown.
+```go
+pp.Compose("audio.pipeline",
+    pepper.Pipe("audio.convert").WithGroup("cpu"),
+    pepper.Pipe("speech.transcribe").WithGroup("asr"),
+    pepper.PipeTransform(func(in map[string]any) (map[string]any, error) {
+        transcript, _ := in["text"].(string)
+        return pepper.In{"prompt": "Summarise: " + transcript}, nil
+    }),
+    pepper.Pipe("llm.chat"),
+)
+
+result, err := pp.Do(ctx, "audio.pipeline", pepper.In{"audio_path": "/tmp/speech.wav"})
+```
+
+**Async pipeline with stage events:**
+
+```go
+proc, err := pepper.Call[SummaryOut]{
+    Cap:   "audio.pipeline",
+    Input: pepper.In{"audio_path": "/tmp/speech.wav"},
+}.Bind(pp).Execute(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+go func() {
+    for event := range proc.Events() {
+        log.Printf("stage %s: %s (%dms)", event.Stage, event.Status, event.DurationMs)
+    }
+}()
+
+result, err := proc.Wait(ctx)
+```
 
 ---
 
-## 🔌 Supported Transports & Adapters
+## LLM Tool Calling
 
-**Transports:**
-*   `mula://` (Default) - Ultra-fast, zero-dependency custom TCP framing.
-*   `nats://` (Coming Soon) - Distributed queue groups via NATS JetStream.
-*   `redis://` (Coming Soon) - Distributed Pub/Sub via Redis.
+Because Pepper knows the schema of every registered capability, you can expose your backend to an LLM agent in one call.
 
-**Adapters:**
-Wrap external APIs as native Pepper capabilities with automatic retries and timeouts:
-*   `adapter.OpenAI`
-*   `adapter.Anthropic`
-*   `adapter.Ollama`
-*   `adapter.MCP` (Model Context Protocol servers)
+```go
+schemas := pp.Capabilities(ctx, pepper.FilterByGroup("tools"))
+
+// OpenAI
+openAITools := pepper.Tools(schemas, pepper.FormatOpenAI)
+
+// Anthropic
+anthropicTools := pepper.Tools(schemas, pepper.FormatAnthropic)
+```
+
+---
+
+## Zero-Copy Blobs
+
+Passing large binary data between Go and Python without serialisation:
+
+```go
+// From raw bytes
+blob, err := pp.NewBlob(imageBytes)
+defer blob.Close()
+
+// From a file
+blob, err := pp.NewBlobFromFile("/tmp/frame.jpg")
+defer blob.Close()
+
+// Pass the ref in any capability input
+result, err := pp.Do(ctx, "face.embed", pepper.In{"image": blob.Ref()})
+```
+
+In Python, `read_blob(image).as_numpy()` memory-maps the exact same shared memory page. On multi-node deployments, Pepper falls back to treating the path as a URI and caches locally on first access.
+
+---
+
+## Production Resilience
+
+- **Poison Pill detection.** If a payload crashes a Python worker more than `WithPoisonPillThreshold(n)` times, Pepper blacklists the `origin_id`, stops retrying, and writes the payload to the DLQ.
+- **Dead Letter Queue.** Persist poison pills to disk for debugging and replay: `pepper.WithDLQ(pepper.FileDLQ("./dlq"))`.
+- **Deadline propagation.** A `context.WithTimeout` in Go propagates across the entire message bus. When the deadline passes, the router drops the pending request and broadcasts a cancel signal to interrupt running workers.
+- **Load-aware routing.** Requests route to the worker with the lowest active load by default. Override with `WithStrategy(pepper.StrategyRoundRobin)` or `WithStrategy(pepper.StrategyLeastLoaded)`.
+- **Worker recycling.** Automatically restart workers after N requests or a maximum uptime: `pepper.NewWorker("w-1").MaxRequests(10000).MaxUptime(24 * time.Hour)`.
+
+---
+
+## Sessions
+
+Maintain state across multiple capability calls:
+
+```go
+sess := pp.NewSession()
+
+result, err := pepper.Call[ReplyOut]{
+    Cap:   "chat.reply",
+    Input: pepper.In{"message": "Hello"},
+}.Session(sess).Do(ctx)
+
+// Later, with the same session:
+sess2 := pp.Session(sess.ID()) // resume from cookie, JWT, etc.
+```
+
+---
+
+## Transports
+
+| Transport | Default | Notes |
+|-----------|---------|-------|
+| `mula://` | Yes | Zero-dependency custom TCP framing |
+| `nats://` | No | Coming soon — NATS JetStream |
+| `redis://` | No | Coming soon — Redis Pub/Sub |
+
+Override with `pepper.WithTransport(pepper.TransportTCPLoopback)` or `pepper.WithTransportURL("tcp://0.0.0.0:7731")`.
 
 ---
 

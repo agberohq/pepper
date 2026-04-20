@@ -65,3 +65,38 @@ type CancelMsg struct {
 	MsgType  Type   `msgpack:"msg_type"`
 	OriginID string `msgpack:"origin_id"`
 }
+
+// WorkerBye is sent by the router to gracefully shut down a worker.
+type WorkerBye struct {
+	ProtoVer uint8  `msgpack:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"`
+	WorkerID string `msgpack:"worker_id"`
+}
+
+// CbRes is the callback response sent back to the originating worker.
+type CbRes struct {
+	ProtoVer uint8  `msgpack:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"`
+	OriginID string `msgpack:"origin_id"`
+	CbID     string `msgpack:"cb_id"`
+	Payload  []byte `msgpack:"payload,omitempty"`
+	Error    string `msgpack:"error,omitempty"`
+}
+
+// StreamChunk is a single chunk sent from the Go side into a bidi stream.
+type StreamChunk struct {
+	ProtoVer uint8  `msgpack:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"`
+	StreamID string `msgpack:"stream_id"`
+	CorrID   string `msgpack:"corr_id"`
+	Seq      uint64 `msgpack:"seq"`
+	Payload  []byte `msgpack:"payload"`
+}
+
+// StreamClose signals end-of-input on a bidi stream.
+type StreamClose struct {
+	ProtoVer uint8  `msgpack:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"`
+	StreamID string `msgpack:"stream_id"`
+	CorrID   string `msgpack:"corr_id"`
+}

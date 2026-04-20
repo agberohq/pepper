@@ -31,6 +31,15 @@ import (
 	"github.com/olekukonko/ll"
 )
 
+// sessionIDKey is the context key for the session ID injected per-request.
+// Unexported — accessed via pepper.SessionFromContext.
+type sessionIDKey struct{}
+
+// SessionIDKey returns the context key used to store the session ID.
+// Used by the pepper root package to implement SessionFromContext without
+// importing goruntime.
+func SessionIDKey() any { return sessionIDKey{} }
+
 // Worker is the interface Go native workers must implement.
 // All methods must be safe for concurrent use.
 type Worker interface {
@@ -208,8 +217,12 @@ func (r *GoWorkerRuntime) handleMessage(ctx context.Context, msg bus.Message) {
 	}
 	in = resolved
 
-	// Create per-request context with deadline
+	// Create per-request context with deadline and session ID.
+	// SessionFromContext(ctx) in capability implementations retrieves the session ID.
 	reqCtx, cancel := context.WithDeadline(ctx, time.UnixMilli(env.DeadlineMs))
+	if env.SessionID != "" {
+		reqCtx = context.WithValue(reqCtx, sessionIDKey{}, env.SessionID)
+	}
 	r.cancelFuncs.Store(env.CorrID, cancel)
 	defer func() {
 		cancel()
@@ -268,7 +281,7 @@ func (r *GoWorkerRuntime) sendResult(env envelope.Envelope, out map[string]any) 
 
 	if env.ForwardTo != "" {
 		fwd := map[string]any{
-			"proto_ver":  uint8(1),
+			"proto_ver":  envelope.ProtoVer,
 			"msg_type":   "pipe",
 			"corr_id":    env.CorrID,
 			"origin_id":  env.OriginID,
@@ -286,7 +299,7 @@ func (r *GoWorkerRuntime) sendResult(env envelope.Envelope, out map[string]any) 
 	}
 
 	resp := map[string]any{
-		"proto_ver": uint8(1),
+		"proto_ver": envelope.ProtoVer,
 		"msg_type":  string(envelope.MsgRes),
 		"corr_id":   env.CorrID,
 		"origin_id": env.OriginID,
@@ -303,7 +316,7 @@ func (r *GoWorkerRuntime) sendResult(env envelope.Envelope, out map[string]any) 
 
 func (r *GoWorkerRuntime) sendError(env envelope.Envelope, code envelope.Code, msg string) {
 	errEnv := map[string]any{
-		"proto_ver": uint8(1),
+		"proto_ver": envelope.ProtoVer,
 		"msg_type":  string(envelope.MsgErr),
 		"corr_id":   env.CorrID,
 		"origin_id": env.OriginID,
@@ -384,7 +397,7 @@ func (r *GoWorkerRuntime) heartbeatLoop(ctx context.Context) {
 
 func (r *GoWorkerRuntime) sendHeartbeat() {
 	ping := map[string]any{
-		"proto_ver":       uint8(1),
+		"proto_ver":       envelope.ProtoVer,
 		"msg_type":        string(envelope.MsgHbPing),
 		"worker_id":       r.id,
 		"runtime":         "go",

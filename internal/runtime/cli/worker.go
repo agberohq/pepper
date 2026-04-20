@@ -164,7 +164,7 @@ func (w *BusWorker) sendResult(env envelope.Envelope, out map[string]any) {
 
 	if env.ForwardTo != "" {
 		fwd := map[string]any{
-			"proto_ver":  uint8(1),
+			"proto_ver":  envelope.ProtoVer,
 			"msg_type":   "pipe",
 			"corr_id":    env.CorrID,
 			"origin_id":  env.OriginID,
@@ -182,7 +182,7 @@ func (w *BusWorker) sendResult(env envelope.Envelope, out map[string]any) {
 	}
 
 	resp := map[string]any{
-		"proto_ver": uint8(1),
+		"proto_ver": envelope.ProtoVer,
 		"msg_type":  string(envelope.MsgRes),
 		"corr_id":   env.CorrID,
 		"origin_id": env.OriginID,
@@ -199,7 +199,7 @@ func (w *BusWorker) sendResult(env envelope.Envelope, out map[string]any) {
 
 func (w *BusWorker) sendErr(env envelope.Envelope, code envelope.Code, msg string) {
 	errEnv := map[string]any{
-		"proto_ver": uint8(1),
+		"proto_ver": envelope.ProtoVer,
 		"msg_type":  string(envelope.MsgErr),
 		"corr_id":   env.CorrID,
 		"origin_id": env.OriginID,
@@ -259,7 +259,7 @@ func (w *BusWorker) heartbeatLoop(ctx context.Context) {
 				load = 0
 			}
 			ping := map[string]any{
-				"proto_ver":       uint8(1),
+				"proto_ver":       envelope.ProtoVer,
 				"msg_type":        string(envelope.MsgHbPing),
 				"worker_id":       w.id,
 				"runtime":         "cli",

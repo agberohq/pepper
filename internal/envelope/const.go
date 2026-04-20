@@ -3,6 +3,9 @@
 // uses the same Envelope struct. Every field is always present.
 package envelope
 
+// ProtoVer is the wire envelope protocol version.
+const ProtoVer = uint8(1)
+
 // Type identifies the kind of message on the wire.
 type Type string
 

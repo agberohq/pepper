@@ -60,7 +60,7 @@ type Spec struct {
 }
 
 // Schema is the public representation of a capability for introspection
-// and LLM tool use (ToOpenAITools / ToAnthropicTools).
+// and LLM tool use (pepper.Tools with pepper.FormatOpenAI / FormatAnthropic).
 type Schema struct {
 	Name         string
 	Version      string

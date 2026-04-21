@@ -48,7 +48,10 @@ type natsStore struct {
 	closed atomic.Bool
 }
 
-// dial opens a raw NATS connection and drains the INFO banner.
+// dial opens a raw NATS connection, drains the INFO banner, sends CONNECT {},
+// then drains the server's initial PING so the connection is fully ready.
+// NATS sends a PING immediately after CONNECT to verify liveness; if it goes
+// unanswered the server closes the connection within ~2 seconds.
 func (s *natsStore) dial() (net.Conn, error) {
 	d := &net.Dialer{Timeout: natsConnectTimeout}
 	c, err := d.Dial("tcp", s.addr)
@@ -56,6 +59,7 @@ func (s *natsStore) dial() (net.Conn, error) {
 		return nil, err
 	}
 	br := bufio.NewReader(c)
+	// Drain lines until INFO is seen.
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(natsReadTimeout))
 		line, err := br.ReadString('\n')
@@ -72,6 +76,29 @@ func (s *natsStore) dial() (net.Conn, error) {
 		c.Close()
 		return nil, err
 	}
+	// Drain any immediate server messages (typically a PING right after CONNECT).
+	// Respond to PING with PONG; stop at the first non-PING line or on timeout.
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			// Timeout means no more immediate messages — connection is ready.
+			break
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "PING" {
+			_ = c.SetWriteDeadline(time.Now().Add(natsWriteTimeout))
+			if _, werr := fmt.Fprint(c, "PONG\r\n"); werr != nil {
+				c.Close()
+				return nil, werr
+			}
+		}
+		// Any non-PING line (e.g. +OK) — stop draining.
+		if line != "PING" {
+			break
+		}
+	}
+	_ = c.SetDeadline(time.Time{}) // clear deadline; callers set their own
 	return c, nil
 }
 
@@ -88,6 +115,8 @@ func natsReadLine(br *bufio.Reader, c net.Conn) (string, error) {
 }
 
 // natsEnsureBucket creates the JetStream KV bucket if absent.
+// Only fields supported by all NATS server versions are sent; in particular
+// "history" is not a valid stream-create field and causes an -ERR on some builds.
 func natsEnsureBucket(c net.Conn) error {
 	br := bufio.NewReader(c)
 	sid := 1
@@ -95,7 +124,7 @@ func natsEnsureBucket(c net.Conn) error {
 	if err := natsWrite(c, fmt.Sprintf("SUB %s %d\r\n", inbox, sid)); err != nil {
 		return err
 	}
-	payload := `{"num_replicas":1,"history":1}`
+	payload := `{"num_replicas":1}`
 	msg := fmt.Sprintf("PUB $JS.API.STREAM.CREATE.KV_%s %s %d\r\n%s\r\n",
 		natsCoordKVBucket, inbox, len(payload), payload)
 	if err := natsWrite(c, msg); err != nil {
@@ -106,6 +135,11 @@ func natsEnsureBucket(c net.Conn) error {
 		line, err := natsReadLine(br, c)
 		if err != nil {
 			return nil // timeout reading response is acceptable
+		}
+		if line == "PING" {
+			// Server keepalive during the wait — answer and keep reading.
+			_ = natsWrite(c, "PONG\r\n")
+			continue
 		}
 		if strings.HasPrefix(line, "MSG") {
 			parts := strings.Fields(line)
@@ -158,24 +192,33 @@ func (s *natsStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 	}
 
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-	line, err := natsReadLine(br, c)
-	if err != nil || !strings.HasPrefix(line, "MSG") {
-		return nil, false, nil
+	for {
+		line, err := natsReadLine(br, c)
+		if err != nil {
+			return nil, false, nil
+		}
+		if line == "PING" {
+			_ = natsWrite(c, "PONG\r\n")
+			continue
+		}
+		if !strings.HasPrefix(line, "MSG") {
+			return nil, false, nil
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
+			return nil, false, nil
+		}
+		n, _ := strconv.Atoi(parts[3])
+		buf := make([]byte, n+2)
+		if _, err := br.Read(buf); err != nil {
+			return nil, false, err
+		}
+		decoded, err := hex.DecodeString(strings.TrimSpace(string(buf[:n])))
+		if err != nil {
+			return nil, false, err
+		}
+		return decoded, true, nil
 	}
-	parts := strings.Fields(line)
-	if len(parts) < 4 {
-		return nil, false, nil
-	}
-	n, _ := strconv.Atoi(parts[3])
-	buf := make([]byte, n+2)
-	if _, err := br.Read(buf); err != nil {
-		return nil, false, err
-	}
-	decoded, err := hex.DecodeString(strings.TrimSpace(string(buf[:n])))
-	if err != nil {
-		return nil, false, err
-	}
-	return decoded, true, nil
 }
 
 func (s *natsStore) Delete(_ context.Context, key string) error {
@@ -215,6 +258,10 @@ func (s *natsStore) List(_ context.Context, prefix string) ([]string, error) {
 		line, err := natsReadLine(br, c)
 		if err != nil {
 			break
+		}
+		if line == "PING" {
+			_ = natsWrite(c, "PONG\r\n")
+			continue
 		}
 		if !strings.HasPrefix(line, "MSG") {
 			continue
@@ -286,6 +333,11 @@ func (s *natsStore) readMessages(ctx context.Context, c net.Conn, ch chan Event)
 				continue
 			}
 			return
+		}
+		// Respond to server keepalive PINGs so the connection stays alive.
+		if line == "PING" {
+			_ = natsWrite(c, "PONG\r\n")
+			continue
 		}
 		if !strings.HasPrefix(line, "MSG") {
 			continue
@@ -361,6 +413,10 @@ func (s *natsStore) Pull(ctx context.Context, queue string) ([]byte, error) {
 				continue
 			}
 			return nil, err
+		}
+		if line == "PING" {
+			_ = natsWrite(c, "PONG\r\n")
+			continue
 		}
 		if !strings.HasPrefix(line, "MSG") {
 			continue

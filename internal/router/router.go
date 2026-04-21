@@ -60,6 +60,7 @@ type Router struct {
 	reaper           *jack.Reaper
 	codec            codec.Codec
 	logger           *ll.Logger
+	distributed      bool // when true, dispatch skips local worker lookup
 	onDispatch       func(env envelope.Envelope, workerID string)
 	onResponse       func(env envelope.Envelope, workerID string, latency time.Duration)
 	onError          func(env envelope.Envelope, code envelope.Code)
@@ -72,6 +73,10 @@ type Config struct {
 	DLQ              dlq.Backend
 	Codec            codec.Codec
 	HeartbeatTimeout time.Duration
+	// Distributed enables coord-bus dispatch mode. When true, Dispatch pushes
+	// directly to the group queue on the bus without requiring a locally
+	// registered worker — remote workers on other nodes pull from the shared queue.
+	Distributed bool
 }
 
 func DefaultConfig() Config {
@@ -102,6 +107,7 @@ func New(b bus.Bus, p *pending.Map, reaper *jack.Reaper, cfg Config, logger *ll.
 		reaper:           reaper,
 		codec:            cfg.Codec,
 		logger:           logger.Namespace("router"),
+		distributed:      cfg.Distributed,
 	}
 }
 
@@ -220,18 +226,29 @@ func (r *Router) Dispatch(ctx context.Context, env envelope.Envelope) error {
 	}
 
 	if env.WorkerID != "" {
-		r.mu.RLock()
-		ws, ok := r.workers[env.WorkerID]
-		r.mu.RUnlock()
-		if !ok || ws.State.Load().(WorkerHealthState) != WorkerStateReady {
-			return fmt.Errorf("%w: worker=%s", ErrWorkerDead, env.WorkerID)
+		if !r.distributed {
+			r.mu.RLock()
+			ws, ok := r.workers[env.WorkerID]
+			r.mu.RUnlock()
+			if !ok || ws.State.Load().(WorkerHealthState) != WorkerStateReady {
+				return fmt.Errorf("%w: worker=%s", ErrWorkerDead, env.WorkerID)
+			}
 		}
+		// In distributed mode, the worker lives on a remote node — skip the
+		// local liveness check and push directly to the worker's personal queue.
 	}
 
 	if env.Dispatch == envelope.DispatchAny && env.WorkerID == "" {
-		env.WorkerID = r.affinityWorker(env.Cap, env.Group)
-		if env.WorkerID == "" {
-			return fmt.Errorf("%w: group=%s cap=%s", ErrNoWorkers, env.Group, env.Cap)
+		if r.distributed {
+			// In distributed mode workers live on remote nodes — push directly
+			// to the shared group queue on the coord bus. The bus (Redis/NATS)
+			// delivers to whichever node's worker pulls next.
+			// Do not require a locally registered worker.
+		} else {
+			env.WorkerID = r.affinityWorker(env.Cap, env.Group)
+			if env.WorkerID == "" {
+				return fmt.Errorf("%w: group=%s cap=%s", ErrNoWorkers, env.Group, env.Cap)
+			}
 		}
 	}
 

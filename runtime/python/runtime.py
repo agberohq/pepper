@@ -177,34 +177,52 @@ def _resolve_cache_dir() -> str:
 
 
 class _KVStore:
-    """Process-local key-value store. One instance per namespace, shared across all caps."""
+    """Process-local key-value store. One instance per namespace, shared across all caps.
+
+    Keys are stored under the composite key  ``{worker_id}:{namespace}:{user_key}``
+    so that each worker process has a clearly isolated KV space. This prevents
+    silent key collisions when multiple workers run on the same host (e.g. during
+    tests) and makes it trivial to audit or evict a single worker's state.
+    """
 
     _stores: dict[str, "_KVStore"] = {}
     _lock = threading.Lock()
+    # Populated at Worker.run() time so the prefix is available before any cap
+    # calls pepper.kv(). Falls back to "" in unit-test contexts without a worker.
+    _worker_id: str = os.environ.get("PEPPER_WORKER_ID", "")
 
     def __init__(self, namespace: str) -> None:
         self._namespace = namespace
         self._data: dict[str, Any] = {}
         self._rw = threading.RLock()
 
+    def _full_key(self, key: str) -> str:
+        """Return the internal storage key, prefixed with worker_id and namespace."""
+        prefix = self._worker_id
+        return f"{prefix}:{self._namespace}:{key}" if prefix else f"{self._namespace}:{key}"
+
     @classmethod
     def for_namespace(cls, namespace: str) -> "_KVStore":
+        # Incorporate the worker_id into the store-map key so that if (in a
+        # future scenario) two workers share a process, they each get an
+        # independent store object.
+        store_key = f"{cls._worker_id}:{namespace}" if cls._worker_id else namespace
         with cls._lock:
-            if namespace not in cls._stores:
-                cls._stores[namespace] = cls(namespace)
-            return cls._stores[namespace]
+            if store_key not in cls._stores:
+                cls._stores[store_key] = cls(namespace)
+            return cls._stores[store_key]
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._rw:
-            return self._data.get(key, default)
+            return self._data.get(self._full_key(key), default)
 
     def set(self, key: str, value: Any) -> None:
         with self._rw:
-            self._data[key] = value
+            self._data[self._full_key(key)] = value
 
     def delete(self, key: str) -> None:
         with self._rw:
-            self._data.pop(key, None)
+            self._data.pop(self._full_key(key), None)
 
     def get_or_set(self, key: str, factory) -> Any:
         """Return cached value, or call factory() once and cache the result.
@@ -217,20 +235,26 @@ class _KVStore:
                 lambda: WhisperModel("tiny", download_root=pepper.cache_dir()),
             )
         """
+        fk = self._full_key(key)
         with self._rw:
-            if key in self._data:
-                return self._data[key]
+            if fk in self._data:
+                return self._data[fk]
             value = factory()
-            self._data[key] = value
+            self._data[fk] = value
             return value
 
     def keys(self) -> list[str]:
+        """Return user-visible keys (without the internal worker:namespace: prefix)."""
+        prefix = self._full_key("")  # "worker_id:namespace:"
         with self._rw:
-            return list(self._data.keys())
+            return [k[len(prefix):] for k in self._data if k.startswith(prefix)]
 
     def clear(self) -> None:
+        """Remove all keys belonging to this namespace on this worker."""
+        prefix = self._full_key("")
         with self._rw:
-            self._data.clear()
+            for k in [k for k in self._data if k.startswith(prefix)]:
+                del self._data[k]
 
     def __repr__(self) -> str:
         with self._rw:
@@ -447,6 +471,11 @@ def load_capability(cap_load: dict) -> LoadedCap:
 
     spec = importlib.util.spec_from_file_location(cap_load["cap"], source_path)
     module = importlib.util.module_from_spec(spec)
+    # Inject the pepper API into the module's namespace before executing it so
+    # that top-level code and setup() can call pepper.kv(), pepper.cache_dir(),
+    # pepper.config(), etc. Without this, any cap that references `pepper` at
+    # module load time raises NameError: name 'pepper' is not defined.
+    module.__dict__["pepper"] = pepper
     spec.loader.exec_module(module)
 
     # Parse Form A header from source before importing
@@ -801,7 +830,9 @@ class Worker:
         _meta_var.set(dict(env.get("meta") or {}))
         _config_var.set(loaded.spec.get("config") or {})
         _delivery_var.set(env.get("delivery_count", 0))
-        _session_var.set(env.get("_session_data") or {})
+        # Session data is injected by the Go runtime into envelope meta under
+        # "_session_data" (not at the top level) so workers can read prior state.
+        _session_var.set((env.get("meta") or {}).get("_session_data") or {})
 
         t_start = time.monotonic()
         log.info("exec start [cap=%s corr_id=%s worker=%s hop=%s]",
@@ -851,7 +882,11 @@ class Worker:
                 "proto_ver": 1, "msg_type": "res", "corr_id": corr_id,
                 "origin_id": origin_id, "worker_id": self.worker_id,
                 "cap": cap_name, "cap_ver": loaded.spec.get("cap_ver", ""),
-                "payload": self._codec.marshal(result), "meta": _meta_var.get(),
+                "payload": self._codec.marshal(result),
+                # Echo session_id back so Go's routeResponse can find and merge
+                # the _session_updates written by pepper.session().set().
+                "session_id": env.get("session_id", ""),
+                "meta": _meta_var.get(),
             }
         except Exception as exc:
             duration_ms = int((time.monotonic() - t_start) * 1000)

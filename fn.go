@@ -81,6 +81,19 @@ func (p *Pepper) buildEnvelope(corrID, originID, cap string, in core.In, o callO
 		}
 		env.Meta[k] = v
 	}
+	// Inject current session data into the envelope meta so Python workers can
+	// read prior session values via pepper.session().get(). Workers write updates
+	// back via _session_updates in the response meta, which routeResponse merges
+	// into the store. The key is "_session_data" inside meta (not top-level) to
+	// match how the Python runtime reads it.
+	if o.sessionID != "" {
+		if data, ok := p.sessions.GetAll(o.sessionID); ok && len(data) > 0 {
+			if env.Meta == nil {
+				env.Meta = make(map[string]any)
+			}
+			env.Meta["_session_data"] = data
+		}
+	}
 	return env
 }
 

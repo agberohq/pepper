@@ -23,6 +23,7 @@ func NewRedis(url string) (Store, error) {
 		addr:   addr,
 		stopCh: make(chan struct{}),
 	}
+	// Probe connectivity.
 	c, err := respDial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("coord/redis: connect %q: %w", url, err)
@@ -31,11 +32,15 @@ func NewRedis(url string) (Store, error) {
 	return s, nil
 }
 
+// poolConn wraps a reusable net.Conn held in the sync.Pool.
+type poolConn struct{ net.Conn }
+
 type redisStore struct {
 	addr string
-	mu   sync.Mutex // guards conn pool (single persistent conn for KV ops)
-	conn net.Conn
-
+	// pool holds idle *poolConn values for KV / Push / Publish ops.
+	// Each caller gets exclusive ownership of the connection it borrows —
+	// there is no shared mutable socket, so concurrent callers never race.
+	pool   sync.Pool
 	closed atomic.Bool
 	stopCh chan struct{}
 }
@@ -44,48 +49,77 @@ func (s *redisStore) dial() (net.Conn, error) {
 	return respDial(s.addr)
 }
 
-// conn returns a live connection, re-dialing if needed.
-func (s *redisStore) getConn() (net.Conn, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.conn != nil {
-		// Ping to verify liveness.
-		if err := respSend(s.conn, "PING"); err == nil {
-			if reply, err := respRead(s.conn); err == nil && reply == "PONG" {
-				return s.conn, nil
+// acquireConn returns a live connection.  It tries the pool first, PING-checks
+// it under a short deadline, and dials fresh if the pool is empty or stale.
+func (s *redisStore) acquireConn() (net.Conn, error) {
+	if pc, _ := s.pool.Get().(*poolConn); pc != nil {
+		const pingTimeout = 2 * time.Second
+		_ = pc.SetDeadline(time.Now().Add(pingTimeout))
+		if err := respSend(pc.Conn, "PING"); err == nil {
+			if reply, err := respRead(pc.Conn); err == nil && reply == "PONG" {
+				_ = pc.SetDeadline(time.Time{})
+				return pc.Conn, nil
 			}
 		}
-		s.conn.Close()
-		s.conn = nil
+		pc.Conn.Close()
 	}
-	c, err := respDial(s.addr)
-	if err != nil {
-		return nil, err
-	}
-	s.conn = c
-	return c, nil
+	return s.dial()
 }
 
-func (s *redisStore) Set(_ context.Context, key string, value []byte, ttlSeconds int64) error {
-	c, err := s.getConn()
+// releaseConn returns a healthy connection to the pool.
+func (s *redisStore) releaseConn(c net.Conn) {
+	if c != nil {
+		s.pool.Put(&poolConn{c})
+	}
+}
+
+// withConn acquires a connection, calls fn, and releases it on success
+// (or closes it on error so a broken conn is never returned to the pool).
+func (s *redisStore) withConn(fn func(net.Conn) error) error {
+	c, err := s.acquireConn()
 	if err != nil {
 		return err
 	}
-	encoded := hex.EncodeToString(value)
-	if ttlSeconds > 0 {
-		_, err = respSendRead(c, "SET", key, encoded, "EX", strconv.FormatInt(ttlSeconds, 10))
-	} else {
-		_, err = respSendRead(c, "SET", key, encoded)
+	if err := fn(c); err != nil {
+		c.Close()
+		return err
 	}
-	return err
+	s.releaseConn(c)
+	return nil
+}
+
+// withConnQuery is like withConn but also returns a value.
+func (s *redisStore) withConnQuery(fn func(net.Conn) (any, error)) (any, error) {
+	c, err := s.acquireConn()
+	if err != nil {
+		return nil, err
+	}
+	v, err := fn(c)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	s.releaseConn(c)
+	return v, nil
+}
+
+func (s *redisStore) Set(_ context.Context, key string, value []byte, ttlSeconds int64) error {
+	encoded := hex.EncodeToString(value)
+	return s.withConn(func(c net.Conn) error {
+		var err error
+		if ttlSeconds > 0 {
+			_, err = respSendRead(c, "SET", key, encoded, "EX", strconv.FormatInt(ttlSeconds, 10))
+		} else {
+			_, err = respSendRead(c, "SET", key, encoded)
+		}
+		return err
+	})
 }
 
 func (s *redisStore) Get(_ context.Context, key string) ([]byte, bool, error) {
-	c, err := s.getConn()
-	if err != nil {
-		return nil, false, err
-	}
-	reply, err := respSendRead(c, "GET", key)
+	reply, err := s.withConnQuery(func(c net.Conn) (any, error) {
+		return respSendRead(c, "GET", key)
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -104,15 +138,14 @@ func (s *redisStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 }
 
 func (s *redisStore) Delete(_ context.Context, key string) error {
-	c, err := s.getConn()
-	if err != nil {
+	return s.withConn(func(c net.Conn) error {
+		_, err := respSendRead(c, "DEL", key)
 		return err
-	}
-	_, err = respSendRead(c, "DEL", key)
-	return err
+	})
 }
 
 func (s *redisStore) List(_ context.Context, prefix string) ([]string, error) {
+	// SCAN uses cursor iteration; keep a dedicated connection for the loop.
 	c, err := s.dial()
 	if err != nil {
 		return nil, err
@@ -149,12 +182,10 @@ func (s *redisStore) List(_ context.Context, prefix string) ([]string, error) {
 }
 
 func (s *redisStore) Publish(_ context.Context, channel string, payload []byte) error {
-	c, err := s.getConn()
-	if err != nil {
+	return s.withConn(func(c net.Conn) error {
+		_, err := respSendRead(c, "PUBLISH", channel, hex.EncodeToString(payload))
 		return err
-	}
-	_, err = respSendRead(c, "PUBLISH", channel, hex.EncodeToString(payload))
-	return err
+	})
 }
 
 // Subscribe listens on channels matching channelPrefix using Redis PSUBSCRIBE.
@@ -164,12 +195,10 @@ func (s *redisStore) Subscribe(ctx context.Context, channelPrefix string) (<-cha
 	if err != nil {
 		return nil, fmt.Errorf("coord/redis: subscribe dial: %w", err)
 	}
-
 	if err := respSend(c, "PSUBSCRIBE", channelPrefix+"*"); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("coord/redis: PSUBSCRIBE: %w", err)
 	}
-
 	ch := make(chan Event, 64)
 	go s.readPubSub(ctx, c, ch)
 	return ch, nil
@@ -226,12 +255,14 @@ func (s *redisStore) Close() error {
 		return nil
 	}
 	close(s.stopCh)
-	s.mu.Lock()
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
+	// Drain the pool and close all idle connections.
+	for {
+		pc, _ := s.pool.Get().(*poolConn)
+		if pc == nil {
+			break
+		}
+		pc.Conn.Close()
 	}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -250,18 +281,16 @@ const (
 // Push enqueues payload on queue using Redis LPUSH.
 // Exactly one Pull caller (across all nodes) will dequeue it via BRPOP.
 func (s *redisStore) Push(_ context.Context, queue string, payload []byte) error {
-	c, err := s.getConn()
-	if err != nil {
+	return s.withConn(func(c net.Conn) error {
+		_, err := respSendRead(c, "LPUSH", queue, hex.EncodeToString(payload))
 		return err
-	}
-	_, err = respSendRead(c, "LPUSH", queue, hex.EncodeToString(payload))
-	return err
+	})
 }
 
 // Pull dequeues the next item from queue using Redis BRPOP.
 // Blocks until an item is available or ctx is cancelled.
 // Opens a dedicated connection per call — BRPOP occupies the connection
-// for the duration of the block, so it cannot share the KV connection.
+// for the duration of the block, so it cannot share the KV connection pool.
 func (s *redisStore) Pull(ctx context.Context, queue string) ([]byte, error) {
 	for {
 		select {

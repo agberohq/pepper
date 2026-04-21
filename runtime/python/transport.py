@@ -167,6 +167,7 @@ class _RedisTransport(_TransportImpl):
         self._send_lock = threading.Lock()
         self._inbox: _queue.Queue[bytes] = _queue.Queue(maxsize=512)
         self._queues: list[str] = []
+        self._sub_patterns: list[str] = []
         self._stop = threading.Event()
 
     def _dial(self) -> socket.socket:
@@ -194,9 +195,10 @@ class _RedisTransport(_TransportImpl):
         sub_topics = [t for t in topics if not t.startswith("pepper.push.")]
 
         if sub_topics:
-            # PSUBSCRIBE for wildcard matching on control/broadcast topics.
-            patterns = [t if t.endswith("*") else t + "*" for t in sub_topics]
-            cmd = _resp_encode("PSUBSCRIBE", *patterns)
+            # Store patterns so _pubsub_loop can re-subscribe after reconnect.
+            self._sub_patterns = [t if t.endswith("*") else t + "*" for t in sub_topics]
+            # Issue the initial PSUBSCRIBE on the already-connected _sub_conn.
+            cmd = _resp_encode("PSUBSCRIBE", *self._sub_patterns)
             self._sub_conn.sendall(cmd)
             t = threading.Thread(target=self._pubsub_loop, daemon=True)
             t.start()
@@ -229,14 +231,27 @@ class _RedisTransport(_TransportImpl):
                     time.sleep(0.5)
 
     def _pubsub_loop(self) -> None:
-        """Background thread: read PSUBSCRIBE messages."""
+        """Background thread: read PSUBSCRIBE messages.
+
+        Reconnects and re-issues PSUBSCRIBE on every outer-loop entry so that
+        a broken socket (e.g. from an i/o timeout under concurrent load) never
+        gets reused. This mirrors _brpop_loop's dial-per-outer-iteration pattern.
+        """
         while not self._stop.is_set():
+            conn: socket.socket | None = None
             try:
+                # Dial a fresh connection and re-subscribe on each (re)entry.
+                conn = self._dial()
+                cmd = _resp_encode("PSUBSCRIBE", *self._sub_patterns)
+                conn.sendall(cmd)
+                # Keep the shared _sub_conn reference current so close() can
+                # tear it down cleanly on shutdown.
+                self._sub_conn = conn
                 while not self._stop.is_set():
-                    self._sub_conn.settimeout(2)
+                    conn.settimeout(2)
                     try:
-                        reply = _resp_read(self._sub_conn)
-                    except TimeoutError:
+                        reply = _resp_read(conn)
+                    except (TimeoutError, socket.timeout):
                         continue
                     if not isinstance(reply, list) or len(reply) < 4:
                         continue
@@ -251,6 +266,14 @@ class _RedisTransport(_TransportImpl):
                 if not self._stop.is_set():
                     log.warning("redis pubsub error: %s — retrying", exc)
                     time.sleep(0.5)
+            finally:
+                # Always close the per-iteration connection on exit; a new one
+                # will be dialled at the top of the next outer-loop iteration.
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
 
     def send_frame(self, data: bytes) -> None:
         # In distributed mode the worker sends responses back to the router
@@ -303,14 +326,42 @@ class _NATSTransport(_TransportImpl):
 
     def _dial(self) -> socket.socket:
         conn = socket.create_connection((self._host, self._port), timeout=5)
-        conn.settimeout(None)
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Drain INFO line.
+        # Drain lines until INFO is seen.
         buf = b""
-        while b"\r\n" not in buf:
-            buf += conn.recv(4096)
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise ConnectionResetError("nats: server closed on connect")
+            buf += chunk
+            if b"\r\n" in buf:
+                line, buf = buf.split(b"\r\n", 1)
+                if line.startswith(b"INFO"):
+                    break
         # Send CONNECT.
         conn.sendall(b"CONNECT {}\r\n")
+        # Drain the server's immediate post-CONNECT PING and respond.
+        # NATS sends PING right after CONNECT to verify liveness; an unanswered
+        # PING causes the server to close the connection within ~2 seconds, which
+        # means worker_hello (sent over this same connection) is silently dropped.
+        conn.settimeout(0.5)
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\r\n" in buf:
+                    line, buf = buf.split(b"\r\n", 1)
+                    line_s = line.decode("utf-8", errors="replace").strip()
+                    if line_s == "PING":
+                        conn.sendall(b"PONG\r\n")
+                    # Stop after the first non-empty, non-PING line (+OK, -ERR, etc.)
+                    elif line_s:
+                        raise StopIteration
+        except (TimeoutError, socket.timeout, StopIteration, OSError):
+            pass
+        conn.settimeout(None)
         return conn
 
     def connect(self, retries: int = 10) -> None:
@@ -318,12 +369,39 @@ class _NATSTransport(_TransportImpl):
             try:
                 self._pub_conn = self._dial()
                 self._sub_conn = self._dial()
+                # Keep both connections alive by responding to server PINGs.
+                # _recv_loop handles _sub_conn; start a mirror thread for _pub_conn.
+                t = threading.Thread(target=self._pub_pong_loop, daemon=True)
+                t.start()
                 return
             except OSError as exc:
                 log.debug("nats connect attempt %d: %s", attempt + 1, exc)
                 time.sleep(0.1 * (2 ** attempt))
         log.error("nats: could not connect to %s:%s", self._host, self._port)
         sys.exit(1)
+
+    def _pub_pong_loop(self) -> None:
+        """Background thread: respond to PING on _pub_conn to keep it alive."""
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                self._pub_conn.settimeout(2)
+                chunk = self._pub_conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\r\n" in buf:
+                    line, buf = buf.split(b"\r\n", 1)
+                    if line.strip() == b"PING":
+                        try:
+                            with self._send_lock:
+                                self._pub_conn.sendall(b"PONG\r\n")
+                        except OSError:
+                            return
+            except (TimeoutError, socket.timeout):
+                continue
+            except OSError:
+                break
 
     def subscribe(self, topics: list[str]) -> None:
         push_topics = [t for t in topics if t.startswith("pepper.push.")]
@@ -356,6 +434,16 @@ class _NATSTransport(_TransportImpl):
                 while b"\r\n" in buf:
                     line, buf = buf.split(b"\r\n", 1)
                     line = line.decode("utf-8", errors="replace")
+                    # NATS sends PING frames to check client liveness; we must
+                    # respond with PONG or the server will close the connection.
+                    # Without this, worker_hello is never delivered and startup
+                    # times out with "timed out waiting for a worker to become ready".
+                    if line == "PING":
+                        try:
+                            self._sub_conn.sendall(b"PONG\r\n")
+                        except OSError:
+                            pass
+                        continue
                     if not line.startswith("MSG"):
                         continue
                     parts = line.split()
@@ -374,7 +462,7 @@ class _NATSTransport(_TransportImpl):
                     except ValueError:
                         continue
                     self._inbox.put(_wrap_payload(data), timeout=1)
-            except TimeoutError:
+            except (TimeoutError, socket.timeout):
                 continue
             except Exception as exc:
                 if not self._stop.is_set():

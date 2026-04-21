@@ -110,6 +110,21 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 		t.Fatalf("coord connect %s: %v", coordURL, err)
 	}
 
+	// Flush any stale queue items left by previous test runs.
+	// Without this, failed subtests leave items in pepper.push.* that get
+	// picked up by workers in the next subtest, causing "cap not found" errors.
+	ctx := context.Background()
+	if keys, err := c.List(ctx, "pepper.push."); err == nil {
+		for _, k := range keys {
+			_ = c.Delete(ctx, k)
+		}
+	}
+	if keys, err := c.List(ctx, "pepper:cap:"); err == nil {
+		for _, k := range keys {
+			_ = c.Delete(ctx, k)
+		}
+	}
+
 	// nodeA — has the workers, registered capabilities execute here
 	nodeA, err := New(
 		WithWorkers(
@@ -142,18 +157,18 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 
 // capability sources
 
-// echoClusterCapSrc echoes inputs back with the worker ID appended.
+// echoClusterCapSrc echoes inputs back. Minimal — no pepper.* calls needed.
 const echoClusterCapSrc = `# pepper:name = cluster.echo
 # pepper:groups = default
 
 def run(inputs: dict) -> dict:
-    return {**inputs, "worker": pepper.corr_id()[:8]}
+    return {**inputs, "echoed": True}
 `
 
-// counterCapSrc increments a shared counter using pepper.kv (worker-local)
-// and also writes to the session so nodeB can observe it via coord.
+// counterCapSrc increments a worker-local counter using pepper.kv.
 const counterCapSrc = `# pepper:name = cluster.counter
 # pepper:groups = default
+from runtime import pepper
 
 def run(inputs: dict) -> dict:
     kv = pepper.kv("counters")
@@ -161,23 +176,22 @@ def run(inputs: dict) -> dict:
     count = (kv.get(key) or 0) + 1
     kv.set(key, count)
 
-    # Also persist to the session so the orchestrator node can read it.
+    # Also persist to session so the orchestrator node can observe via coord.
     sess = pepper.session()
     sess.set(key, count)
 
-    return {"key": key, "count": count, "worker": pepper.corr_id()[:8]}
+    return {"key": key, "count": count}
 `
 
-// slowCapSrc simulates a long-running cap for concurrency tests.
+// slowCapSrc simulates a slow cap for concurrency tests.
 const slowCapSrc = `# pepper:name = cluster.slow
 # pepper:groups = default
-
 import time
 
 def run(inputs: dict) -> dict:
     delay = float(inputs.get("delay_s", 0.1))
     time.sleep(delay)
-    return {"slept_s": delay, "worker": pepper.corr_id()[:8]}
+    return {"slept_s": delay}
 `
 
 // tests

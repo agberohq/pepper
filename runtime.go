@@ -24,9 +24,9 @@ import (
 	"github.com/agberohq/pepper/internal/registry"
 	"github.com/agberohq/pepper/internal/router"
 	"github.com/agberohq/pepper/internal/sub"
-	adapter2 "github.com/agberohq/pepper/runtime/adapter"
-	cli2 "github.com/agberohq/pepper/runtime/cli"
-	goruntime2 "github.com/agberohq/pepper/runtime/goruntime"
+	"github.com/agberohq/pepper/runtime/adapter"
+	"github.com/agberohq/pepper/runtime/cli"
+	"github.com/agberohq/pepper/runtime/goruntime"
 	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/jack"
 )
@@ -142,6 +142,7 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		DLQ:              p.cfg.DLQ,
 		Codec:            p.codec,
 		HeartbeatTimeout: p.cfg.HeartbeatInterval * 3,
+		Distributed:      p.cfg.Coord != nil,
 	}, p.logger)
 	rt.doctor = jack.NewDoctor(
 		jack.DoctorWithMaxConcurrent(len(p.cfg.Workers)+4),
@@ -282,8 +283,10 @@ func (p *Pepper) routeResponse(data []byte) {
 	// store here so state survives across requests.
 	sessionID, _ := raw["session_id"].(string)
 	if sessionID != "" {
-		if updates, ok := env.Meta()["_session_updates"].(map[string]any); ok && len(updates) > 0 {
-			_ = p.sessions.Merge(sessionID, updates)
+		if meta := env.Meta(); meta != nil {
+			if updates := extractMap(meta["_session_updates"]); len(updates) > 0 {
+				_ = p.sessions.Merge(sessionID, updates)
+			}
 		}
 	}
 
@@ -796,7 +799,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 		if !ok {
 			return fmt.Errorf("go worker %q: GoWorker does not implement pepper.Worker", spec.Name)
 		}
-		bridge := goruntime2.NewBridge(pw)
+		bridge := goruntime.NewBridge(pw)
 		// Inject the wire codec into typedWorkerWrapper so it can encode/decode
 		// typed structs using the same codec as the rest of the pipeline.
 		if cs, ok := pw.(interface {
@@ -809,7 +812,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 			groups = []string{"default"}
 		}
 		wid := "go-" + p.sanitizeName(spec.Name)
-		rt := goruntime2.New(wid, bridge, groups, p.rt.bus, p.codec, p.logger)
+		rt := goruntime.New(wid, bridge, groups, p.rt.bus, p.codec, p.logger)
 		cfg := spec.Config
 		if cfg == nil {
 			cfg = map[string]any{}
@@ -843,24 +846,24 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		}
 		wid := "http-" + p.sanitizeName(spec.Name)
 
-		var a adapter2.Adapter
-		var auth adapter2.AuthProvider
+		var a adapter.Adapter
+		var auth adapter.AuthProvider
 		var baseURL string
 		timeout := DefaultAdapterTimeout
 
 		switch v := spec.AdapterSpec.(type) {
-		case *adapter2.HTTPBuilder:
+		case *adapter.HTTPBuilder:
 			a = v.GetAdapter()
 			auth = v.GetAuth()
 			baseURL = v.GetBaseURL()
 			if t := v.GetTimeout(); t > 0 {
 				timeout = t
 			}
-		case *adapter2.MCPBuilder:
-			a = &adapter2.MCPAdapter{ServerURL: v.GetServerURL(), ToolName: v.GetTool()}
+		case *adapter.MCPBuilder:
+			a = &adapter.MCPAdapter{ServerURL: v.GetServerURL(), ToolName: v.GetTool()}
 			baseURL = v.GetServerURL()
 		default:
-			if direct, ok := spec.AdapterSpec.(adapter2.Adapter); ok {
+			if direct, ok := spec.AdapterSpec.(adapter.Adapter); ok {
 				a = direct
 				baseURL = spec.Source
 			} else {
@@ -868,7 +871,7 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 			}
 		}
 
-		wrt := adapter2.NewBusWorker(wid, spec.Name, a, auth, baseURL, timeout, groups, p.rt.bus, p.codec, p.logger)
+		wrt := adapter.NewBusWorker(wid, spec.Name, a, auth, baseURL, timeout, groups, p.rt.bus, p.codec, p.logger)
 		if err := wrt.Start(ctx); err != nil {
 			p.logger.Fields("worker", wid, "error", err).Warn("adapter worker start warning")
 		}
@@ -887,7 +890,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 		if spec.Runtime != registry.RuntimeCLI || spec.CLISpec == nil {
 			continue
 		}
-		cmdSpec, ok := spec.CLISpec.(*cli2.CMDSpec)
+		cmdSpec, ok := spec.CLISpec.(*cli.CMDSpec)
 		if !ok {
 			return fmt.Errorf("cli worker %q: unexpected CLISpec type %T", spec.Name, spec.CLISpec)
 		}
@@ -896,7 +899,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 			groups = []string{"default"}
 		}
 		wid := "cli-" + p.sanitizeName(spec.Name)
-		wrt := cli2.NewBusWorker(wid, spec.Name, *cmdSpec, groups, p.rt.bus, p.codec, p.rt.blob, p.cfg.DefaultTimeout+30*time.Second, p.logger)
+		wrt := cli.NewBusWorker(wid, spec.Name, *cmdSpec, groups, p.rt.bus, p.codec, p.rt.blob, p.cfg.DefaultTimeout+30*time.Second, p.logger)
 		if err := wrt.Start(ctx); err != nil {
 			return fmt.Errorf("cli worker %q start: %w", spec.Name, err)
 		}
@@ -1039,4 +1042,22 @@ func newBus(url string, cfg bus.Config) (bus.Bus, error) {
 	default:
 		return nil, fmt.Errorf("bus: unknown transport URL %q", url)
 	}
+}
+
+// extractMap normalises a value that may be map[string]any (JSON) or
+// map[any]any (msgpack) into map[string]any. Returns nil for other types.
+func extractMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	if m, ok := v.(map[any]any); ok {
+		out := make(map[string]any, len(m))
+		for k, val := range m {
+			if ks, ok := k.(string); ok {
+				out[ks] = val
+			}
+		}
+		return out
+	}
+	return nil
 }

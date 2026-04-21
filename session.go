@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/agberohq/pepper/internal/core"
-	"github.com/agberohq/pepper/internal/runtime/goruntime"
+	"github.com/agberohq/pepper/runtime/goruntime"
 )
 
 // Session is a stateful handle bound to a named session ID.

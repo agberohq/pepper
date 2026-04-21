@@ -439,17 +439,17 @@ class TestBusTransportParsing:
         assert t.scheme == "mula"
         assert t.port == 7731
 
-    def test_redis_scheme_raises_not_implemented(self):
-        """Redis transport is stubbed — must raise NotImplementedError, not silently mis-connect."""
-        import pytest
-        with pytest.raises(NotImplementedError, match="redis"):
-            BusTransport("redis://127.0.0.1:6379")
+    def test_redis_scheme_parses(self):
+        """Redis transport is implemented — constructor must succeed."""
+        t = BusTransport("redis://127.0.0.1:6379")
+        assert t.scheme == "redis"
+        assert t.port == 6379
 
-    def test_nats_scheme_raises_not_implemented(self):
-        """NATS transport is stubbed — must raise NotImplementedError, not silently mis-connect."""
-        import pytest
-        with pytest.raises(NotImplementedError, match="nats"):
-            BusTransport("nats://127.0.0.1:4222")
+    def test_nats_scheme_parses(self):
+        """NATS transport is implemented — constructor must succeed."""
+        t = BusTransport("nats://127.0.0.1:4222")
+        assert t.scheme == "nats"
+        assert t.port == 4222
 
 
 class TestBusTransportTCP:
@@ -495,10 +495,8 @@ class TestBusTransportTCP:
 
 class TestRedisWorkerConnectivity:
     """
-    Verifies that a Python worker could reach Redis when PEPPER_BUS_URL points
-    to a redis:// address.  Currently raises NotImplementedError (transport
-    is stubbed); these tests document the expected future behaviour and prove
-    the port is open when Redis is running.
+    Verifies that a Python worker can reach Redis when PEPPER_BUS_URL points
+    to a redis:// address. The Redis transport is fully implemented.
 
     All tests in this class skip automatically when Redis is not reachable.
     """
@@ -521,25 +519,23 @@ class TestRedisWorkerConnectivity:
             resp = conn.recv(128)
         assert resp.startswith(b"+PONG"), f"unexpected Redis response: {resp!r}"
 
-    def test_redis_url_raises_not_implemented(self):
+    def test_redis_url_constructs_and_parses(self):
         """
-        Until the Python runtime implements redis://, BusTransport must raise
-        NotImplementedError so workers fail fast with a clear message rather
-        than connecting to the wrong port.
+        BusTransport accepts redis:// URLs — the transport is fully implemented.
+        Verifies construction succeeds and parses the URL correctly.
         """
         self._require_redis()
-        import pytest
         url = f"redis://{_REDIS_HOST}:{_REDIS_PORT}"
-        with pytest.raises(NotImplementedError, match="redis"):
-            BusTransport(url)
+        t = BusTransport(url)
+        assert t.scheme == "redis"
+        assert t.host == _REDIS_HOST
+        assert t.port == _REDIS_PORT
 
 
 class TestNATSWorkerConnectivity:
     """
-    Verifies that a Python worker could reach NATS when PEPPER_BUS_URL points
-    to a nats:// address.  Currently raises NotImplementedError (transport is
-    stubbed); these tests document expected future behaviour and prove the INFO
-    handshake works when NATS is running.
+    Verifies that a Python worker can reach NATS when PEPPER_BUS_URL points
+    to a nats:// address. The NATS transport is fully implemented.
 
     All tests in this class skip automatically when NATS is not reachable.
     """
@@ -582,13 +578,14 @@ class TestNATSWorkerConnectivity:
             resp = conn.recv(64)
         assert b"PONG" in resp, f"expected PONG, got: {resp!r}"
 
-    def test_nats_url_raises_not_implemented(self):
+    def test_nats_url_constructs_and_parses(self):
         """
-        Until the Python runtime implements nats://, BusTransport must raise
-        NotImplementedError so workers fail fast with a clear message.
+        BusTransport accepts nats:// URLs — the transport is fully implemented.
+        Verifies construction succeeds and parses the URL correctly.
         """
         self._require_nats()
-        import pytest
         url = f"nats://{_NATS_HOST}:{_NATS_PORT}"
-        with pytest.raises(NotImplementedError, match="nats"):
-            BusTransport(url)
+        t = BusTransport(url)
+        assert t.scheme == "nats"
+        assert t.host == _NATS_HOST
+        assert t.port == _NATS_PORT

@@ -49,7 +49,7 @@ import (
 	"time"
 
 	"github.com/agberohq/pepper/internal/core"
-	"github.com/agberohq/pepper/internal/runtime/adapter"
+	"github.com/agberohq/pepper/runtime/adapter"
 )
 
 // skip guards
@@ -170,55 +170,32 @@ def run(inputs: dict) -> dict:
 `
 
 // transcribeCapSrc is the Whisper transcription cap.
+// Uses pepper.kv() for model caching and pepper.cache_dir() for a canonical
+// download location — eliminates per-test re-downloads and module-level globals.
 const transcribeCapSrc = `# pepper:name    = speech.transcribe
 # pepper:version = 1.0.0
 # pepper:groups  = gpu,cpu
 # pepper:deps    = faster-whisper>=1.0.0
 
-import os
 import time
 
-_model = None
-_model_load_time = None
-_cache_dir = None
-
-def _model_is_cached(model_size: str, cache_dir: str) -> bool:
-    """Return True if the faster-whisper model is already in the local cache."""
-    try:
-        from huggingface_hub import try_to_load_from_cache
-        repo_id = f"Systran/faster-whisper-{model_size}"
-        result = try_to_load_from_cache(repo_id, "model.bin", cache_dir=cache_dir)
-        return result is not None and result != "" and not isinstance(result, type(None))
-    except Exception:
-        return False
-
 def setup(config: dict) -> None:
-    global _model, _model_load_time, _cache_dir
     from faster_whisper import WhisperModel
 
     model_size = config.get("model_size", "tiny")
     device = "cuda" if _cuda_available() else "cpu"
     compute = "float16" if device == "cuda" else "int8"
+    cache_dir = pepper.cache_dir()
 
-    _cache_dir = os.environ.get(
-        "HF_HOME",
-        os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-    )
+    def _load():
+        t0 = time.monotonic()
+        m = WhisperModel(model_size, device=device, compute_type=compute,
+                         download_root=cache_dir)
+        return {"model": m, "load_s": round(time.monotonic() - t0, 3), "cache_dir": cache_dir}
 
-    t0 = time.monotonic()
-    if _model_is_cached(model_size, _cache_dir):
-        # Model already on disk — load without any network calls.
-        _model = WhisperModel(
-            model_size, device=device, compute_type=compute,
-            download_root=_cache_dir, local_files_only=True,
-        )
-    else:
-        # First run — allow download, then it will be cached for subsequent runs.
-        _model = WhisperModel(
-            model_size, device=device, compute_type=compute,
-            download_root=_cache_dir,
-        )
-    _model_load_time = time.monotonic() - t0
+    # get_or_set loads the model exactly once per process, reusing it across
+    # all requests and all caps on this worker — no module-level globals needed.
+    pepper.kv("models").get_or_set(f"whisper-{model_size}", _load)
 
 def _cuda_available() -> bool:
     try:
@@ -228,17 +205,18 @@ def _cuda_available() -> bool:
         return False
 
 def run(inputs: dict) -> dict:
-    if _model is None:
+    model_size = pepper.config().get("model_size", "tiny")
+    entry = pepper.kv("models").get(f"whisper-{model_size}")
+    if entry is None:
         return {"error": "model not loaded — setup() was not called"}
 
     audio_path = inputs.get("denoised_path") or inputs.get("audio_path", "")
     if not audio_path:
         return {"error": "no audio_path or denoised_path provided"}
 
-    import time
     t0 = time.monotonic()
-    segments, info = _model.transcribe(audio_path, beam_size=3)
-    segments = list(segments)  # consume generator
+    segments, info = entry["model"].transcribe(audio_path, beam_size=3)
+    segments = list(segments)
     latency = time.monotonic() - t0
 
     transcript = " ".join(seg.text.strip() for seg in segments)
@@ -247,8 +225,8 @@ def run(inputs: dict) -> dict:
         "language": info.language,
         "duration": info.duration,
         "latency_s": round(latency, 3),
-        "model_load_s": round(_model_load_time, 3),
-        "model_cache_dir": _cache_dir,
+        "model_load_s": entry["load_s"],
+        "model_cache_dir": entry["cache_dir"],
         "segment_count": len(segments),
     }
 `

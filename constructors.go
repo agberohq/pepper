@@ -1,8 +1,8 @@
 package pepper
 
 import (
-	"github.com/agberohq/pepper/internal/runtime/adapter"
-	"github.com/agberohq/pepper/internal/runtime/cli"
+	"github.com/agberohq/pepper/runtime/adapter"
+	"github.com/agberohq/pepper/runtime/cli"
 )
 
 // HTTPAdapter starts building an HTTP adapter capability builder.

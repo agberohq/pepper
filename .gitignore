@@ -3,3 +3,5 @@ _*/
 .venv/
 *.egg-info
 hub
+xet
+/models*

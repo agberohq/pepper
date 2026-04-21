@@ -193,11 +193,11 @@ func (f *RuntimeFinder) validRuntimeDir(dir string) bool {
 
 func (f *RuntimeFinder) legacyFallback(specs []*registry.Spec) string {
 	// Original logic preserved exactly
-	if f.fileExists("internal/runtime/python/runtime.py") {
-		return "internal/runtime/python/runtime.py"
+	if f.fileExists("runtime/python/runtime.py") {
+		return "runtime/python/runtime.py"
 	}
-	if f.fileExists("../internal/runtime/python/runtime.py") {
-		return "../internal/runtime/python/runtime.py"
+	if f.fileExists("../runtime/python/runtime.py") {
+		return "../runtime/python/runtime.py"
 	}
 
 	for _, s := range specs {

@@ -1,5 +1,5 @@
 """
-Unit tests for cap.py. Run with: python -m pytest internal/runtime/python/test_cap.py -v
+Unit tests for cap.py. Run with: python -m pytest runtime/python/test_cap.py -v
 """
 
 import sys

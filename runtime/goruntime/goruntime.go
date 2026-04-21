@@ -27,7 +27,7 @@ import (
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/envelope"
-	"github.com/agberohq/pepper/internal/runtime/adapter"
+	"github.com/agberohq/pepper/runtime/adapter"
 	"github.com/olekukonko/ll"
 )
 

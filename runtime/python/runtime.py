@@ -14,7 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Generator
+from typing import Any, Dict
 import socket
 
 # ── Logging — structured JSON to fd 3 (Go reads it), fallback to stderr ──────
@@ -128,6 +128,113 @@ class pepper:
         return BlobWriter.write(data, dtype=dtype, shape=shape or [], format=format,
                                 origin_id=_origin_id_var.get())
 
+    @staticmethod
+    def kv(namespace: str = "default") -> "_KVStore":
+        """Return a shared key-value store scoped to a namespace.
+
+        The KV store is process-local (all caps on this worker share it).
+        Use it to cache expensive objects (models, tokenizers, connections)
+        across requests without re-loading them each time.
+
+        Example::
+
+            # In setup():
+            pepper.kv("models").set("whisper", WhisperModel("tiny"))
+
+            # In run():
+            model = pepper.kv("models").get("whisper")
+        """
+        return _KVStore.for_namespace(namespace)
+
+    @staticmethod
+    def cache_dir() -> str:
+        """Return the canonical Pepper model/data cache directory.
+
+        Resolves in priority order:
+          1. ``PEPPER_CACHE_DIR`` environment variable
+          2. ``HF_HOME`` environment variable (HuggingFace compatibility)
+          3. ``~/.cache/pepper``
+
+        Capabilities should use this instead of hardcoding cache paths so
+        that operators can redirect the cache with a single env var.
+
+        Example::
+
+            model = WhisperModel("tiny", download_root=pepper.cache_dir())
+        """
+        return _resolve_cache_dir()
+
+
+def _resolve_cache_dir() -> str:
+    """Resolve the canonical Pepper cache directory (module-level helper)."""
+    d = (
+        os.environ.get("PEPPER_CACHE_DIR")
+        or os.environ.get("HF_HOME")
+        or os.path.join(os.path.expanduser("~"), ".cache", "pepper")
+    )
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+class _KVStore:
+    """Process-local key-value store. One instance per namespace, shared across all caps."""
+
+    _stores: dict[str, "_KVStore"] = {}
+    _lock = threading.Lock()
+
+    def __init__(self, namespace: str) -> None:
+        self._namespace = namespace
+        self._data: dict[str, Any] = {}
+        self._rw = threading.RLock()
+
+    @classmethod
+    def for_namespace(cls, namespace: str) -> "_KVStore":
+        with cls._lock:
+            if namespace not in cls._stores:
+                cls._stores[namespace] = cls(namespace)
+            return cls._stores[namespace]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._rw:
+            return self._data.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        with self._rw:
+            self._data[key] = value
+
+    def delete(self, key: str) -> None:
+        with self._rw:
+            self._data.pop(key, None)
+
+    def get_or_set(self, key: str, factory) -> Any:
+        """Return cached value, or call factory() once and cache the result.
+
+        Thread-safe: factory is called at most once per key even under
+        concurrent requests. Ideal for lazy model loading::
+
+            model = pepper.kv("models").get_or_set(
+                "whisper-tiny",
+                lambda: WhisperModel("tiny", download_root=pepper.cache_dir()),
+            )
+        """
+        with self._rw:
+            if key in self._data:
+                return self._data[key]
+            value = factory()
+            self._data[key] = value
+            return value
+
+    def keys(self) -> list[str]:
+        with self._rw:
+            return list(self._data.keys())
+
+    def clear(self) -> None:
+        with self._rw:
+            self._data.clear()
+
+    def __repr__(self) -> str:
+        with self._rw:
+            return f"_KVStore(namespace={self._namespace!r}, keys={list(self._data)!r})"
 
 class SessionProxy:
     def __init__(self, data: dict): self._data = data

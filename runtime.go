@@ -23,10 +23,10 @@ import (
 	"github.com/agberohq/pepper/internal/pending"
 	"github.com/agberohq/pepper/internal/registry"
 	"github.com/agberohq/pepper/internal/router"
-	"github.com/agberohq/pepper/internal/runtime/adapter"
-	"github.com/agberohq/pepper/internal/runtime/cli"
-	"github.com/agberohq/pepper/internal/runtime/goruntime"
 	"github.com/agberohq/pepper/internal/sub"
+	adapter2 "github.com/agberohq/pepper/runtime/adapter"
+	cli2 "github.com/agberohq/pepper/runtime/cli"
+	goruntime2 "github.com/agberohq/pepper/runtime/goruntime"
 	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/jack"
 )
@@ -796,7 +796,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 		if !ok {
 			return fmt.Errorf("go worker %q: GoWorker does not implement pepper.Worker", spec.Name)
 		}
-		bridge := goruntime.NewBridge(pw)
+		bridge := goruntime2.NewBridge(pw)
 		// Inject the wire codec into typedWorkerWrapper so it can encode/decode
 		// typed structs using the same codec as the rest of the pipeline.
 		if cs, ok := pw.(interface {
@@ -809,7 +809,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 			groups = []string{"default"}
 		}
 		wid := "go-" + p.sanitizeName(spec.Name)
-		rt := goruntime.New(wid, bridge, groups, p.rt.bus, p.codec, p.logger)
+		rt := goruntime2.New(wid, bridge, groups, p.rt.bus, p.codec, p.logger)
 		cfg := spec.Config
 		if cfg == nil {
 			cfg = map[string]any{}
@@ -843,24 +843,24 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		}
 		wid := "http-" + p.sanitizeName(spec.Name)
 
-		var a adapter.Adapter
-		var auth adapter.AuthProvider
+		var a adapter2.Adapter
+		var auth adapter2.AuthProvider
 		var baseURL string
 		timeout := DefaultAdapterTimeout
 
 		switch v := spec.AdapterSpec.(type) {
-		case *adapter.HTTPBuilder:
+		case *adapter2.HTTPBuilder:
 			a = v.GetAdapter()
 			auth = v.GetAuth()
 			baseURL = v.GetBaseURL()
 			if t := v.GetTimeout(); t > 0 {
 				timeout = t
 			}
-		case *adapter.MCPBuilder:
-			a = &adapter.MCPAdapter{ServerURL: v.GetServerURL(), ToolName: v.GetTool()}
+		case *adapter2.MCPBuilder:
+			a = &adapter2.MCPAdapter{ServerURL: v.GetServerURL(), ToolName: v.GetTool()}
 			baseURL = v.GetServerURL()
 		default:
-			if direct, ok := spec.AdapterSpec.(adapter.Adapter); ok {
+			if direct, ok := spec.AdapterSpec.(adapter2.Adapter); ok {
 				a = direct
 				baseURL = spec.Source
 			} else {
@@ -868,7 +868,7 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 			}
 		}
 
-		wrt := adapter.NewBusWorker(wid, spec.Name, a, auth, baseURL, timeout, groups, p.rt.bus, p.codec, p.logger)
+		wrt := adapter2.NewBusWorker(wid, spec.Name, a, auth, baseURL, timeout, groups, p.rt.bus, p.codec, p.logger)
 		if err := wrt.Start(ctx); err != nil {
 			p.logger.Fields("worker", wid, "error", err).Warn("adapter worker start warning")
 		}
@@ -887,7 +887,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 		if spec.Runtime != registry.RuntimeCLI || spec.CLISpec == nil {
 			continue
 		}
-		cmdSpec, ok := spec.CLISpec.(*cli.CMDSpec)
+		cmdSpec, ok := spec.CLISpec.(*cli2.CMDSpec)
 		if !ok {
 			return fmt.Errorf("cli worker %q: unexpected CLISpec type %T", spec.Name, spec.CLISpec)
 		}
@@ -896,7 +896,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 			groups = []string{"default"}
 		}
 		wid := "cli-" + p.sanitizeName(spec.Name)
-		wrt := cli.NewBusWorker(wid, spec.Name, *cmdSpec, groups, p.rt.bus, p.codec, p.rt.blob, p.cfg.DefaultTimeout+30*time.Second, p.logger)
+		wrt := cli2.NewBusWorker(wid, spec.Name, *cmdSpec, groups, p.rt.bus, p.codec, p.rt.blob, p.cfg.DefaultTimeout+30*time.Second, p.logger)
 		if err := wrt.Start(ctx); err != nil {
 			return fmt.Errorf("cli worker %q start: %w", spec.Name, err)
 		}

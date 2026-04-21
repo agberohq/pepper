@@ -86,15 +86,19 @@ class TestBusTransportParsing:
         assert t.scheme == "nanomsg"
         assert t.port == 5555
 
-    def test_redis_scheme_raises(self):
-        """Redis transport raises NotImplementedError until implemented."""
-        with pytest.raises(NotImplementedError, match="redis"):
-            BusTransport("redis://127.0.0.1:6379")
+    def test_redis_scheme_parses(self):
+        """Redis transport is implemented — constructor must succeed and parse the URL."""
+        t = BusTransport("redis://127.0.0.1:6379")
+        assert t.scheme == "redis"
+        assert t.host == "127.0.0.1"
+        assert t.port == 6379
 
-    def test_nats_scheme_raises(self):
-        """NATS transport raises NotImplementedError until implemented."""
-        with pytest.raises(NotImplementedError, match="nats"):
-            BusTransport("nats://127.0.0.1:4222")
+    def test_nats_scheme_parses(self):
+        """NATS transport is implemented — constructor must succeed and parse the URL."""
+        t = BusTransport("nats://127.0.0.1:4222")
+        assert t.scheme == "nats"
+        assert t.host == "127.0.0.1"
+        assert t.port == 4222
 
     def test_legacy_parse_bus_url(self):
         host, port = _parse_bus_url("tcp://192.168.1.5:8080")
@@ -213,15 +217,16 @@ class TestRedisReachability:
         with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=2.0) as conn:
             _send(conn, "DEL", key)
 
-    def test_redis_url_in_env_is_parseable(self):
+    def test_redis_url_constructs_and_parses(self):
         """
-        Validates that a redis:// URL in PEPPER_BUS_URL would be caught early
-        (NotImplementedError) rather than silently mis-connecting.
-        This documents the current state: redis transport is stubbed, not live.
+        Validates that a redis:// URL in PEPPER_BUS_URL is accepted by BusTransport.
+        The transport is fully implemented — construction must succeed.
         """
         url = f"redis://{REDIS_HOST}:{REDIS_PORT}"
-        with pytest.raises(NotImplementedError, match="redis"):
-            BusTransport(url)
+        t = BusTransport(url)
+        assert t.scheme == "redis"
+        assert t.host == REDIS_HOST
+        assert t.port == REDIS_PORT
 
 
 # ── NATS reachability test ────────────────────────────────────────────────────
@@ -288,15 +293,16 @@ class TestNATSReachability:
             resp = conn.recv(64)
         assert b"PONG" in resp, f"Expected PONG, got: {resp!r}"
 
-    def test_nats_url_in_env_is_parseable(self):
+    def test_nats_url_constructs_and_parses(self):
         """
-        Validates that a nats:// URL in PEPPER_BUS_URL would be caught early
-        (NotImplementedError) rather than silently mis-connecting.
-        Documents current state: nats transport is stubbed, not live.
+        Validates that a nats:// URL in PEPPER_BUS_URL is accepted by BusTransport.
+        The transport is fully implemented — construction must succeed.
         """
         url = f"nats://{NATS_HOST}:{NATS_PORT}"
-        with pytest.raises(NotImplementedError, match="nats"):
-            BusTransport(url)
+        t = BusTransport(url)
+        assert t.scheme == "nats"
+        assert t.host == NATS_HOST
+        assert t.port == NATS_PORT
 
 
 # ── Future: full NATS pub/sub transport test ─────────────────────────────────

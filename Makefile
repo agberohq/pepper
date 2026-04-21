@@ -4,7 +4,7 @@
         python-test python-test-unit python-setup \
         check-services python-setup-real clean
 
-PYTHON_DIR := internal/runtime/python
+PYTHON_DIR := runtime/python
 VENV        := .venv
 PYTHON      := $(VENV)/bin/python
 PIP         := $(VENV)/bin/pip
@@ -145,6 +145,38 @@ go-real:
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run "^TestReal" \
 		-timeout 600s .
+
+
+# Requires Redis and/or NATS running locally.
+#
+#   Start services:
+#     redis-server &
+#     nats-server -js &
+#
+#   Run all cluster tests (both backends):
+#     make go-real-cluster
+#
+#   Run a specific backend:
+#     make go-real-cluster-redis
+#     make go-real-cluster-nats
+#
+#   Override service addresses:
+#     make go-real-cluster PEPPER_TEST_REDIS_HOST=10.0.0.1
+
+go-real-cluster-redis:
+	@echo "Cluster backend : Redis ($(PEPPER_TEST_REDIS_HOST):$(PEPPER_TEST_REDIS_PORT))"
+	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
+		-run TestRealClusterRedis \
+		-timeout 120s .
+
+go-real-cluster-nats:
+	@echo "Cluster backend : NATS ($(PEPPER_TEST_NATS_HOST):$(PEPPER_TEST_NATS_PORT))"
+	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
+		-run TestRealClusterNATS \
+		-timeout 120s .
+
+go-real-cluster: go-real-cluster-redis go-real-cluster-nats
+
 
 # ─── Python tests ─────────────────────────────────────────────────────────────
 python-test: python-setup

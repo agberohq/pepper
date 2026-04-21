@@ -31,8 +31,8 @@ import (
 
 	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/registry"
-	"github.com/agberohq/pepper/internal/runtime/adapter"
-	"github.com/agberohq/pepper/internal/runtime/cli"
+	"github.com/agberohq/pepper/runtime/adapter"
+	"github.com/agberohq/pepper/runtime/cli"
 )
 
 // Capability is implemented by every registerable unit regardless of runtime.

@@ -8,13 +8,16 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/agberohq/pepper/internal/coord"
 )
 
 // Registry holds all registered capabilities.
 // Thread-safe for concurrent reads after startup.
 type Registry struct {
-	mu   sync.RWMutex
-	caps map[string]*Spec
+	mu    sync.RWMutex
+	caps  map[string]*Spec
+	coord coord.Store // nil = single-node, no coord
 }
 
 // New returns an empty Registry.
@@ -25,11 +28,13 @@ func New() *Registry {
 // Add registers a capability. Returns error if already registered.
 func (r *Registry) Add(spec *Spec) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, exists := r.caps[spec.Name]; exists {
+		r.mu.Unlock()
 		return fmt.Errorf("pepper/registry: capability %q already registered", spec.Name)
 	}
 	r.caps[spec.Name] = spec
+	r.mu.Unlock()
+	r.publishCap(spec)
 	return nil
 }
 

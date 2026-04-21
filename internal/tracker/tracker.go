@@ -290,8 +290,6 @@ func (t *Tracker) before(ctx context.Context, env *envelope.Envelope, in hooks.I
 	p.Status = StatusRunning
 	p.Actions = append(p.Actions, action)
 	p.UpdatedAt = time.Now()
-	actionIdx := len(p.Actions) - 1
-	_ = actionIdx
 	p.mu.Unlock()
 
 	t.broadcast(p, action)

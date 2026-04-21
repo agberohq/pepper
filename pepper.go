@@ -15,7 +15,7 @@ import (
 	"github.com/agberohq/pepper/internal/metrics"
 	"github.com/agberohq/pepper/internal/pending"
 	"github.com/agberohq/pepper/internal/registry"
-	"github.com/agberohq/pepper/internal/storage"
+	"github.com/agberohq/pepper/internal/session"
 	"github.com/agberohq/pepper/internal/tracker"
 	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/jack"
@@ -26,7 +26,7 @@ import (
 type Pepper struct {
 	cfg      Config
 	codec    codec.Codec
-	sessions storage.Store
+	sessions session.Store
 	mu       sync.RWMutex
 
 	reg            *registry.Registry
@@ -50,9 +50,13 @@ func New(opts ...Option) (*Pepper, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pepper: codec: %w", err)
 	}
-	sess := cfg.Storage
+	sess := cfg.Session
 	if sess == nil {
-		sess = storage.NewMemory(DefaultSessionTTL)
+		if cfg.Coord != nil {
+			sess = session.NewCoordStore(cfg.Coord, DefaultSessionTTL)
+		} else {
+			sess = session.NewMemory(DefaultSessionTTL)
+		}
 	}
 	sd := jack.NewShutdown(
 		jack.ShutdownWithTimeout(cfg.ShutdownTimeout),
@@ -73,8 +77,13 @@ func New(opts ...Option) (*Pepper, error) {
 		procResults = mappo.NewConcurrent[string, Result]()
 	}
 
+	reg := registry.New()
+	if cfg.Coord != nil {
+		reg.UseCoord(cfg.Coord)
+	}
+
 	return &Pepper{
-		cfg: cfg, codec: c, reg: registry.New(), pending: pending.New(),
+		cfg: cfg, codec: c, reg: reg, pending: pending.New(),
 		hooks: hooksReg, tracker: trk, processResults: procResults, sessions: sess, shutdown: sd,
 		logger: logger,
 	}, nil

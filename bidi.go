@@ -68,7 +68,13 @@ func (s *BidiStream[In, Out]) CloseInput() error {
 
 // Chunks returns a channel of decoded output chunks.
 // Closed when the stream ends or ctx is cancelled.
+// Safe to call on a zero-value Stream — returns a channel that closes immediately.
 func (s *BidiStream[In, Out]) Chunks(ctx context.Context) <-chan Out {
+	if s.pp == nil || s.outCh == nil {
+		ch := make(chan Out)
+		close(ch)
+		return ch
+	}
 	return drainResponses[Out](ctx, s.outCh, s.pp.codec)
 }
 
@@ -131,3 +137,9 @@ func drainResponses[T any](ctx context.Context, src <-chan pending.Response, c c
 	}()
 	return out
 }
+
+// Stream is a convenience alias for BidiStream[any, any].
+// Use it when you need an untyped streaming handle — for example in
+// compile-check tests or adapters that deal with raw map payloads.
+// For production use prefer the fully-typed BidiStream[In, Out].
+type Stream = BidiStream[any, any]

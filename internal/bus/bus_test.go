@@ -1,49 +1,157 @@
-package bus
+package bus_test
 
 import (
 	"context"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/agberohq/pepper/internal/bus"
 )
 
-// TestBusInterface is a test suite that runs against any Bus implementation.
-type TestBusInterface struct {
-	NewBus func(Config) (Bus, error)
-	Name   string
-}
-
-func (suite *TestBusInterface) Run(t *testing.T) {
-	t.Run(suite.Name+"/PublishSubscribe", suite.testPublishSubscribe)
-	t.Run(suite.Name+"/SubscribePrefix", suite.testSubscribePrefix)
-	t.Run(suite.Name+"/PushOne", suite.testPushOne)
-	t.Run(suite.Name+"/MultiplePublishers", suite.testMultiplePublishers)
-	t.Run(suite.Name+"/ContextCancellation", suite.testContextCancellation)
-	t.Run(suite.Name+"/Close", suite.testClose)
-}
-
-func (suite *TestBusInterface) testPublishSubscribe(t *testing.T) {
-	bus, err := suite.NewBus(Config{URL: "tcp://127.0.0.1:0"})
+// newTestBus creates a Mula-backed bus for testing.
+func newTestBus(t *testing.T) bus.Bus {
+	t.Helper()
+	m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: "tcp://127.0.0.1:0", SendBuf: 128, RecvBuf: 128})
 	if err != nil {
-		t.Fatalf("NewBus: %v", err)
+		t.Fatalf("NewMula: %v", err)
 	}
-	defer bus.Close()
+	return m.AsBus()
+}
+
+func TestMula(t *testing.T) {
+	testPublishSubscribe(t)
+	testSubscribePrefix(t)
+	testPushOne(t)
+	testMultiplePublishers(t)
+	testContextCancellation(t)
+	testClose(t)
+}
+
+func TestMulaClose(t *testing.T) {
+	b := newTestBus(t)
+	if err := b.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+	if err := b.Publish("test", []byte("data")); err == nil {
+		t.Error("Publish after close should fail")
+	}
+}
+
+func TestTopicHelpers(t *testing.T) {
+	tests := []struct {
+		name     string
+		topic    string
+		expected string
+		fn       func(string) string
+	}{
+		{"TopicPush", "gpu", "pepper.push.gpu", bus.TopicPush},
+		{"TopicPub", "gpu", "pepper.pub.gpu", bus.TopicPub},
+		{"TopicRes", "origin123", "pepper.res.origin123", bus.TopicRes},
+		{"TopicPipe", "asr", "pepper.pipe.asr", bus.TopicPipe},
+		{"TopicStream", "corr456", "pepper.stream.corr456", bus.TopicStream},
+		{"TopicCb", "corr789", "pepper.cb.corr789", bus.TopicCb},
+		{"TopicHB", "worker1", "pepper.hb.worker1", bus.TopicHB},
+		{"TopicControl", "worker1", "pepper.control.worker1", bus.TopicControl},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fn(tt.topic); got != tt.expected {
+				t.Errorf("%s(%q) = %q, want %q", tt.name, tt.topic, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsBroadcastTopic(t *testing.T) {
+	tests := []struct {
+		topic string
+		want  bool
+	}{
+		{"pepper.pub.gpu", true},
+		{"pepper.broadcast", true},
+		{"pepper.push.gpu", false},
+		{"pepper.res.abc", false},
+	}
+	for _, tt := range tests {
+		if got := bus.IsBroadcastTopic(tt.topic); got != tt.want {
+			t.Errorf("IsBroadcastTopic(%q) = %v, want %v", tt.topic, got, tt.want)
+		}
+	}
+}
+
+func TestWorkerEnvVars(t *testing.T) {
+	vars := bus.WorkerEnvVars("w-1", "tcp://127.0.0.1:7731", "msgpack", []string{"gpu", "asr"}, 5000, 8, "/dev/shm/pepper")
+	expected := map[string]string{
+		"PEPPER_WORKER_ID":      "w-1",
+		"PEPPER_BUS_URL":        "tcp://127.0.0.1:7731",
+		"PEPPER_CODEC":          "msgpack",
+		"PEPPER_GROUPS":         "gpu,asr",
+		"PEPPER_HEARTBEAT_MS":   "5000",
+		"PEPPER_MAX_CONCURRENT": "8",
+		"PEPPER_BLOB_DIR":       "/dev/shm/pepper",
+	}
+	for _, v := range vars {
+		for k, want := range expected {
+			if len(v) > len(k)+1 && v[:len(k)+1] == k+"=" {
+				if got := v[len(k)+1:]; got != want {
+					t.Errorf("%s = %q, want %q", k, got, want)
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkMulaPublish(b *testing.B) {
+	m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: "tcp://127.0.0.1:0", SendBuf: 128, RecvBuf: 128})
+	if err != nil {
+		b.Fatal(err)
+	}
+	adapted := m.AsBus()
+	defer adapted.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	topic := "pepper.pub.bench"
+	subCh, err := adapted.Subscribe(ctx, topic)
+	if err != nil {
+		b.Fatal(err)
+	}
+	go func() {
+		for range subCh {
+		}
+	}()
+
+	data := []byte("benchmark data")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := adapted.Publish(topic, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func testPublishSubscribe(t *testing.T) {
+	t.Helper()
+	b := newTestBus(t)
+	defer b.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Use a pub topic so it goes through the PUB/SUB system
 	topic := "pepper.pub.test"
-	subCh, err := bus.Subscribe(ctx, topic)
+	subCh, err := b.Subscribe(ctx, topic)
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-
-	// Give time for subscription to be established
 	time.Sleep(50 * time.Millisecond)
 
 	testData := []byte("hello world")
-	if err := bus.Publish(topic, testData); err != nil {
+	if err := b.Publish(topic, testData); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -60,24 +168,19 @@ func (suite *TestBusInterface) testPublishSubscribe(t *testing.T) {
 	}
 }
 
-func (suite *TestBusInterface) testSubscribePrefix(t *testing.T) {
-	bus, err := suite.NewBus(Config{URL: "tcp://127.0.0.1:0"})
-	if err != nil {
-		t.Fatalf("NewBus: %v", err)
-	}
-	defer bus.Close()
+func testSubscribePrefix(t *testing.T) {
+	t.Helper()
+	b := newTestBus(t)
+	defer b.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	prefix := "pepper.res."
-	subCh, err := bus.SubscribePrefix(ctx, prefix)
+	subCh, err := b.SubscribePrefix(ctx, prefix)
 	if err != nil {
 		t.Fatalf("SubscribePrefix: %v", err)
 	}
-
-	topics := []string{"pepper.res.abc", "pepper.res.def", "pepper.other.xyz"}
-	expectedMessages := 2
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -85,169 +188,132 @@ func (suite *TestBusInterface) testSubscribePrefix(t *testing.T) {
 		defer wg.Done()
 		received := 0
 		for msg := range subCh {
-			if !hasPrefix(msg.Topic, prefix) {
-				t.Errorf("received message for non-matching topic: %s", msg.Topic)
+			if len(msg.Topic) < len(prefix) || msg.Topic[:len(prefix)] != prefix {
+				t.Errorf("unexpected topic: %s", msg.Topic)
 			}
 			received++
-			if received == expectedMessages {
+			if received == 2 {
 				return
 			}
 		}
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-
-	for _, topic := range topics {
-		bus.Publish(topic, []byte("test"))
-		time.Sleep(20 * time.Millisecond)
-	}
+	b.Publish("pepper.res.abc", []byte("test"))
+	time.Sleep(20 * time.Millisecond)
+	b.Publish("pepper.res.def", []byte("test"))
+	time.Sleep(20 * time.Millisecond)
+	b.Publish("pepper.other.xyz", []byte("test"))
 
 	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
-		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for prefix messages")
 	}
 }
 
-func (suite *TestBusInterface) testPushOne(t *testing.T) {
-	bus, err := suite.NewBus(Config{URL: "tcp://127.0.0.1:0"})
-	if err != nil {
-		t.Fatalf("NewBus: %v", err)
-	}
-	defer bus.Close()
+func testPushOne(t *testing.T) {
+	t.Helper()
+	b := newTestBus(t)
+	defer b.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	topic := "pepper.push.gpu"
-
-	// PushOne should not block indefinitely
-	err = bus.PushOne(ctx, topic, []byte("test"))
+	err := b.PushOne(ctx, "pepper.push.gpu", []byte("test"))
 	if err != nil {
-		t.Logf("PushOne returned error (expected if no workers): %v", err)
+		t.Logf("PushOne returned error (no workers): %v", err)
 	}
 }
 
-func (suite *TestBusInterface) testMultiplePublishers(t *testing.T) {
-	bus, err := suite.NewBus(Config{URL: "tcp://127.0.0.1:0"})
-	if err != nil {
-		t.Fatalf("NewBus: %v", err)
-	}
-	defer bus.Close()
+func testMultiplePublishers(t *testing.T) {
+	t.Helper()
+	b := newTestBus(t)
+	defer b.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	topic := "pepper.pub.concurrent"
-	subCh, err := bus.Subscribe(ctx, topic)
+	subCh, err := b.Subscribe(ctx, topic)
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-
 	time.Sleep(50 * time.Millisecond)
 
-	numPublishers := 10
+	n := 10
 	var wg sync.WaitGroup
-	wg.Add(numPublishers)
-
-	for i := 0; i < numPublishers; i++ {
+	wg.Add(n)
+	for i := 0; i < n; i++ {
 		go func(id int) {
 			defer wg.Done()
-			data := []byte{byte(id)}
-			if err := bus.Publish(topic, data); err != nil {
-				t.Errorf("Publish %d: %v", id, err)
-			}
+			b.Publish(topic, []byte{byte(id)})
 		}(i)
 	}
-
 	wg.Wait()
 
 	received := 0
 	timeout := time.After(3 * time.Second)
-
-	for received < numPublishers {
+	for received < n {
 		select {
 		case <-subCh:
 			received++
 		case <-timeout:
-			t.Fatalf("timeout: received %d/%d messages", received, numPublishers)
+			t.Fatalf("timeout: received %d/%d", received, n)
 		}
 	}
 }
 
-func (suite *TestBusInterface) testContextCancellation(t *testing.T) {
-	bus, err := suite.NewBus(Config{URL: "tcp://127.0.0.1:0"})
-	if err != nil {
-		t.Fatalf("NewBus: %v", err)
-	}
-	defer bus.Close()
+func testContextCancellation(t *testing.T) {
+	t.Helper()
+	b := newTestBus(t)
+	defer b.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	topic := "pepper.pub.cancel"
-	subCh, err := bus.Subscribe(ctx, topic)
+	subCh, err := b.Subscribe(ctx, "pepper.pub.cancel")
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	// Cancel context
 	cancel()
 	time.Sleep(50 * time.Millisecond)
 
-	// Channel should be closed
 	select {
 	case _, ok := <-subCh:
 		if ok {
-			t.Error("channel should be closed after context cancellation")
+			t.Error("channel should be closed after context cancel")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for channel to close")
+		t.Fatal("timeout waiting for channel close")
 	}
 }
 
-func (suite *TestBusInterface) testClose(t *testing.T) {
-	bus, err := suite.NewBus(Config{URL: "tcp://127.0.0.1:0"})
-	if err != nil {
-		t.Fatalf("NewBus: %v", err)
-	}
+func testClose(t *testing.T) {
+	t.Helper()
+	b := newTestBus(t)
 
 	ctx := context.Background()
-	topic := "pepper.pub.close"
-	subCh, err := bus.Subscribe(ctx, topic)
+	subCh, err := b.Subscribe(ctx, "pepper.pub.close")
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	// Close the bus
-	if err := bus.Close(); err != nil {
-		t.Errorf("Close: %v", err)
-	}
+	b.Close()
 
-	// Publish should fail after close
-	err = bus.Publish(topic, []byte("after close"))
-	if err == nil {
+	if err := b.Publish("pepper.pub.close", []byte("after")); err == nil {
 		t.Error("Publish should fail after close")
 	}
 
-	// Channel should be closed
 	select {
 	case _, ok := <-subCh:
 		if ok {
 			t.Error("channel should be closed after bus close")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for channel to close")
+		t.Fatal("timeout waiting for channel close")
 	}
 
-	// Second close should be safe
-	if err := bus.Close(); err != nil {
-		t.Errorf("second Close: %v", err)
-	}
+	b.Close() // idempotent
 }

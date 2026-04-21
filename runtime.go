@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	stdruntime "runtime"
+	"strings"
 	"time"
 
 	blobpkg "github.com/agberohq/pepper/internal/blob"
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/compose"
+	"github.com/agberohq/pepper/internal/coord"
 	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/metrics"
@@ -52,6 +55,19 @@ func (p *Pepper) NewBlobFromFile(path string) (*blobpkg.Blob, error) {
 	return p.rt.blob.WriteFile(path, p.cfg.DefaultTimeout+30*time.Second)
 }
 
+// bootRuntime initialises the bus, blob manager, router, and all worker loops.
+//
+// Mode selection:
+//
+//	cfg.Coord == nil  → single-node: Mula TCP bus (Go↔Python local IPC)
+//	cfg.Coord != nil  → distributed: coord pub/sub bus (Redis or NATS)
+//
+// The busAddr passed to Python workers is:
+//
+//	single-node: "tcp://127.0.0.1:{port}"  (Mula framing)
+//	distributed: the coord URL, e.g. "redis://..." or "nats://..."
+//
+// Python's BusTransport selects the correct transport based on the scheme.
 func (p *Pepper) bootRuntime(ctx context.Context) error {
 	rt := &runtimeState{}
 	p.rt = rt
@@ -59,10 +75,6 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	rt.bgCtx = bgCtx
 	rt.bgCancel = bgCancel
 
-	// Initialise the cross-platform child-process lifecycle manager.
-	// Must happen before any Python worker is spawned so that Configure and
-	// Track are available. Dispose is called when the background context is
-	// cancelled (i.e. when Stop() fires bgCancel).
 	if err := sub.Init(); err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: sub manager: %w", err)
@@ -72,18 +84,38 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		_ = sub.Dispose()
 	}()
 
-	busURL := p.cfg.TransportURL
-	if busURL == "" {
-		busURL = fmt.Sprintf("tcp://127.0.0.1:%d", p.freePort())
-	}
+	// Bus selection
+	var theBus bus.Bus
+	var busAddr string // passed to Python workers as PEPPER_BUS_URL
 
-	nngBus, err := bus.NewMula(bus.Config{URL: busURL, SendBuf: 256, RecvBuf: 256})
-	if err != nil {
-		bgCancel()
-		return fmt.Errorf("pepper: bus: %w", err)
+	if p.cfg.Coord != nil {
+		// Distributed mode: coord backend provides pub/sub and Push/Pull.
+		// Mula is NOT started. Python workers connect to the coord URL.
+		theBus = bus.NewCoordBus(p.cfg.Coord, p.cfg.TransportURL)
+		busAddr = p.cfg.TransportURL // e.g. "redis://host:6379"
+		if busAddr == "" {
+			bgCancel()
+			return fmt.Errorf("pepper: WithCoord requires WithTransportURL to be set " +
+				"(e.g. \"redis://host:6379\" or \"nats://host:4222\")")
+		}
+	} else {
+		// Single-node mode: Mula TCP bus for local Go↔Python IPC.
+		mulaURL := p.cfg.TransportURL
+		if mulaURL == "" {
+			mulaURL = fmt.Sprintf("tcp://127.0.0.1:%d", p.freePort())
+		}
+		m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: mulaURL, SendBuf: 256, RecvBuf: 256})
+		if err != nil {
+			bgCancel()
+			return fmt.Errorf("pepper: bus: %w", err)
+		}
+		theBus = m.AsBus()
+		busAddr = m.Addr()
+		p.shutdown.Register(m)
 	}
-	rt.bus = nngBus
+	rt.bus = theBus
 
+	// Blob manager
 	rt.reqReaper = jack.NewReaper(0, jack.ReaperWithShards(32), jack.ReaperWithHandler(func(_ context.Context, corrID string) {
 		p.pending.Fail(corrID, fmt.Errorf("deadline exceeded: %s", corrID))
 	}))
@@ -102,30 +134,37 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	}
 	rt.blob = bm
 
-	rt.router = router.New(nngBus, p.pending, rt.reqReaper, router.Config{
-		MaxRetries: p.cfg.MaxRetries, PoisonThreshold: p.cfg.PoisonPillThreshold,
-		PoisonPillTTL: p.cfg.PoisonPillTTL, DLQ: p.cfg.DLQ, Codec: p.codec, HeartbeatTimeout: p.cfg.HeartbeatInterval * 3,
+	// Router
+	rt.router = router.New(theBus, p.pending, rt.reqReaper, router.Config{
+		MaxRetries:       p.cfg.MaxRetries,
+		PoisonThreshold:  p.cfg.PoisonPillThreshold,
+		PoisonPillTTL:    p.cfg.PoisonPillTTL,
+		DLQ:              p.cfg.DLQ,
+		Codec:            p.codec,
+		HeartbeatTimeout: p.cfg.HeartbeatInterval * 3,
 	}, p.logger)
-	rt.doctor = jack.NewDoctor(jack.DoctorWithMaxConcurrent(len(p.cfg.Workers)+4), jack.DoctorWithGlobalTimeout(p.cfg.HeartbeatInterval*3))
+	rt.doctor = jack.NewDoctor(
+		jack.DoctorWithMaxConcurrent(len(p.cfg.Workers)+4),
+		jack.DoctorWithGlobalTimeout(p.cfg.HeartbeatInterval*3),
+	)
 
-	resCh, err := nngBus.SubscribePrefix(bgCtx, "pepper.res.")
+	// Response and control subscriptions
+	resCh, err := theBus.SubscribePrefix(bgCtx, "pepper.res.")
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe res: %w", err)
 	}
-	// pepper.control. (with dot) — worker-specific control messages
-	ctrlCh, err := nngBus.SubscribePrefix(bgCtx, "pepper.control.")
+	ctrlCh, err := theBus.SubscribePrefix(bgCtx, "pepper.control.")
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe ctrl: %w", err)
 	}
-	// pepper.control (no dot) — Python test mock and legacy workers send here
-	ctrlExactCh, err := nngBus.Subscribe(bgCtx, "pepper.control")
+	ctrlExactCh, err := theBus.Subscribe(bgCtx, "pepper.control")
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe ctrl exact: %w", err)
 	}
-	hbCh, err := nngBus.SubscribePrefix(bgCtx, "pepper.hb.")
+	hbCh, err := theBus.SubscribePrefix(bgCtx, "pepper.hb.")
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe hb: %w", err)
@@ -135,44 +174,32 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	go p.controlLoop(bgCtx, ctrlExactCh)
 	go p.controlLoop(bgCtx, hbCh)
 
+	// Boot workers
 	allSpecs := p.reg.All()
 	if len(allSpecs) > 0 {
-		// Boot Go-native workers (run as goroutines inside this process).
 		if err := p.bootGoWorkers(bgCtx, allSpecs); err != nil {
 			bgCancel()
 			return fmt.Errorf("pepper: go workers: %w", err)
 		}
-		// Boot HTTP/MCP adapter workers.
 		if err := p.bootAdapterWorkers(bgCtx, allSpecs); err != nil {
 			bgCancel()
 			return fmt.Errorf("pepper: adapter workers: %w", err)
 		}
-		// Boot CLI tool workers.
 		if err := p.bootCLIWorkers(bgCtx, allSpecs); err != nil {
 			bgCancel()
 			return fmt.Errorf("pepper: cli workers: %w", err)
 		}
-		// Boot Python subprocess workers.
 		for i, wc := range p.cfg.Workers {
 			wID := wc.ID
 			if wID == "" {
 				wID = fmt.Sprintf("w-%d", i+1)
 			}
-			if err := p.spawnPythonWorker(bgCtx, wc, wID, nngBus.Addr(), allSpecs); err != nil {
+			if err := p.spawnPythonWorker(bgCtx, wc, wID, busAddr, allSpecs); err != nil {
 				bgCancel()
 				return err
 			}
 		}
-		// Wait for at least one worker to become ready.
-		//
-		// We deliberately use an independent internal deadline (bootTimeout)
-		// rather than the caller's ctx. The caller's ctx is reused for Do()
-		// calls after Start() returns; if we consumed most of that deadline
-		// waiting for Python to boot, Do() would immediately time out.
-		//
-		// bootTimeout defaults to DefaultTimeout (usually 30 s). It is
-		// bounded above by bgCtx (the process-lifetime context) so we still
-		// stop promptly on shutdown.
+
 		bootTimeout := p.cfg.DefaultTimeout
 		if bootTimeout <= 0 {
 			bootTimeout = DefaultShutdownTimeout
@@ -196,7 +223,11 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		}
 	}
 
-	p.shutdown.RegisterWithContext("doctor.stop", func(_ context.Context) error { rt.doctor.StopAll(p.cfg.ShutdownTimeout); return nil })
+	// Shutdown hooks
+	p.shutdown.RegisterWithContext("doctor.stop", func(_ context.Context) error {
+		rt.doctor.StopAll(p.cfg.ShutdownTimeout)
+		return nil
+	})
 	p.shutdown.RegisterWithContext("loopers.stop", func(_ context.Context) error {
 		rt.loopers.Range(func(_, v any) bool { v.(*jack.Looper).Stop(); return true })
 		return nil
@@ -210,7 +241,14 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	p.shutdown.RegisterWithContext("req.reaper.stop", func(_ context.Context) error { rt.reqReaper.Stop(); return nil })
 	p.shutdown.RegisterWithContext("blob.reaper.stop", func(_ context.Context) error { rt.blobReaper.Stop(); return nil })
 	p.shutdown.RegisterWithContext("bg.cancel", func(_ context.Context) error { bgCancel(); return nil })
-	p.shutdown.Register(nngBus)
+
+	// In distributed mode the coord bus owns its own lifecycle via Close().
+	if p.cfg.Coord != nil {
+		p.shutdown.RegisterWithContext("coord.close", func(_ context.Context) error {
+			return p.cfg.Coord.Close()
+		})
+	}
+
 	return nil
 }
 
@@ -707,13 +745,20 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	// Open a pipe for Python structured log output (fd 3 in the child).
 	// Python writes one JSON line per record; Go re-emits via rt.logger so all
 	// logs share one backend (Victoria Logs, stdout, etc.).
-	logR, logW, pipeErr := os.Pipe()
-	if pipeErr == nil {
-		cmd.ExtraFiles = []*os.File{logW}
+	// ExtraFiles is not supported on Windows, so we skip the pipe there.
+	var logR, logW *os.File
+	if stdruntime.GOOS != "windows" {
+		var pipeErr error
+		logR, logW, pipeErr = os.Pipe()
+		if pipeErr != nil {
+			logR, logW = nil, nil
+		} else {
+			cmd.ExtraFiles = []*os.File{logW}
+		}
 	}
 
 	if err := cmd.Start(); err != nil {
-		if pipeErr == nil {
+		if logW != nil {
 			logR.Close()
 			logW.Close()
 		}
@@ -724,7 +769,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	if err := sub.Track(cmd.Process); err != nil {
 		p.logger.Fields("worker", workerID, "error", err).Warn("sub.Track failed")
 	}
-	if pipeErr == nil {
+	if logW != nil {
 		logW.Close() // parent closes write end; child holds the only reference
 		go p.pipeWorkerLogs(logR, workerID)
 	}
@@ -961,5 +1006,37 @@ func (p *Pepper) pipeWorkerLogs(r *os.File, workerID string) {
 		default:
 			l.Info(msg)
 		}
+	}
+}
+
+// newBus creates a Bus from the URL scheme, delegating to coord transports.
+// Lives in runtime.go (the only caller) to avoid a bus→coord import cycle.
+func newBus(url string, cfg bus.Config) (bus.Bus, error) {
+	cfg.URL = url
+
+	switch {
+	case url == "" || strings.HasPrefix(url, "tcp://") || strings.HasPrefix(url, "mula://"):
+		m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: url, SendBuf: cfg.SendBuf, RecvBuf: cfg.RecvBuf})
+		if err != nil {
+			return nil, fmt.Errorf("bus: mula: %w", err)
+		}
+		return m.AsBus(), nil
+
+	case strings.HasPrefix(url, "redis://"):
+		c, err := coord.NewRedis(url)
+		if err != nil {
+			return nil, fmt.Errorf("bus: redis: %w", err)
+		}
+		return bus.NewCoordBus(c, url), nil
+
+	case strings.HasPrefix(url, "nats://"):
+		c, err := coord.NewNATS(url)
+		if err != nil {
+			return nil, fmt.Errorf("bus: nats: %w", err)
+		}
+		return bus.NewCoordBus(c, url), nil
+
+	default:
+		return nil, fmt.Errorf("bus: unknown transport URL %q", url)
 	}
 }

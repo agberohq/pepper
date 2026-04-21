@@ -7,7 +7,7 @@ import (
 	"github.com/agberohq/pepper/internal/dlq"
 	"github.com/agberohq/pepper/internal/hooks"
 	"github.com/agberohq/pepper/internal/metrics"
-	"github.com/agberohq/pepper/internal/storage"
+	"github.com/agberohq/pepper/internal/session"
 )
 
 // Metrics
@@ -29,7 +29,7 @@ func NopDLQ() dlq.Backend { return dlq.Nop{} }
 // Session
 
 // InMemoryStore returns an in-memory SessionStore with TTL managed by jack.Lifetime.
-func InMemoryStore(ttl time.Duration) storage.Store { return storage.NewMemory(ttl) }
+func InMemoryStore(ttl time.Duration) session.Store { return session.NewMemory(ttl) }
 
 // Hook helpers
 
@@ -62,4 +62,4 @@ type DLQBackend = dlq.Backend
 type DLQEntry = dlq.Entry
 
 // Storage is the pluggable session persistence backend.
-type Storage = storage.Store
+type Storage = session.Store

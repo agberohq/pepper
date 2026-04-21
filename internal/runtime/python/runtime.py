@@ -302,6 +302,13 @@ def _make_codec() -> "_Codec":
 
 # ── Form A parser — defined in cap.py, imported here for runtime use ──────────
 from cap import parse_form_a  # noqa: E402
+from transport import BusTransport  # noqa: E402
+
+
+def _parse_bus_url(url: str) -> tuple[str, int]:
+    """Parse a bus URL into (host, port). Thin wrapper over BusTransport._parse."""
+    _, host, port = BusTransport._parse(url)
+    return host, port
 
 
 class LoadedCap:
@@ -442,33 +449,35 @@ class Worker:
         log.info("pepper worker %s starting, bus=%s", self.worker_id, self.bus_url)
         self._transport = BusTransport(self.bus_url)
         self._transport.connect()
+        # raw_conn is only set for Mula; None in distributed mode.
         self._conn = self._transport.raw_conn
 
         _PipeForwarder.init(self._conn)
         _CallbackDispatcher.init(self)
 
-        # Announce subscription topics to Mula router.
-        # pepper.push.{group} must be included so handleConn starts the
-        # drainPushToSubscriber goroutine for DispatchAny requests.
-        # pepper.pub.{group} is for fan-out dispatch modes.
+        # Build the list of topics this worker cares about.
+        # BusTransport.subscribe() handles the protocol difference:
+        #   Mula:  sends a pipe-separated topic list as the first frame,
+        #          which Mula's handleConn uses to set up push queues.
+        #   Redis: PSUBSCRIBE for control/broadcast, BRPOP loop for push topics.
+        #   NATS:  queue-group SUB for push topics, plain SUB for others.
         topics = ["pepper.control", "pepper.broadcast"]
         if self.worker_id:
             topics.append(f"pepper.control.{self.worker_id}")
-            # Per-worker direct push topic — receives requests pinned directly
-            # to this worker by the router's cap affinity selection.
             topics.append(f"pepper.push.{self.worker_id}")
         for g in self.groups:
             topics.append(f"pepper.push.{g}")
             topics.append(f"pepper.pub.{g}")
-        topic_frame = "|".join(topics).encode("utf-8")
-        self._send_frame(topic_frame)
 
-        # Send worker_hello
+        self._transport.subscribe(topics)
+
+        # Send worker_hello so the router registers this worker.
         self._send_envelope(self._make_hello())
 
         hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         hb_thread.start()
         self._message_loop()
+
 
     def _message_loop(self):
         while self._running:
@@ -814,104 +823,6 @@ def _reply_topic(env: dict) -> str:
     if msg_type == "pipe":
         return env.get("topic", "pepper.pipe.unknown")
     return "pepper.control"
-
-
-# ── Bus transport abstraction ─────────────────────────────────────────────────
-# The scheme in PEPPER_BUS_URL selects the transport:
-#   mula://host:port   — Pepper's pure-Go TCP bus (default for all runtimes)
-#   tcp://host:port    — alias for mula://
-#   nanomsg://host:port — mangos/nanomsg (Go-only; Python falls back to mula framing)
-#   redis://...        — future: publish/subscribe via Redis Streams
-#   nats://...         — future: NATS core or JetStream
-#
-# Go passes PEPPER_BUS_URL with the full scheme so the runtime can choose the
-# right transport without any guessing.  Adding a new backend only requires:
-#   1. A new elif branch in BusTransport.connect()
-#   2. Overriding send_frame / recv_frame if the framing differs
-
-class BusTransport:
-    """Pluggable bus transport.  Current implementation: Mula plain-TCP."""
-
-    SUPPORTED = ("mula", "tcp", "nanomsg")  # nanomsg uses same framing via mula compat
-
-    def __init__(self, url: str):
-        self.url = url.strip()
-        self.scheme, self.host, self.port = self._parse(self.url)
-        self._conn: socket.socket | None = None
-        self._send_lock = threading.Lock()
-
-    @staticmethod
-    def _parse(url: str) -> tuple[str, str, int]:
-        if "://" not in url:
-            # bare host:port — treat as mula
-            host, _, port = url.rpartition(":")
-            return "mula", host or "127.0.0.1", int(port) if port else 7731
-        scheme, rest = url.split("://", 1)
-        scheme = scheme.lower()
-        if scheme in ("redis", "nats"):
-            raise NotImplementedError(
-                f"Transport {scheme!r} is not yet implemented in the Python runtime. "
-                f"Set PEPPER_BUS_URL to a mula:// or tcp:// address."
-            )
-        host, _, port_str = rest.rpartition(":")
-        return scheme, host or "127.0.0.1", int(port_str) if port_str else 7731
-
-    def connect(self, retries: int = 10) -> None:
-        """Connect to the bus.  Raises SystemExit on failure."""
-        if self.scheme in self.SUPPORTED:
-            self._connect_tcp(retries)
-        else:
-            raise NotImplementedError(f"unsupported bus scheme: {self.scheme!r}")
-
-    def _connect_tcp(self, retries: int) -> None:
-        for attempt in range(retries):
-            try:
-                conn = socket.create_connection((self.host, self.port), timeout=5)
-                conn.settimeout(None)
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self._conn = conn
-                log.info("bus connected [scheme=%s addr=%s:%s]", self.scheme, self.host, self.port)
-                return
-            except OSError as exc:
-                log.debug("bus connect attempt %d failed: %s", attempt + 1, exc)
-                time.sleep(0.1 * (2 ** attempt))
-        log.error("bus: could not connect to %s:%s after %d attempts", self.host, self.port, retries)
-        sys.exit(1)
-
-    def send_frame(self, data: bytes) -> None:
-        assert self._conn is not None, "not connected"
-        with self._send_lock:
-            self._conn.sendall(len(data).to_bytes(4, "big") + data)
-
-    def recv_frame(self) -> bytes | None:
-        hdr = _recv_exact(self._conn, 4)
-        if hdr is None:
-            raise ConnectionResetError("router closed connection")
-        size = int.from_bytes(hdr, "big")
-        if size == 0:
-            return None  # keepalive ping
-        if size > 64 * 1024 * 1024:
-            raise ValueError(f"frame too large: {size} bytes")
-        return _recv_exact(self._conn, size)
-
-    @property
-    def raw_conn(self) -> socket.socket | None:
-        return self._conn
-
-    def close(self) -> None:
-        if self._conn:
-            try:
-                self._conn.close()
-            except OSError:
-                pass
-            self._conn = None
-
-
-def _parse_bus_url(url: str) -> tuple[str, int]:
-    """Legacy helper kept for compatibility — prefer BusTransport."""
-    t = BusTransport(url)
-    return t.host, t.port
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

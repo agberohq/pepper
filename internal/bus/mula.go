@@ -1,70 +1,107 @@
 package bus
 
+// Mula is the default intra-node transport connecting the Go router to
+// Python/CLI/HTTP worker subprocesses on the same machine.
+//
+// Wire format: [4-byte big-endian length][payload]
+// Message encoding: [2-byte topic-len][topic][data]
+
 import (
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
+// MulaConfig holds configuration for the Mula transport.
+type MulaConfig struct {
+	URL     string // tcp://host:port, port 0 = OS assigns
+	SendBuf int
+	RecvBuf int
+}
+
+// DefaultMulaConfig returns safe defaults.
+func DefaultMulaConfig() MulaConfig {
+	return MulaConfig{URL: "tcp://127.0.0.1:0", SendBuf: 128, RecvBuf: 128}
+}
+
+// Mula is a Bus implementation using Pepper's custom TCP framing protocol.
 type Mula struct {
-	cfg        Config
+	cfg        MulaConfig
 	baseAddr   string
 	mu         sync.RWMutex
-	subs       map[string][]*subscriber
-	localSubs  map[string][]*localSub
-	prefixSubs []prefixSub
-	pushQs     map[string]*pushQueue
+	subs       map[string][]*mulaRemoteSub
+	localSubs  map[string][]*mulaLocalSub
+	prefixSubs []mulaPrefixSub
+	pushQs     map[string]*mulaPushQ
 	closed     atomic.Bool
 	listener   net.Listener
 	port       int
 	stopCh     chan struct{}
 }
 
-type subscriber struct {
-	conn   net.Conn
-	topics []string
-	sendCh chan []byte
-	closed atomic.Bool
+type mulaRemoteSub struct {
+	conn     net.Conn
+	topics   []string
+	sendCh   chan []byte
+	closed   atomic.Bool
+	closedCh chan struct{}
 }
 
-type prefixSub struct {
+type mulaPrefixSub struct {
 	prefix    string
 	ch        chan Message
 	closeOnce *sync.Once
 }
 
-type localSub struct {
+type mulaLocalSub struct {
 	ch        chan Message
 	closeOnce sync.Once
 }
 
-type pushQueue struct {
+type mulaPushQ struct {
 	ch chan []byte
 }
 
+// MulaMessage is a message received from the Mula bus.
+type MulaMessage struct {
+	Topic string
+	Data  []byte
+}
+
+// NewMula creates a new Mula bus bound to the address in cfg.URL.
+// It accepts either a Config or MulaConfig — callers may use Config for
+// consistency with the Bus interface conventions.
 func NewMula(cfg Config) (*Mula, error) {
-	host, port, err := parseAddr(cfg.URL)
+	mcfg := MulaConfig{URL: cfg.URL, SendBuf: cfg.SendBuf, RecvBuf: cfg.RecvBuf}
+	return newMulaFromMulaConfig(mcfg)
+}
+
+// NewMulaFromMulaConfig creates a Mula from a MulaConfig directly.
+func NewMulaFromMulaConfig(cfg MulaConfig) (*Mula, error) {
+	return newMulaFromMulaConfig(cfg)
+}
+
+func newMulaFromMulaConfig(cfg MulaConfig) (*Mula, error) {
+	host, port, err := parseMulaAddr(cfg.URL)
 	if err != nil {
-		return nil, fmt.Errorf("bus.NewMula: %w", err)
+		return nil, fmt.Errorf("coord.NewMula: %w", err)
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
-		return nil, fmt.Errorf("bus.NewMula: listen %s:%d: %w", host, port, err)
+		return nil, fmt.Errorf("coord.NewMula: listen %s:%d: %w", host, port, err)
 	}
 	b := &Mula{
 		cfg:       cfg,
 		baseAddr:  host,
-		subs:      make(map[string][]*subscriber),
-		localSubs: make(map[string][]*localSub),
-		pushQs:    make(map[string]*pushQueue),
+		subs:      make(map[string][]*mulaRemoteSub),
+		localSubs: make(map[string][]*mulaLocalSub),
+		pushQs:    make(map[string]*mulaPushQ),
 		listener:  ln,
 		port:      ln.Addr().(*net.TCPAddr).Port,
 		stopCh:    make(chan struct{}),
@@ -79,36 +116,41 @@ func (b *Mula) Addr() string {
 
 func (b *Mula) Publish(topic string, data []byte) error {
 	if b.closed.Load() {
-		return fmt.Errorf("bus: closed")
+		return fmt.Errorf("mula: closed")
 	}
-	msg := encodeMsg(topic, data)
+	msg := mulaMarshal(topic, data)
 
 	b.mu.RLock()
-	remoteSubs := make([]*subscriber, len(b.subs[topic]))
-	copy(remoteSubs, b.subs[topic])
-	localEntries := make([]*localSub, len(b.localSubs[topic]))
-	copy(localEntries, b.localSubs[topic])
-	prefixCopy := make([]prefixSub, len(b.prefixSubs))
-	copy(prefixCopy, b.prefixSubs)
+	remote := make([]*mulaRemoteSub, len(b.subs[topic]))
+	copy(remote, b.subs[topic])
+	local := make([]*mulaLocalSub, len(b.localSubs[topic]))
+	copy(local, b.localSubs[topic])
+	prefix := make([]mulaPrefixSub, len(b.prefixSubs))
+	copy(prefix, b.prefixSubs)
 	b.mu.RUnlock()
 
-	for _, sub := range remoteSubs {
+	for _, sub := range remote {
 		if sub.closed.Load() {
 			continue
 		}
 		select {
 		case sub.sendCh <- msg:
-		case <-time.After(50 * time.Millisecond):
+		default:
 		}
 	}
-
 	m := Message{Topic: topic, Data: data}
-	for _, ls := range localEntries {
-		_ = sendWithTimeout(ls.ch, m, 50*time.Millisecond)
+	for _, ls := range local {
+		select {
+		case ls.ch <- m:
+		default:
+		}
 	}
-	for _, ps := range prefixCopy {
+	for _, ps := range prefix {
 		if strings.HasPrefix(topic, ps.prefix) {
-			_ = sendWithTimeout(ps.ch, m, 50*time.Millisecond)
+			select {
+			case ps.ch <- m:
+			default:
+			}
 		}
 	}
 	return nil
@@ -116,7 +158,7 @@ func (b *Mula) Publish(topic string, data []byte) error {
 
 func (b *Mula) PushOne(ctx context.Context, topic string, data []byte) error {
 	if b.closed.Load() {
-		return fmt.Errorf("bus: closed")
+		return fmt.Errorf("mula: closed")
 	}
 	q := b.getOrCreatePushQ(topic)
 	select {
@@ -133,7 +175,7 @@ func (b *Mula) Subscribe(ctx context.Context, topic string) (<-chan Message, err
 
 func (b *Mula) SubscribePrefix(ctx context.Context, prefix string) (<-chan Message, error) {
 	if b.closed.Load() {
-		return nil, fmt.Errorf("bus: closed")
+		return nil, fmt.Errorf("mula: closed")
 	}
 	bufSize := b.cfg.RecvBuf
 	if bufSize <= 0 {
@@ -141,7 +183,7 @@ func (b *Mula) SubscribePrefix(ctx context.Context, prefix string) (<-chan Messa
 	}
 	ch := make(chan Message, bufSize)
 	once := &sync.Once{}
-	ps := prefixSub{prefix: prefix, ch: ch, closeOnce: once}
+	ps := mulaPrefixSub{prefix: prefix, ch: ch, closeOnce: once}
 	b.mu.Lock()
 	b.prefixSubs = append(b.prefixSubs, ps)
 	b.mu.Unlock()
@@ -162,20 +204,17 @@ func (b *Mula) SubscribePrefix(ctx context.Context, prefix string) (<-chan Messa
 
 func (b *Mula) subscribe(ctx context.Context, topic string) (<-chan Message, error) {
 	if b.closed.Load() {
-		return nil, fmt.Errorf("bus: closed")
+		return nil, fmt.Errorf("mula: closed")
 	}
 	bufSize := b.cfg.RecvBuf
 	if bufSize <= 0 {
 		bufSize = 64
 	}
-	ls := &localSub{ch: make(chan Message, bufSize)}
+	ls := &mulaLocalSub{ch: make(chan Message, bufSize)}
 	b.mu.Lock()
 	b.localSubs[topic] = append(b.localSubs[topic], ls)
 	b.mu.Unlock()
 
-	// For push topics, also drain the push queue into this local subscriber
-	// so in-process Go workers (adapter, goruntime, cli) receive PushOne messages
-	// the same way TCP-connected Python workers do via drainPushToSubscriber.
 	if strings.HasPrefix(topic, "pepper.push.") {
 		go func() {
 			q := b.getOrCreatePushQ(topic)
@@ -186,8 +225,10 @@ func (b *Mula) subscribe(ctx context.Context, topic string) (<-chan Message, err
 				case <-ctx.Done():
 					return
 				case data := <-q.ch:
-					msg := Message{Topic: topic, Data: data}
-					_ = sendWithTimeout(ls.ch, msg, 50*time.Millisecond)
+					select {
+					case ls.ch <- Message{Topic: topic, Data: data}:
+					default:
+					}
 				}
 			}
 		}()
@@ -242,7 +283,6 @@ func (b *Mula) acceptLoop() {
 			case <-b.stopCh:
 				return
 			default:
-				time.Sleep(5 * time.Millisecond)
 				continue
 			}
 		}
@@ -252,21 +292,21 @@ func (b *Mula) acceptLoop() {
 
 func (b *Mula) handleConn(conn net.Conn) {
 	defer conn.Close()
-	helloData, err := readFrame(conn)
+	helloData, err := mulaReadFrame(conn)
 	if err != nil {
 		return
 	}
 	topicStr := string(helloData)
 	topics := strings.Split(topicStr, "|")
 	if len(topics) > 0 && strings.HasPrefix(topics[0], "pull:") {
-		pullTopic := strings.TrimPrefix(topics[0], "pull:")
-		b.servePuller(conn, pullTopic)
+		b.servePuller(conn, strings.TrimPrefix(topics[0], "pull:"))
 		return
 	}
-	sub := &subscriber{
-		conn:   conn,
-		topics: topics,
-		sendCh: make(chan []byte, b.cfg.SendBuf),
+	sub := &mulaRemoteSub{
+		conn:     conn,
+		topics:   topics,
+		sendCh:   make(chan []byte, b.cfg.SendBuf),
+		closedCh: make(chan struct{}),
 	}
 	b.mu.Lock()
 	for _, t := range topics {
@@ -274,30 +314,27 @@ func (b *Mula) handleConn(conn net.Conn) {
 	}
 	b.mu.Unlock()
 	go func() {
-		defer sub.closed.Store(true)
+		defer func() {
+			sub.closed.Store(true)
+			close(sub.closedCh)
+		}()
 		for msg := range sub.sendCh {
-			if err := writeFrame(conn, msg); err != nil {
+			if err := mulaWriteFrame(conn, msg); err != nil {
 				return
 			}
 		}
 	}()
-
-	// For any pepper.push.{group} topics in the subscription list, also drain
-	// that group's push queue into this subscriber's sendCh.
-	// This allows regular TCP subscribers (Python workers) to receive DispatchAny
-	// requests that arrive via PushOne without needing a separate pull connection.
 	for _, t := range topics {
 		if strings.HasPrefix(t, "pepper.push.") {
-			topic := t // capture for closure
-			go b.drainPushToSubscriber(sub, topic)
+			go b.drainPushToSub(sub, t)
 		}
 	}
 	for {
-		data, err := readFrame(conn)
+		data, err := mulaReadFrame(conn)
 		if err != nil {
 			break
 		}
-		topic, payload := decodeMsg(data)
+		topic, payload := mulaUnmarshal(data)
 		b.deliverToLocal(topic, payload)
 	}
 	sub.closed.Store(true)
@@ -314,44 +351,30 @@ func (b *Mula) handleConn(conn net.Conn) {
 	b.mu.Unlock()
 }
 
-// drainPushToSubscriber reads from the push queue for a topic and forwards
-// each message to the subscriber's sendCh, wrapped with the topic prefix so
-// the recipient can decode it with the same path as pub/sub messages.
-// This allows Python workers that subscribe to pepper.push.{group} to receive
-// DispatchAny requests without needing a separate pull connection.
-func (b *Mula) drainPushToSubscriber(sub *subscriber, topic string) {
+func (b *Mula) drainPushToSub(sub *mulaRemoteSub, topic string) {
 	q := b.getOrCreatePushQ(topic)
 	for {
 		select {
 		case <-b.stopCh:
 			return
+		case <-sub.closedCh:
+			return
 		case data := <-q.ch:
-			// Wrap with topic prefix so the subscriber can decode it the same
-			// way as regular pub/sub messages: [2-byte-topic-len][topic][payload]
-			wrapped := encodeMsg(topic, data)
-			for {
-				if sub.closed.Load() {
-					// Put back and exit
-					select {
-					case q.ch <- data:
-					default:
-					}
-					return
-				}
+			select {
+			case sub.sendCh <- mulaMarshal(topic, data):
+			case <-sub.closedCh:
 				select {
-				case sub.sendCh <- wrapped:
-					goto nextMsg
-				case <-time.After(100 * time.Millisecond):
-					// loop around to check sub.closed again
-				case <-b.stopCh:
-					select {
-					case q.ch <- data:
-					default:
-					}
-					return
+				case q.ch <- data:
+				default:
 				}
+				return
+			case <-b.stopCh:
+				select {
+				case q.ch <- data:
+				default:
+				}
+				return
 			}
-		nextMsg:
 		}
 	}
 }
@@ -363,7 +386,7 @@ func (b *Mula) servePuller(conn net.Conn, topic string) {
 		case <-b.stopCh:
 			return
 		case data := <-q.ch:
-			if err := writeFrame(conn, data); err != nil {
+			if err := mulaWriteFrame(conn, data); err != nil {
 				select {
 				case q.ch <- data:
 				default:
@@ -376,24 +399,30 @@ func (b *Mula) servePuller(conn net.Conn, topic string) {
 
 func (b *Mula) deliverToLocal(topic string, data []byte) {
 	b.mu.RLock()
-	exactEntries := make([]*localSub, len(b.localSubs[topic]))
-	copy(exactEntries, b.localSubs[topic])
-	prefixSubs := make([]prefixSub, len(b.prefixSubs))
-	copy(prefixSubs, b.prefixSubs)
+	exact := make([]*mulaLocalSub, len(b.localSubs[topic]))
+	copy(exact, b.localSubs[topic])
+	prefix := make([]mulaPrefixSub, len(b.prefixSubs))
+	copy(prefix, b.prefixSubs)
 	b.mu.RUnlock()
 
-	msg := Message{Topic: topic, Data: data}
-	for _, ls := range exactEntries {
-		_ = sendWithTimeout(ls.ch, msg, 50*time.Millisecond)
+	m := Message{Topic: topic, Data: data}
+	for _, ls := range exact {
+		select {
+		case ls.ch <- m:
+		default:
+		}
 	}
-	for _, ps := range prefixSubs {
+	for _, ps := range prefix {
 		if strings.HasPrefix(topic, ps.prefix) {
-			_ = sendWithTimeout(ps.ch, msg, 50*time.Millisecond)
+			select {
+			case ps.ch <- m:
+			default:
+			}
 		}
 	}
 }
 
-func (b *Mula) getOrCreatePushQ(topic string) *pushQueue {
+func (b *Mula) getOrCreatePushQ(topic string) *mulaPushQ {
 	b.mu.RLock()
 	q, ok := b.pushQs[topic]
 	b.mu.RUnlock()
@@ -405,12 +434,18 @@ func (b *Mula) getOrCreatePushQ(topic string) *pushQueue {
 	if q, ok = b.pushQs[topic]; ok {
 		return q
 	}
-	q = &pushQueue{ch: make(chan []byte, 256)}
+	q = &mulaPushQ{ch: make(chan []byte, 256)}
 	b.pushQs[topic] = q
 	return q
 }
 
-func writeFrame(conn net.Conn, data []byte) error {
+// AsBus returns b as a Bus. Since *Mula now directly implements Bus,
+// this is a convenience method for callers that need the interface type.
+func (b *Mula) AsBus() Bus { return b }
+
+// Wire encoding helpers.
+
+func mulaWriteFrame(conn net.Conn, data []byte) error {
 	hdr := make([]byte, 4)
 	binary.BigEndian.PutUint32(hdr, uint32(len(data)))
 	if _, err := conn.Write(hdr); err != nil {
@@ -420,7 +455,7 @@ func writeFrame(conn net.Conn, data []byte) error {
 	return err
 }
 
-func readFrame(conn net.Conn) ([]byte, error) {
+func mulaReadFrame(conn net.Conn) ([]byte, error) {
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
 		return nil, err
@@ -430,14 +465,14 @@ func readFrame(conn net.Conn) ([]byte, error) {
 		return nil, nil
 	}
 	if size > 64*1024*1024 {
-		return nil, fmt.Errorf("bus: frame too large: %d bytes", size)
+		return nil, fmt.Errorf("mula: frame too large: %d bytes", size)
 	}
 	buf := make([]byte, size)
 	_, err := io.ReadFull(conn, buf)
 	return buf, err
 }
 
-func encodeMsg(topic string, data []byte) []byte {
+func mulaMarshal(topic string, data []byte) []byte {
 	tb := []byte(topic)
 	out := make([]byte, 2+len(tb)+len(data))
 	binary.BigEndian.PutUint16(out[:2], uint16(len(tb)))
@@ -446,7 +481,7 @@ func encodeMsg(topic string, data []byte) []byte {
 	return out
 }
 
-func decodeMsg(frame []byte) (topic string, data []byte) {
+func mulaUnmarshal(frame []byte) (topic string, data []byte) {
 	if len(frame) < 2 {
 		return "", frame
 	}
@@ -457,7 +492,7 @@ func decodeMsg(frame []byte) (topic string, data []byte) {
 	return string(frame[2 : 2+tl]), frame[2+tl:]
 }
 
-func parseAddr(rawURL string) (host string, port int, err error) {
+func parseMulaAddr(rawURL string) (host string, port int, err error) {
 	rawURL = strings.TrimSpace(rawURL)
 	switch {
 	case strings.HasPrefix(rawURL, "tcp://"):
@@ -471,26 +506,9 @@ func parseAddr(rawURL string) (host string, port int, err error) {
 			return "", 0, fmt.Errorf("invalid port in %q: %w", rawURL, err)
 		}
 		return h, port, nil
-	case strings.HasPrefix(rawURL, "ipc://"):
-		return "127.0.0.1", 7731, nil
 	case rawURL == "" || rawURL == "auto":
 		return "127.0.0.1", 0, nil
 	default:
-		return "", 0, fmt.Errorf("unsupported bus URL %q — use tcp:// or ipc://", rawURL)
+		return "", 0, fmt.Errorf("unsupported mula URL %q — use tcp://host:port", rawURL)
 	}
 }
-
-// sendWithTimeout sends to a channel with a short timeout to avoid silent drops in tests.
-func sendWithTimeout(ch chan<- Message, msg Message, timeout time.Duration) bool {
-	select {
-	case ch <- msg:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
-}
-
-func WorkerConnectAddr(busAddr string) string { return busAddr }
-func GetPID() int                             { return os.Getpid() }
-
-var _ Bus = (*Mula)(nil)

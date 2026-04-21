@@ -182,6 +182,16 @@ _model = None
 _model_load_time = None
 _cache_dir = None
 
+def _model_is_cached(model_size: str, cache_dir: str) -> bool:
+    """Return True if the faster-whisper model is already in the local cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        repo_id = f"Systran/faster-whisper-{model_size}"
+        result = try_to_load_from_cache(repo_id, "model.bin", cache_dir=cache_dir)
+        return result is not None and result != "" and not isinstance(result, type(None))
+    except Exception:
+        return False
+
 def setup(config: dict) -> None:
     global _model, _model_load_time, _cache_dir
     from faster_whisper import WhisperModel
@@ -196,7 +206,18 @@ def setup(config: dict) -> None:
     )
 
     t0 = time.monotonic()
-    _model = WhisperModel(model_size, device=device, compute_type=compute)
+    if _model_is_cached(model_size, _cache_dir):
+        # Model already on disk — load without any network calls.
+        _model = WhisperModel(
+            model_size, device=device, compute_type=compute,
+            download_root=_cache_dir, local_files_only=True,
+        )
+    else:
+        # First run — allow download, then it will be cached for subsequent runs.
+        _model = WhisperModel(
+            model_size, device=device, compute_type=compute,
+            download_root=_cache_dir,
+        )
     _model_load_time = time.monotonic() - t0
 
 def _cuda_available() -> bool:

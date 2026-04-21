@@ -1,4 +1,4 @@
-package storage
+package session
 
 // Store is the pluggable session persistence interface.
 type Store interface {

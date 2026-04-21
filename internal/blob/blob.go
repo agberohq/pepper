@@ -3,6 +3,7 @@ package blob
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,6 +22,21 @@ type Ref struct {
 	Shape        []int  `msgpack:"shape"`
 	Format       string `msgpack:"format"`
 }
+
+// Scheme returns the URL scheme of Path.
+// Returns "file" for bare filesystem paths (no "://" present).
+func (r Ref) Scheme() string {
+	if i := strings.Index(r.Path, "://"); i > 0 {
+		return r.Path[:i]
+	}
+	return "file"
+}
+
+// IsLocal reports whether the blob lives on the local filesystem.
+func (r Ref) IsLocal() bool { return r.Scheme() == "file" }
+
+// IsRemote reports whether the blob lives on a remote object store (e.g. s3://).
+func (r Ref) IsRemote() bool { return !r.IsLocal() }
 
 type Blob struct {
 	ref     Ref

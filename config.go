@@ -4,17 +4,26 @@ import (
 	"crypto/tls"
 	"time"
 
+	"github.com/agberohq/pepper/internal/blob"
+	"github.com/agberohq/pepper/internal/coord"
 	"github.com/agberohq/pepper/internal/dlq"
 	"github.com/agberohq/pepper/internal/metrics"
-	"github.com/agberohq/pepper/internal/storage"
+	"github.com/agberohq/pepper/internal/session"
 	"github.com/olekukonko/ll"
 )
 
 // Config holds all Pepper runtime configuration.
 type Config struct {
 	// Wire protocol
-	Codec        Codec
-	Transport    Transport
+	Codec     Codec
+	Transport Transport
+	// TransportURL has two roles depending on mode:
+	//   single-node (no Coord): Mula TCP address, e.g. "tcp://127.0.0.1:7731"
+	//                           defaults to a random free port if empty.
+	//   distributed (with Coord): the coord URL, e.g. "redis://host:6379"
+	//                             or "nats://host:4222". Must match the URL
+	//                             passed to coord.NewRedis / coord.NewNATS.
+	//                             Required when WithCoord is set.
 	TransportURL string
 
 	// Workers
@@ -32,9 +41,15 @@ type Config struct {
 	MaxHops    uint8
 	MaxCbDepth uint8
 
-	// Blobs (zero-copy)
+	// Blobs (zero-copy local, or remote object store in distributed mode)
 	BlobDir       string
 	BlobOrphanTTL time.Duration
+	// BlobStore is the remote object store backend used in distributed mode.
+	// When set, blobs are uploaded here so workers on other nodes can fetch
+	// them. Ref.Path will be "s3://..." instead of a local filesystem path.
+	// If nil in distributed mode, large file transfer falls back to the
+	// router's HTTP relay (not yet implemented — set this for production).
+	BlobStore blob.RemoteBackend
 
 	// Streaming
 	StreamCredits uint16
@@ -50,8 +65,8 @@ type Config struct {
 	Debug         DebugLevel
 	InspectorPath string
 
-	// Storage backends
-	Storage storage.Store
+	// Session backends
+	Session session.Store
 	DLQ     dlq.Backend
 	Metrics metrics.Sink
 
@@ -63,6 +78,18 @@ type Config struct {
 
 	// Tracking enables the built-in ProcessTracker for Execute/Process[Out].
 	Tracking bool
+
+	// Coord is the coordination store for distributed deployments.
+	//
+	// When set:
+	//   - capability registrations are published to all nodes
+	//   - session storage uses the coord backend automatically (unless
+	//     WithSession is also set, which takes precedence)
+	//   - the bus uses coord pub/sub + Push/Pull instead of Mula TCP
+	//   - TransportURL must be set to the same URL as the coord backend
+	//
+	// When nil (default): single-node in-memory mode, Mula bus.
+	Coord coord.Store
 
 	// Logger
 	logger *ll.Logger
@@ -125,11 +152,41 @@ func WithPoisonPillThreshold(n int) Option {
 func WithPoisonPillTTL(d time.Duration) Option { return func(cfg *Config) { cfg.PoisonPillTTL = d } }
 func WithDebug(level DebugLevel) Option        { return func(cfg *Config) { cfg.Debug = level } }
 func WithInspector(path string) Option         { return func(cfg *Config) { cfg.InspectorPath = path } }
-func WithStorage(s storage.Store) Option       { return func(cfg *Config) { cfg.Storage = s } }
 func WithDLQ(d dlq.Backend) Option             { return func(cfg *Config) { cfg.DLQ = d } }
 func WithMetrics(s metrics.Sink) Option        { return func(cfg *Config) { cfg.Metrics = s } }
 func WithTracking(enabled bool) Option         { return func(cfg *Config) { cfg.Tracking = enabled } }
 func WithStrategy(s Strategy) Option           { return func(cfg *Config) { cfg.Strategy = s } }
+
+// WithSession sets the session persistence backend.
+// If not set and WithCoord is used, a coord-backed session store is created
+// automatically. If neither is set, an in-memory store is used.
+func WithSession(s session.Store) Option { return func(cfg *Config) { cfg.Session = s } }
+
+// WithBlobStore sets the remote object store backend for distributed blob access.
+// Required in distributed mode (WithCoord) when workers on different machines
+// need to share large binary payloads (audio, video, images, model outputs).
+//
+//	pp, _ := pepper.New(
+//	    pepper.WithCoord(coord.NewRedis("redis://host:6379")),
+//	    pepper.WithTransportURL("redis://host:6379"),
+//	    pepper.WithBlobStore(&blob.S3Backend{
+//	        Bucket:  "my-bucket",
+//	        BaseURL: "https://s3.amazonaws.com",
+//	    }),
+//	)
+func WithBlobStore(b blob.RemoteBackend) Option { return func(cfg *Config) { cfg.BlobStore = b } }
+
+// WithCoord attaches a coordination store for distributed deployments.
+//
+// Also set WithTransportURL to the same URL so Python workers know where
+// to connect:
+//
+//	c, _ := coord.NewRedis("redis://host:6379")
+//	pp, _ := pepper.New(
+//	    pepper.WithCoord(c),
+//	    pepper.WithTransportURL("redis://host:6379"),
+//	)
+func WithCoord(c coord.Store) Option { return func(cfg *Config) { cfg.Coord = c } }
 
 // Resource registers a named resource config for Python @resource workers.
 //

@@ -298,17 +298,40 @@ func (s *natsStore) Publish(_ context.Context, channel string, payload []byte) e
 
 // Subscribe listens on channels matching channelPrefix.
 // Each call opens a dedicated connection with a plain SUB.
+// Handles both exact topics (pepper.control.w-1) and prefix patterns (pepper.control.*).
 func (s *natsStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan Event, error) {
 	c, err := s.dial()
 	if err != nil {
 		return nil, fmt.Errorf("coord/nats: subscribe dial: %w", err)
 	}
+
+	ch := make(chan Event, 64)
+
+	// NATS wildcards: * (single token), > (multi-token suffix, must be dot-prefixed)
+	// If caller passes a Redis-style pattern with *, convert to NATS >
+	subj := channelPrefix
+	if strings.HasSuffix(subj, "*") {
+		subj = strings.TrimSuffix(subj, "*") + ">"
+	}
+
+	// Subscribe to the computed subject
 	sid := 1
-	if err := natsWrite(c, fmt.Sprintf("SUB %s.> %d\r\n", channelPrefix, sid)); err != nil {
+	if err := natsWrite(c, fmt.Sprintf("SUB %s %d\r\n", subj, sid)); err != nil {
 		c.Close()
 		return nil, err
 	}
-	ch := make(chan Event, 64)
+
+	// If the original was an exact topic (no wildcard), also subscribe to its prefix
+	// to match Redis PSUBSCRIBE behavior. Use a DIFFERENT sid.
+	if !strings.ContainsAny(channelPrefix, "*>") {
+		sid++
+		prefixSubj := channelPrefix + ".>"
+		if err := natsWrite(c, fmt.Sprintf("SUB %s %d\r\n", prefixSubj, sid)); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+
 	go s.readMessages(ctx, c, ch)
 	return ch, nil
 }
@@ -373,9 +396,8 @@ func (s *natsStore) Push(_ context.Context, queue string, payload []byte) error 
 		return err
 	}
 	defer c.Close()
-	subj := "pepper.queue." + queue
 	encoded := hex.EncodeToString(payload)
-	return natsWrite(c, fmt.Sprintf("PUB %s %d\r\n%s\r\n", subj, len(encoded), encoded))
+	return natsWrite(c, fmt.Sprintf("PUB %s %d\r\n%s\r\n", queue, len(encoded), encoded))
 }
 
 // Pull subscribes to the queue subject with a shared queue group and blocks
@@ -388,7 +410,7 @@ func (s *natsStore) Pull(ctx context.Context, queue string) ([]byte, error) {
 	}
 	defer c.Close()
 
-	subj := "pepper.queue." + queue
+	subj := queue
 	sid := 1
 	// Queue-group subscription: all nodes subscribe with the same group name.
 	// NATS selects exactly one subscriber per message.

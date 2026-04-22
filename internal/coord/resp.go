@@ -1,8 +1,5 @@
 package coord
 
-// Replaces the copies in internal/bus/redis.go (readRESPBus) and
-// internal/storage/redis.go (readRESP).
-
 import (
 	"bufio"
 	"fmt"

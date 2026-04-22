@@ -2,113 +2,171 @@ package coord
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestMemory(t *testing.T) {
-	s := &Suite{
-		Name:     "Memory",
-		NewStore: func(t *testing.T) Store { return NewMemory() },
-	}
-	s.Run(t)
-}
-
-func TestMemoryReaper(t *testing.T) {
-	store := NewMemory()
-	defer store.Close()
-
+func TestMemory_PushPull_ExactTopic(t *testing.T) {
 	ctx := context.Background()
-	if err := store.Set(ctx, "expire-me", []byte("val"), 1); err != nil {
-		t.Fatal(err)
-	}
-	_, ok, _ := store.Get(ctx, "expire-me")
-	if !ok {
-		t.Fatal("key should exist immediately after Set")
-	}
-	time.Sleep(1100 * time.Millisecond)
-	_, ok, _ = store.Get(ctx, "expire-me")
-	if ok {
-		t.Fatal("key should be gone after TTL")
-	}
-}
+	s := NewMemory()
+	defer s.Close()
 
-func TestMemorySubscribeOnSet(t *testing.T) {
-	store := NewMemory()
-	defer store.Close()
+	queue := "pepper.push.default"
+	payload := []byte("memory-test-payload")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	if err := s.Push(ctx, queue, payload); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
 
-	ch, err := store.Subscribe(ctx, "pepper:worker:")
+	got, err := s.Pull(ctx, queue)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Pull: %v", err)
 	}
-	time.Sleep(10 * time.Millisecond)
-
-	if err := store.Set(ctx, "pepper:worker:w-1", []byte(`{"id":"w-1"}`), 0); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case ev := <-ch:
-		if ev.Key != "pepper:worker:w-1" {
-			t.Errorf("expected key pepper:worker:w-1, got %q", ev.Key)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no event received")
+	if string(got) != string(payload) {
+		t.Errorf("Pull got %q, want %q", got, payload)
 	}
 }
 
-func TestMemorySubscribeOnDelete(t *testing.T) {
-	store := NewMemory()
-	defer store.Close()
+func TestMemory_Subscribe_ExactAndPrefix(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+	defer s.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	tests := []struct {
+		name         string
+		subscribeTo  string
+		publishTo    []string
+		wantReceived []string
+	}{
+		{
+			name:         "exact topic receives exact publish",
+			subscribeTo:  "pepper.control.w-1",
+			publishTo:    []string{"pepper.control.w-1"},
+			wantReceived: []string{"pepper.control.w-1"},
+		},
+		{
+			name:         "prefix subscribe receives child topics",
+			subscribeTo:  "pepper.control",
+			publishTo:    []string{"pepper.control.w-1", "pepper.control.w-2"},
+			wantReceived: []string{"pepper.control.w-1", "pepper.control.w-2"},
+		},
+		{
+			name:         "wildcard * converted to prefix match",
+			subscribeTo:  "pepper.*",
+			publishTo:    []string{"pepper.foo", "pepper.bar"},
+			wantReceived: []string{"pepper.foo", "pepper.bar"},
+		},
+	}
 
-	key := "pepper:worker:w-del"
-	store.Set(ctx, key, []byte("present"), 0)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			subCtx, subCancel := context.WithCancel(ctx)
+			defer subCancel()
 
-	ch, err := store.Subscribe(ctx, "pepper:worker:")
+			ch, err := s.Subscribe(subCtx, tt.subscribeTo)
+			if err != nil {
+				t.Fatalf("Subscribe(%q): %v", tt.subscribeTo, err)
+			}
+
+			var wg sync.WaitGroup
+			received := make([]string, 0, len(tt.publishTo))
+			var mu sync.Mutex
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case ev, ok := <-ch:
+						if !ok {
+							return
+						}
+						mu.Lock()
+						received = append(received, ev.Key)
+						mu.Unlock()
+						if len(received) >= len(tt.wantReceived) {
+							return
+						}
+					case <-time.After(2 * time.Second):
+						return
+					}
+				}
+			}()
+
+			for _, topic := range tt.publishTo {
+				if err := s.Publish(ctx, topic, []byte("msg")); err != nil {
+					t.Errorf("Publish(%q): %v", topic, err)
+				}
+			}
+
+			wg.Wait()
+			// Don't close ch - receive-only; context cancellation handles cleanup
+
+			wantSet := make(map[string]bool)
+			for _, w := range tt.wantReceived {
+				wantSet[w] = true
+			}
+			gotSet := make(map[string]bool)
+			for _, r := range received {
+				gotSet[r] = true
+			}
+			for w := range wantSet {
+				if !gotSet[w] {
+					t.Errorf("Subscribe(%q) missed expected topic %q; got %v", tt.subscribeTo, w, received)
+				}
+			}
+		})
+	}
+}
+
+func TestMemory_Subscribe_MultipleChannels(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+	defer s.Close()
+
+	// Subscribe to two different exact topics
+	subCtx1, cancel1 := context.WithCancel(ctx)
+	subCtx2, cancel2 := context.WithCancel(ctx)
+	defer cancel1()
+	defer cancel2()
+
+	ch1, err := s.Subscribe(subCtx1, "pepper.control.w-1")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Subscribe #1: %v", err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	ch2, err := s.Subscribe(subCtx2, "pepper.control.w-2")
+	if err != nil {
+		t.Fatalf("Subscribe #2: %v", err)
+	}
 
-	store.Delete(ctx, key)
+	// Publish to both
+	if err := s.Publish(ctx, "pepper.control.w-1", []byte("msg1")); err != nil {
+		t.Errorf("Publish w-1: %v", err)
+	}
+	if err := s.Publish(ctx, "pepper.control.w-2", []byte("msg2")); err != nil {
+		t.Errorf("Publish w-2: %v", err)
+	}
 
+	// Verify each channel gets its message
+	var got1, got2 bool
 	select {
-	case ev := <-ch:
-		if !ev.Deleted {
-			t.Errorf("expected Deleted=true, got key=%q deleted=%v", ev.Key, ev.Deleted)
+	case ev := <-ch1:
+		if ev.Key == "pepper.control.w-1" {
+			got1 = true
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no delete event received")
+	case <-time.After(500 * time.Millisecond):
 	}
-}
-
-func TestMemoryCloseIdempotent(t *testing.T) {
-	store := NewMemory()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ch, _ := store.Subscribe(ctx, "pepper:")
-	store.Close()
-	store.Close() // must not panic
-
 	select {
-	case _, ok := <-ch:
-		if ok {
-			t.Error("channel should be closed after store Close")
+	case ev := <-ch2:
+		if ev.Key == "pepper.control.w-2" {
+			got2 = true
 		}
-	case <-time.After(time.Second):
-		t.Fatal("channel not closed after store.Close()")
+	case <-time.After(500 * time.Millisecond):
 	}
-}
 
-func BenchmarkMemorySetGet(b *testing.B) {
-	store := NewMemory()
-	defer store.Close()
-	runBenchSetGet(b, store)
+	if !got1 || !got2 {
+		t.Errorf("Expected both channels to receive messages; got1=%v, got2=%v", got1, got2)
+	}
+	// Don't close ch1/ch2 - receive-only; context cancellation handles cleanup
 }

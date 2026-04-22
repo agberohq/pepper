@@ -400,7 +400,9 @@ class _NATSTransport(_TransportImpl):
                             return
             except (TimeoutError, socket.timeout):
                 continue
-            except OSError:
+            except OSError as exc:
+                if "timed out" in str(exc).lower():
+                    continue
                 break
 
     def subscribe(self, topics: list[str]) -> None:
@@ -415,7 +417,12 @@ class _NATSTransport(_TransportImpl):
 
         for topic in other_topics:
             self._sid += 1
-            subj = topic if topic.endswith(">") else topic.rstrip("*") + ">"
+            # NATS wildcards: * (single token) -> convert to > (multi-token suffix)
+            # Exact topics (no wildcard) are subscribed as-is
+            if "*" in topic:
+                subj = topic.replace("*", ">")
+            else:
+                subj = topic
             sub_cmd = f"SUB {subj} {self._sid}\r\n"
             self._sub_conn.sendall(sub_cmd.encode())
 
@@ -449,7 +456,11 @@ class _NATSTransport(_TransportImpl):
                     parts = line.split()
                     if len(parts) < 4:
                         continue
-                    n = int(parts[3])
+                    try:
+                        n = int(parts[-1])
+                    except (ValueError, IndexError):
+                        continue
+
                     while len(buf) < n + 2:
                         more = self._sub_conn.recv(65536)
                         if not more:
@@ -464,6 +475,12 @@ class _NATSTransport(_TransportImpl):
                     self._inbox.put(_wrap_payload(data), timeout=1)
             except (TimeoutError, socket.timeout):
                 continue
+            except OSError as exc:
+                if "timed out" in str(exc).lower():
+                    continue
+                if not self._stop.is_set():
+                    log.warning("nats recv error: %s", exc)
+                break
             except Exception as exc:
                 if not self._stop.is_set():
                     log.warning("nats recv error: %s", exc)

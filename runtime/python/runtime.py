@@ -3,6 +3,9 @@ runtime.py — Pepper Python worker runtime.
 """
 from __future__ import annotations
 
+import sys
+if __name__ == "__main__":
+    sys.modules["runtime"] = sys.modules[__name__]
 import contextvars
 import importlib.util
 import inspect

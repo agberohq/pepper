@@ -83,7 +83,11 @@ func TestMemory_Subscribe_ExactAndPrefix(t *testing.T) {
 							return
 						}
 						mu.Lock()
-						received = append(received, ev.Key)
+						topic := ev.Channel
+						if topic == "" {
+							topic = ev.Key
+						}
+						received = append(received, topic)
 						mu.Unlock()
 						if len(received) >= len(tt.wantReceived) {
 							return
@@ -152,14 +156,22 @@ func TestMemory_Subscribe_MultipleChannels(t *testing.T) {
 	var got1, got2 bool
 	select {
 	case ev := <-ch1:
-		if ev.Key == "pepper.control.w-1" {
+		topic := ev.Channel
+		if topic == "" {
+			topic = ev.Key
+		}
+		if topic == "pepper.control.w-1" {
 			got1 = true
 		}
 	case <-time.After(500 * time.Millisecond):
 	}
 	select {
 	case ev := <-ch2:
-		if ev.Key == "pepper.control.w-2" {
+		topic := ev.Channel
+		if topic == "" {
+			topic = ev.Key
+		}
+		if topic == "pepper.control.w-2" {
 			got2 = true
 		}
 	case <-time.After(500 * time.Millisecond):

@@ -8,8 +8,6 @@ import (
 	"time"
 )
 
-// NewMemory returns an in-process Store backed by plain maps and channels.
-// Suitable for single-node deployments and tests. Zero dependencies.
 func NewMemory() Store {
 	m := &memStore{
 		kv:     make(map[string]memEntry),
@@ -22,7 +20,7 @@ func NewMemory() Store {
 
 type memEntry struct {
 	value     []byte
-	expiresAt time.Time // zero = no expiry
+	expiresAt time.Time
 }
 
 type memSub struct {
@@ -113,7 +111,10 @@ func (m *memStore) Publish(_ context.Context, channel string, payload []byte) er
 	m.mu.RLock()
 	subs := m.snapshotSubsByChannel(channel)
 	m.mu.RUnlock()
-	m.fanout(subs, Event{Channel: channel, Value: payload})
+
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+	m.fanout(subs, Event{Channel: channel, Value: cp})
 	return nil
 }
 
@@ -140,15 +141,15 @@ func (m *memStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan 
 		m.mu.Unlock()
 		sub.close()
 	}()
+
 	return ch, nil
 }
 
-// Push enqueues payload on the named queue channel.
-// The queue is created on first use with a buffer of 512 items.
 func (m *memStore) Push(_ context.Context, queue string, payload []byte) error {
 	q := m.getOrCreateQueue(queue)
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
+
 	select {
 	case q <- cp:
 		return nil
@@ -157,7 +158,6 @@ func (m *memStore) Push(_ context.Context, queue string, payload []byte) error {
 	}
 }
 
-// Pull dequeues the next item from queue, blocking until available or ctx done.
 func (m *memStore) Pull(ctx context.Context, queue string) ([]byte, error) {
 	q := m.getOrCreateQueue(queue)
 	select {
@@ -186,20 +186,56 @@ func (m *memStore) Close() error {
 	return nil
 }
 
-func (m *memStore) snapshotSubs(key string) []*memSub {
+func (m *memStore) snapshotSubsByChannel(channel string) []*memSub {
 	var out []*memSub
 	for _, s := range m.subs {
-		if strings.HasPrefix(key, s.prefix) {
+		prefix := s.prefix
+
+		if strings.HasSuffix(prefix, "*") {
+			base := strings.TrimSuffix(prefix, "*")
+			if strings.HasPrefix(channel, base) {
+				out = append(out, s)
+			}
+			continue
+		}
+
+		if strings.HasSuffix(prefix, ">") {
+			base := strings.TrimSuffix(prefix, ">")
+			if strings.HasPrefix(channel, base) {
+				out = append(out, s)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(channel, prefix) {
 			out = append(out, s)
 		}
 	}
 	return out
 }
 
-func (m *memStore) snapshotSubsByChannel(channel string) []*memSub {
+func (m *memStore) snapshotSubs(key string) []*memSub {
 	var out []*memSub
 	for _, s := range m.subs {
-		if strings.HasPrefix(channel, s.prefix) {
+		prefix := s.prefix
+
+		if strings.HasSuffix(prefix, "*") {
+			base := strings.TrimSuffix(prefix, "*")
+			if strings.HasPrefix(key, base) {
+				out = append(out, s)
+			}
+			continue
+		}
+
+		if strings.HasSuffix(prefix, ">") {
+			base := strings.TrimSuffix(prefix, ">")
+			if strings.HasPrefix(key, base) {
+				out = append(out, s)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(key, prefix) {
 			out = append(out, s)
 		}
 	}
@@ -236,6 +272,3 @@ func (m *memStore) reaperLoop() {
 }
 
 var _ Store = (*memStore)(nil)
-
-// ErrNotFound is returned when a key does not exist.
-var ErrNotFound = fmt.Errorf("coord: key not found")

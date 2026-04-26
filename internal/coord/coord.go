@@ -2,9 +2,10 @@
 // registry, and session layers.
 //
 // A Store is a key-value store with pub/sub notifications and a work queue.
-// Three backends are supported:
+// Four backends are supported:
 //
-//	memory — in-process, zero deps, single-node only
+//	memory — in-process, zero deps, tests and single-node embedded use
+//	mula   — TCP framing protocol, default single-node mode (tcp://host:port)
 //	redis  — production, connects to any Redis 6+ server
 //	nats   — production, connects to any NATS 2.x server with JetStream
 //

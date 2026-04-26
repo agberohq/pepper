@@ -194,6 +194,17 @@ func (p *Pepper) WorkerReady(cap string) bool {
 	return p.rt.router.HasCapWorker(cap)
 }
 
+// WaitWorkerReady blocks until at least one worker is ready to handle cap,
+// or ctx is cancelled. Unlike WorkerReady, this does not poll — it wakes
+// immediately when a cap_ready or heartbeat signals readiness.
+func (p *Pepper) WaitWorkerReady(ctx context.Context, cap string) error {
+	if p.rt == nil || p.rt.router == nil {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return p.rt.router.WaitCapReady(ctx, cap)
+}
+
 func (p *Pepper) ensureStarted() error {
 	p.mu.RLock()
 	started, stopped := p.started, p.stopped

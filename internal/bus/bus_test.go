@@ -7,34 +7,38 @@ import (
 	"time"
 
 	"github.com/agberohq/pepper/internal/bus"
+	"github.com/agberohq/pepper/internal/coord"
 )
 
-// newTestBus creates a Mula-backed bus for testing.
+// newTestBus creates a Mula-backed Bus for external (_test) package tests.
 func newTestBus(t *testing.T) bus.Bus {
 	t.Helper()
-	m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: "tcp://127.0.0.1:0", SendBuf: 128, RecvBuf: 128})
+	c, err := coord.NewMula("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("NewMula: %v", err)
 	}
-	return m.AsBus()
+	t.Cleanup(func() { c.Close() })
+	return bus.NewCoordBus(c, coord.MulaAddr(c))
 }
 
-func TestMula(t *testing.T) {
-	testPublishSubscribe(t)
-	testSubscribePrefix(t)
-	testPushOne(t)
-	testMultiplePublishers(t)
-	testContextCancellation(t)
-	testClose(t)
+// TestMulaBus runs the full publish/subscribe/push behavioural tests against
+// a Mula-backed Bus.
+func TestMulaBus(t *testing.T) {
+	t.Run("PublishSubscribe", func(t *testing.T) { testPublishSubscribe(t) })
+	t.Run("SubscribePrefix", func(t *testing.T) { testSubscribePrefix(t) })
+	t.Run("PushOne", func(t *testing.T) { testPushOne(t) })
+	t.Run("MultiplePublishers", func(t *testing.T) { testMultiplePublishers(t) })
+	t.Run("ContextCancellation", func(t *testing.T) { testContextCancellation(t) })
+	t.Run("Close", func(t *testing.T) { testClose(t) })
 }
 
-func TestMulaClose(t *testing.T) {
+func TestMulaCloseIdempotent(t *testing.T) {
 	b := newTestBus(t)
 	if err := b.Close(); err != nil {
 		t.Errorf("first Close: %v", err)
 	}
 	if err := b.Close(); err != nil {
-		t.Errorf("second Close: %v", err)
+		t.Errorf("second Close (idempotent): %v", err)
 	}
 	if err := b.Publish("test", []byte("data")); err == nil {
 		t.Error("Publish after close should fail")
@@ -105,19 +109,63 @@ func TestWorkerEnvVars(t *testing.T) {
 	}
 }
 
+func TestMockBus(t *testing.T) {
+	m := bus.NewMock()
+	defer m.Close()
+
+	// Publish / Subscribe round-trip.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ch, err := m.Subscribe(ctx, "pepper.pub.test")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	if err := m.Publish("pepper.pub.test", []byte("hello")); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	select {
+	case msg := <-ch:
+		if string(msg.Data) != "hello" {
+			t.Errorf("data: got %q, want hello", msg.Data)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for published message")
+	}
+
+	// PushOne / PopPush.
+	if err := m.PushOne(ctx, "pepper.push.gpu", []byte("task-payload")); err != nil {
+		t.Fatalf("PushOne: %v", err)
+	}
+	data, ok := m.PopPush("pepper.push.gpu")
+	if !ok {
+		t.Fatal("PopPush: expected message, got nothing")
+	}
+	if string(data) != "task-payload" {
+		t.Errorf("PopPush: got %q, want task-payload", data)
+	}
+
+	// PopPush on empty queue returns false.
+	if _, ok := m.PopPush("pepper.push.gpu"); ok {
+		t.Error("PopPush: expected empty queue after dequeue")
+	}
+}
+
 func BenchmarkMulaPublish(b *testing.B) {
-	m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: "tcp://127.0.0.1:0", SendBuf: 128, RecvBuf: 128})
+	c, err := coord.NewMula("tcp://127.0.0.1:0")
 	if err != nil {
 		b.Fatal(err)
 	}
-	adapted := m.AsBus()
-	defer adapted.Close()
+	bbus := bus.NewCoordBus(c, coord.MulaAddr(c))
+	defer bbus.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	topic := "pepper.pub.bench"
-	subCh, err := adapted.Subscribe(ctx, topic)
+	subCh, err := bbus.Subscribe(ctx, topic)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -129,11 +177,13 @@ func BenchmarkMulaPublish(b *testing.B) {
 	data := []byte("benchmark data")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := adapted.Publish(topic, data); err != nil {
+		if err := bbus.Publish(topic, data); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
+
+// shared test helpers
 
 func testPublishSubscribe(t *testing.T) {
 	t.Helper()
@@ -150,20 +200,20 @@ func testPublishSubscribe(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	testData := []byte("hello world")
-	if err := b.Publish(topic, testData); err != nil {
+	want := []byte("hello world")
+	if err := b.Publish(topic, want); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
 	select {
 	case msg := <-subCh:
 		if msg.Topic != topic {
-			t.Errorf("expected topic %q, got %q", topic, msg.Topic)
+			t.Errorf("topic: got %q, want %q", msg.Topic, topic)
 		}
-		if string(msg.Data) != string(testData) {
-			t.Errorf("expected data %q, got %q", testData, msg.Data)
+		if string(msg.Data) != string(want) {
+			t.Errorf("data: got %q, want %q", msg.Data, want)
 		}
-	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
 		t.Fatal("timeout waiting for message")
 	}
 }
@@ -199,17 +249,17 @@ func testSubscribePrefix(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	b.Publish("pepper.res.abc", []byte("test"))
+	b.Publish("pepper.res.abc", []byte("one"))
 	time.Sleep(20 * time.Millisecond)
-	b.Publish("pepper.res.def", []byte("test"))
+	b.Publish("pepper.res.def", []byte("two"))
 	time.Sleep(20 * time.Millisecond)
-	b.Publish("pepper.other.xyz", []byte("test"))
+	b.Publish("pepper.other.xyz", []byte("noise")) // must not arrive
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
 		t.Fatal("timeout waiting for prefix messages")
 	}
 }
@@ -222,10 +272,8 @@ func testPushOne(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := b.PushOne(ctx, "pepper.push.gpu", []byte("test"))
-	if err != nil {
-		t.Logf("PushOne returned error (no workers): %v", err)
-	}
+	// PushOne with no listeners is acceptable — must not block past ctx.
+	_ = b.PushOne(ctx, "pepper.push.gpu", []byte("test"))
 }
 
 func testMultiplePublishers(t *testing.T) {
@@ -255,12 +303,11 @@ func testMultiplePublishers(t *testing.T) {
 	wg.Wait()
 
 	received := 0
-	timeout := time.After(3 * time.Second)
 	for received < n {
 		select {
 		case <-subCh:
 			received++
-		case <-timeout:
+		case <-ctx.Done():
 			t.Fatalf("timeout: received %d/%d", received, n)
 		}
 	}
@@ -278,15 +325,13 @@ func testContextCancellation(t *testing.T) {
 	}
 
 	cancel()
-	time.Sleep(50 * time.Millisecond)
-
 	select {
 	case _, ok := <-subCh:
 		if ok {
 			t.Error("channel should be closed after context cancel")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for channel close")
+		t.Fatal("timeout waiting for channel close after ctx cancel")
 	}
 }
 
@@ -312,8 +357,71 @@ func testClose(t *testing.T) {
 			t.Error("channel should be closed after bus close")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for channel close")
+		t.Fatal("timeout waiting for channel close after bus close")
 	}
 
 	b.Close() // idempotent
+}
+
+// TestPipelinePattern exercises the exact pattern used by the pipeline dispatcher:
+// Subscribe to a prefix topic (stageCh)
+// Subscribe to a push topic (workerCh)
+// Push to the worker push topic (simulating router.Dispatch)
+// Worker reads from workerCh, publishes result to the forward topic
+// stageCh receives the forwarded result
+func TestPipelinePattern(t *testing.T) {
+	c, err := coord.NewMula("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewMula: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	b := bus.NewCoordBus(c, coord.MulaAddr(c))
+	t.Cleanup(func() { b.Close() })
+
+	bgCtx := context.Background()
+	callCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Step 1: pipeline subscribes to prefix (simulates dispatchPipeline).
+	stageCh, err := b.SubscribePrefix(callCtx, "pepper.pipe.foo.")
+	if err != nil {
+		t.Fatalf("SubscribePrefix: %v", err)
+	}
+
+	// Step 2: worker subscribes to its direct push topic (simulates goruntime.Start).
+	workerCh, err := b.Subscribe(bgCtx, "pepper.push.w1")
+	if err != nil {
+		t.Fatalf("Subscribe workerCh: %v", err)
+	}
+
+	// Allow subscription goroutines to start.
+	time.Sleep(5 * time.Millisecond)
+
+	// Step 3: router pushes to worker (simulates router.Dispatch DispatchAny).
+	if err := b.PushOne(callCtx, "pepper.push.w1", []byte(`{"task":"hello"}`)); err != nil {
+		t.Fatalf("PushOne: %v", err)
+	}
+
+	// Step 4: worker receives from workerCh and publishes result to ForwardTo.
+	select {
+	case msg := <-workerCh:
+		t.Logf("worker received: %s", msg.Data)
+		// Worker publishes to the pipe forward topic.
+		if err := b.Publish("pepper.pipe.foo.stage.1", []byte(`{"result":"HELLO"}`)); err != nil {
+			t.Fatalf("Publish result: %v", err)
+		}
+	case <-callCtx.Done():
+		t.Fatal("timeout: worker never received push message")
+	}
+
+	// Step 5: pipeline receives on stageCh.
+	select {
+	case msg := <-stageCh:
+		t.Logf("pipeline stage received: topic=%s data=%s", msg.Topic, msg.Data)
+		if string(msg.Data) != `{"result":"HELLO"}` {
+			t.Errorf("got %q, want {\"result\":\"HELLO\"}", msg.Data)
+		}
+	case <-callCtx.Done():
+		t.Fatal("timeout: pipeline stage never received forwarded result")
+	}
 }

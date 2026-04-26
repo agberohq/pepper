@@ -23,16 +23,13 @@ _resources: dict = {}
 _resources_lock = threading.Lock()
 _resource_gens: dict = {}
 
-
 class Input(Generic[T]):
     """Annotate a run() parameter as a typed capability input."""
     pass
 
-
 class Output(Generic[T]):
     """Annotate a run() return type."""
     pass
-
 
 def capability(
         *,
@@ -75,7 +72,6 @@ def capability(
         return cls
     return decorator
 
-
 def resource(*, name: str):
     """
     Decorator for shared connection pools. The decorated generator is started
@@ -97,11 +93,9 @@ def resource(*, name: str):
         return wrapper
     return decorator
 
-
 def get_resource(name: str):
     with _resources_lock:
         return _resources.get(name)
-
 
 def close_resources():
     """Call cleanup code for all resources. Invoked on worker_bye."""
@@ -116,11 +110,9 @@ def close_resources():
         _resource_gens.clear()
         _resources.clear()
 
-
-# ── Form A parser (spec §10.1) ────────────────────────────────────────────────
+# Form A parser (spec §10.1)
 
 _HEADER_RE = re.compile(r"^#\s*pepper:(\w+)\s*=\s*(.+)$")
-
 
 def parse_form_a(source: str) -> dict:
     """
@@ -145,8 +137,7 @@ def parse_form_a(source: str) -> dict:
             break
     return meta
 
-
-# ── Blob reader (spec §12.4) ──────────────────────────────────────────────────
+# Blob reader (spec §12.4)
 
 class BlobRef:
     """
@@ -212,7 +203,6 @@ class BlobRef:
         import numpy as np
         return torch.from_numpy(np.array(self.as_numpy()))
 
-
 def read_blob(ref: dict) -> BlobRef:
     """
     Convert a blob reference dict (with _pepper_blob=True) to a BlobRef.
@@ -224,8 +214,7 @@ def read_blob(ref: dict) -> BlobRef:
         raise ValueError("read_blob: argument is not a pepper blob reference")
     return BlobRef(ref)
 
-
-# ── Schema extraction ─────────────────────────────────────────────────────────
+# Schema extraction
 
 def _extract_input_schema(cls) -> dict:
     run = getattr(cls, "run", None)
@@ -263,7 +252,6 @@ def _extract_input_schema(cls) -> dict:
         schema["required"] = required
     return schema
 
-
 def _extract_output_schema(cls) -> dict:
     run = getattr(cls, "run", None)
     if run is None:
@@ -276,7 +264,6 @@ def _extract_output_schema(cls) -> dict:
     except Exception:
         pass
     return {}
-
 
 def _unwrap_generic(ann):
     """Unwrap Input[T], Output[T], Optional[T], List[T] to inner type."""
@@ -295,7 +282,6 @@ def _unwrap_generic(ann):
         if origin in (dict, typing.Dict) and len(args) == 2:
             return {"type": "object"}
     return ann
-
 
 def _annotation_to_json_schema(ann) -> dict:
     ann = _unwrap_generic(ann)
@@ -335,14 +321,12 @@ def _annotation_to_json_schema(ann) -> dict:
 
     return {}
 
-
 def _is_pydantic(ann) -> bool:
     try:
         from pydantic import BaseModel
         return isinstance(ann, type) and issubclass(ann, BaseModel)
     except ImportError:
         return False
-
 
 def _pydantic_to_schema(model) -> dict:
     try:

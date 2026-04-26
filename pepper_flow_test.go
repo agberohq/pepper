@@ -391,7 +391,7 @@ func TestFlowPipelineWithGoFunc(t *testing.T) {
 
 	if err := pp.Compose("text.shout",
 		Pipe("text.upper"),
-		PipeTransform(func(in map[string]any) (map[string]any, error) {
+		Transform(func(in map[string]any) (map[string]any, error) {
 			// Pass through unchanged — just verifying PipeTransform in the chain
 			return in, nil
 		}),

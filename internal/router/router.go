@@ -64,6 +64,10 @@ type Router struct {
 	onDispatch       func(env envelope.Envelope, workerID string)
 	onResponse       func(env envelope.Envelope, workerID string, latency time.Duration)
 	onError          func(env envelope.Envelope, code envelope.Code)
+	// capReadyCh is closed-and-replaced whenever a new cap becomes ready,
+	// allowing WaitCapReady to block without polling.
+	capReadyMu sync.Mutex
+	capReadyCh chan struct{}
 }
 
 type Config struct {
@@ -108,6 +112,7 @@ func New(b bus.Bus, p *pending.Map, reaper *jack.Reaper, cfg Config, logger *ll.
 		codec:            cfg.Codec,
 		logger:           logger.Namespace("router"),
 		distributed:      cfg.Distributed,
+		capReadyCh:       make(chan struct{}),
 	}
 }
 
@@ -133,6 +138,34 @@ func (r *Router) MarkCapReady(workerID, cap string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.capAffinity[cap] = append(r.capAffinity[cap], workerID)
+	r.notifyCapReady()
+}
+
+// notifyCapReady wakes all WaitCapReady callers. Must be called with r.mu held.
+func (r *Router) notifyCapReady() {
+	r.capReadyMu.Lock()
+	ch := r.capReadyCh
+	r.capReadyCh = make(chan struct{})
+	r.capReadyMu.Unlock()
+	close(ch)
+}
+
+// WaitCapReady blocks until HasCapWorker(cap) returns true or ctx is done.
+func (r *Router) WaitCapReady(ctx context.Context, cap string) error {
+	for {
+		if r.HasCapWorker(cap) {
+			return nil
+		}
+		r.capReadyMu.Lock()
+		ch := r.capReadyCh
+		r.capReadyMu.Unlock()
+		select {
+		case <-ch:
+			// A new cap became ready — re-check.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (r *Router) MarkWorkerDead(workerID string) {
@@ -188,10 +221,52 @@ func (r *Router) RemoveWorker(workerID string) {
 }
 
 func (r *Router) UpdateHeartbeat(ping envelope.HbPing) {
-	r.mu.RLock()
+	r.mu.Lock()
 	ws, ok := r.workers[ping.WorkerID]
-	r.mu.RUnlock()
-	if !ok {
+	if !ok && r.distributed {
+		// Worker came up before this node started — pub/sub does not retain
+		// messages, so worker_hello and cap_ready were missed. Reconstruct
+		// the full worker state from the heartbeat, which carries both groups
+		// and the caps list (populated only after cap_load completes).
+		groups := ping.Groups
+		if len(groups) == 0 {
+			groups = []string{"default"}
+		}
+		ws = &WorkerState{
+			ID:      ping.WorkerID,
+			Runtime: ping.Runtime,
+			Groups:  groups,
+		}
+		ws.State.Store(WorkerStateReady)
+		ws.LastPing.Store(time.Now().UnixMilli())
+		r.workers[ping.WorkerID] = ws
+		for _, g := range groups {
+			r.addToGroup(g, ping.WorkerID)
+		}
+		r.logger.Fields("worker_id", ping.WorkerID, "groups", groups, "caps", ping.Caps).Info("worker discovered via heartbeat")
+	}
+	// Idempotently register cap affinity from the heartbeat caps list.
+	// Only processes when caps is non-empty — an empty list means the worker's
+	// cap_load hasn't completed yet (first heartbeat race) and should be ignored.
+	var newCapRegistered bool
+	for _, cap := range ping.Caps {
+		found := false
+		for _, id := range r.capAffinity[cap] {
+			if id == ping.WorkerID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			r.capAffinity[cap] = append(r.capAffinity[cap], ping.WorkerID)
+			newCapRegistered = true
+		}
+	}
+	if newCapRegistered {
+		r.notifyCapReady()
+	}
+	r.mu.Unlock()
+	if ws == nil {
 		return
 	}
 	ws.Load.Store(uint32(ping.Load))
@@ -240,10 +315,19 @@ func (r *Router) Dispatch(ctx context.Context, env envelope.Envelope) error {
 
 	if env.Dispatch == envelope.DispatchAny && env.WorkerID == "" {
 		if r.distributed {
-			// In distributed mode workers live on remote nodes — push directly
-			// to the shared group queue on the coord bus. The bus (Redis/NATS)
-			// delivers to whichever node's worker pulls next.
-			// Do not require a locally registered worker.
+			// In distributed mode, workers can live on remote nodes, so the
+			// local workerStates map is not the source of truth. BUT we must
+			// still verify at least ONE worker in the cluster has sent
+			// cap_ready for this cap — otherwise the router would push the
+			// request onto the shared coord queue with nobody draining it,
+			// and the caller would hang until ctx deadline with no useful
+			// error. cap_ready is fanned out on the shared pepper.control
+			// channel, so every node sees every ready worker in the cluster;
+			// HasCapWorker answers this without a coord round-trip.
+			if !r.HasCapWorker(env.Cap) {
+				return fmt.Errorf("%w: cap=%s group=%s (no ready worker in cluster)",
+					ErrNoWorkers, env.Cap, env.Group)
+			}
 		} else {
 			env.WorkerID = r.affinityWorker(env.Cap, env.Group)
 			if env.WorkerID == "" {
@@ -454,10 +538,23 @@ func (r *Router) WorkerCountInGroup(group string) int {
 
 // HasCapWorker reports whether at least one live worker has sent cap_ready for cap.
 // Used by Pepper.WorkerReady() to let callers poll after Start().
+//
+// In distributed mode a non-owning node (pure orchestrator) may not have the
+// cap-specific worker in r.workers yet when capAffinity is populated (pub/sub
+// delivery order is non-deterministic). In that case we accept the affinity
+// entry as sufficient proof — the worker is alive and will drain the queue.
 func (r *Router) HasCapWorker(cap string) bool {
 	r.mu.RLock()
 	affinity := r.capAffinity[cap]
 	r.mu.RUnlock()
+	if len(affinity) == 0 {
+		return false
+	}
+	if r.distributed {
+		// Trust the cap_ready affinity entry; the worker may not appear in
+		// r.workers yet on a non-owning node.
+		return true
+	}
 	for _, id := range affinity {
 		r.mu.RLock()
 		ws, ok := r.workers[id]
@@ -468,7 +565,6 @@ func (r *Router) HasCapWorker(cap string) bool {
 	}
 	return false
 }
-
 func (r *Router) addToGroup(group, workerID string) {
 	r.groups[group] = append(r.groups[group], workerID)
 }

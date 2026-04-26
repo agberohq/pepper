@@ -10,6 +10,7 @@ import (
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/pending"
 	"github.com/agberohq/pepper/internal/router"
+	"github.com/agberohq/pepper/internal/sub"
 	"github.com/olekukonko/jack"
 )
 
@@ -28,6 +29,7 @@ type runtimeState struct {
 	reqReaper    *jack.Reaper
 	blobReaper   *jack.Reaper
 	doctor       *jack.Doctor
+	subManager   sub.Manager
 }
 
 type workerEntry struct {

@@ -75,7 +75,7 @@ func main() {
 	// Pipeline — no internal imports needed
 	if err := pp.Compose("text.pipeline",
 		pepper.Pipe("text.upper"),
-		pepper.PipeTransform(func(in map[string]any) (map[string]any, error) {
+		pepper.Transform(func(in map[string]any) (map[string]any, error) {
 			text, _ := in["text"].(string)
 			return map[string]any{"text": "~" + text + "~"}, nil
 		}),

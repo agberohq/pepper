@@ -4,7 +4,8 @@
 // Concrete transport implementations live in internal/coord:
 //
 
-// Use NewFromCoord or NewCoordBus to create a Bus from a coord transport.
+// Use NewCoordBus to create a Bus from a coord transport, or NewMulaBus for
+// a self-contained single-node Bus backed by Mula.
 //
 // Topic layout:
 //
@@ -84,7 +85,6 @@ func IsPushTopic(topic string) bool { return strings.HasPrefix(topic, "pepper.pu
 
 func GroupFromPushTopic(topic string) string { return strings.TrimPrefix(topic, "pepper.push.") }
 func GroupFromPubTopic(topic string) string  { return strings.TrimPrefix(topic, "pepper.pub.") }
-func hasPrefix(s, prefix string) bool        { return strings.HasPrefix(s, prefix) }
 
 // WorkerEnvVars returns environment variables injected into worker subprocesses.
 func WorkerEnvVars(workerID, busAddr, codec string, groups []string, heartbeatMs, maxConcurrent int, blobDir string) []string {
@@ -101,9 +101,10 @@ func WorkerEnvVars(workerID, busAddr, codec string, groups []string, heartbeatMs
 
 func itoa(n int) string { return fmt.Sprintf("%d", n) }
 
-// Dispatch routes an envelope to the correct socket pattern.
-func Dispatch(b Bus, env envelope.Envelope, data []byte) error {
-	ctx := context.Background()
+// Dispatch routes an envelope to the correct bus pattern.
+// Use this for one-off dispatch outside the router; for production use prefer
+// router.Router.Dispatch which handles affinity, retries, and deadlines.
+func Dispatch(ctx context.Context, b Bus, env envelope.Envelope, data []byte) error {
 	switch env.Dispatch {
 	case envelope.DispatchAny:
 		return b.PushOne(ctx, TopicPush(env.Group), data)

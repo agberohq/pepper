@@ -99,6 +99,19 @@ func (c *clusterSetup) stop() {
 	c.coord.Close()
 }
 
+// waitReady blocks until nodeB's router has registered at least one worker
+// for the given capability — proving that the worker_hello fan-out from nodeA
+// has been processed and nodeB will not fast-fail with ErrNoWorkers.
+// Must be called after both nodeA.Start() and nodeB.Start() return.
+func (c *clusterSetup) waitReady(t *testing.T, cap string, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := c.nodeB.WaitWorkerReady(ctx, cap); err != nil {
+		t.Fatalf("waitReady: nodeB did not see a ready worker for cap=%q within %v: %v", cap, timeout, err)
+	}
+}
+
 // newCluster creates two Pepper nodes wired to the same coord store.
 // nodeA owns the Python/Go workers; nodeB is a pure orchestrator (no workers)
 // that routes requests through the coord queue to nodeA's workers.
@@ -249,6 +262,7 @@ func testCrossNodeDispatch(t *testing.T, url string, newCoord func(string) (coor
 	if err := cl.nodeB.Start(startCtx); err != nil {
 		t.Fatalf("nodeB Start: %v", err)
 	}
+	cl.waitReady(t, "cluster.echo", 30*time.Second)
 
 	doCtx, doCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer doCancel()
@@ -292,6 +306,7 @@ func testSessionSharing(t *testing.T, url string, newCoord func(string) (coord.S
 	if err := cl.nodeB.Start(startCtx); err != nil {
 		t.Fatalf("nodeB Start: %v", err)
 	}
+	cl.waitReady(t, "cluster.counter", 30*time.Second)
 
 	doCtx, doCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer doCancel()
@@ -344,6 +359,7 @@ func testWorkerLocalKV(t *testing.T, url string, newCoord func(string) (coord.St
 	if err := cl.nodeB.Start(startCtx); err != nil {
 		t.Fatalf("nodeB Start: %v", err)
 	}
+	cl.waitReady(t, "cluster.counter", 30*time.Second)
 
 	doCtx, doCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer doCancel()
@@ -397,6 +413,7 @@ func testConcurrentThroughput(t *testing.T, url string, newCoord func(string) (c
 	if err := cl.nodeB.Start(startCtx); err != nil {
 		t.Fatalf("nodeB Start: %v", err)
 	}
+	cl.waitReady(t, "cluster.echo", 30*time.Second)
 
 	const n = 20
 	var (
@@ -459,6 +476,7 @@ func testExactlyOnceDelivery(t *testing.T, url string, newCoord func(string) (co
 	if err := cl.nodeB.Start(startCtx); err != nil {
 		t.Fatalf("nodeB Start: %v", err)
 	}
+	cl.waitReady(t, "cluster.echo", 30*time.Second)
 
 	const n = 10
 	seen := sync.Map{}
@@ -521,6 +539,7 @@ func testNodeBOrchestrates(t *testing.T, url string, newCoord func(string) (coor
 	if err := cl.nodeB.Start(startCtx); err != nil {
 		t.Fatalf("nodeB Start: %v", err)
 	}
+	cl.waitReady(t, "cluster.echo", 30*time.Second)
 
 	doCtx, doCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer doCancel()

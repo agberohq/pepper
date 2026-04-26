@@ -84,16 +84,6 @@ func requireOllama(t *testing.T) {
 	conn.Close()
 }
 
-func requireGPU(t *testing.T) {
-	t.Helper()
-	if os.Getenv("CUDA_VISIBLE_DEVICES") == "NoDevFiles" {
-		t.Skip("CUDA_VISIBLE_DEVICES=NoDevFiles — skipping GPU test")
-	}
-	if err := exec.Command("nvidia-smi").Run(); err != nil {
-		t.Skip("no GPU available (nvidia-smi failed) — skipping GPU test")
-	}
-}
-
 func ollamaModel(t *testing.T) string {
 	t.Helper()
 	if m := os.Getenv("PEPPER_OLLAMA_MODEL"); m != "" {
@@ -498,7 +488,7 @@ func TestRealFullPipeline(t *testing.T) {
 	if err := pp.Compose("audio.process",
 		Pipe("audio.denoise").WithGroup("cpu"),
 		Pipe("speech.transcribe").WithGroup("gpu"),
-		PipeTransform(func(in map[string]any) (map[string]any, error) {
+		Transform(func(in map[string]any) (map[string]any, error) {
 			text, _ := in["text"].(string)
 			if text == "" {
 				text = "[silence or inaudible audio]"
@@ -690,112 +680,6 @@ def run(inputs: dict) -> dict:
 	}
 }
 
-// waitForCaps polls pp.WorkerReady() until a live worker has announced cap_ready
-// for every named cap, or ctx is cancelled.
-//
-// Start() exits as soon as any worker is ready — including in-process adapter
-// workers (Ollama, HTTP) which register synchronously. Python subprocess workers
-// take a few extra seconds to boot, connect, and send cap_ready. Without this
-// wait, Do() races against worker startup and gets ErrNoWorkers.
-func waitForCaps(t *testing.T, pp *Pepper, ctx context.Context, caps ...string) error {
-	t.Helper()
-	for {
-		all := true
-		for _, cap := range caps {
-			if !pp.WorkerReady(cap) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			// Report which caps are still missing.
-			missing := make([]string, 0, len(caps))
-			for _, cap := range caps {
-				if !pp.WorkerReady(cap) {
-					missing = append(missing, cap)
-				}
-			}
-			return fmt.Errorf("timed out — caps still not ready: %v", missing)
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-}
-
-// Song analysis pipeline
-
-// mp3ToWAVCapSrc converts any audio format to 16kHz mono WAV using ffmpeg.
-// This is stage 1 of the song analysis pipeline.
-const mp3ToWAVCapSrc = `# pepper:name    = audio.convert
-# pepper:version = 1.0.0
-# pepper:groups  = cpu,default
-
-import subprocess
-import tempfile
-import os
-from pathlib import Path
-
-def run(inputs: dict) -> dict:
-    src = inputs.get("audio_path", "")
-    if not src or not Path(src).exists():
-        return {"error": f"audio_path not found: {src!r}"}
-
-    dst = Path(tempfile.gettempdir()) / f"pepper_converted_{os.getpid()}.wav"
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", src,
-            "-ar", "16000",   # 16 kHz — Whisper's native rate
-            "-ac", "1",       # mono
-            "-f", "wav",
-            str(dst),
-        ],
-        capture_output=True, timeout=60,
-    )
-    if result.returncode != 0:
-        return {"error": result.stderr.decode(errors="replace")[-500:]}
-
-    size = dst.stat().st_size
-    return {
-        "audio_path":   str(dst),  # passed straight to speech.transcribe
-        "converted_from": src,
-        "wav_size_bytes": size,
-    }
-`
-
-// geminiAvailable returns the Gemini API key from env, or skips the test.
-func geminiKey(t *testing.T) string {
-	t.Helper()
-	key := os.Getenv("PEPPER_GEMINI_KEY")
-	if key == "" {
-		t.Skip("PEPPER_GEMINI_KEY not set — skipping Gemini variant (use Ollama instead)")
-	}
-	return key
-}
-
-// testMP3Path returns the path to the test MP3, preferring PEPPER_TEST_MP3
-// env var over the committed testdata placeholder.
-func testMP3Path(t *testing.T) string {
-	t.Helper()
-	if p := os.Getenv("PEPPER_TEST_MP3"); p != "" {
-		if _, err := os.Stat(p); err != nil {
-			t.Fatalf("PEPPER_TEST_MP3=%s not found: %v", p, err)
-		}
-		t.Logf("Audio: %s (from PEPPER_TEST_MP3)", p)
-		return p
-	}
-	// Fall back to the committed placeholder.
-	p := filepath.Join("testdata", "audio", "sample.mp3")
-	if _, err := os.Stat(p); err != nil {
-		t.Skipf("testdata/audio/sample.mp3 not found and PEPPER_TEST_MP3 not set: %v", err)
-	}
-	t.Logf("Audio: %s (placeholder — replace with real audio for meaningful transcript)", p)
-	return p
-}
-
 // TestRealSongAnalysis runs a four-stage pipeline:
 //
 //	MP3/audio → [ffmpeg convert] → [Whisper transcribe] → [transform] → [LLM analysis]
@@ -931,7 +815,7 @@ func TestRealSongAnalysis(t *testing.T) {
 	if err := pp.Compose("song.pipeline",
 		Pipe("audio.convert").WithGroup("cpu"),
 		Pipe("speech.transcribe").WithGroup("cpu"),
-		PipeTransform(func(in map[string]any) (map[string]any, error) {
+		Transform(func(in map[string]any) (map[string]any, error) {
 			transcript, _ := in["text"].(string)
 			language, _ := in["language"].(string)
 			duration, _ := in["duration"].(float64)
@@ -1043,6 +927,102 @@ func TestRealSongAnalysis(t *testing.T) {
 		}
 		t.Errorf("expected analysis/response/message in output, got keys: %v", keys)
 	}
+}
+
+// waitForCaps polls pp.WorkerReady() until a live worker has announced cap_ready
+// for every named cap, or ctx is cancelled.
+//
+// Start() exits as soon as any worker is ready — including in-process adapter
+// workers (Ollama, HTTP) which register synchronously. Python subprocess workers
+// take a few extra seconds to boot, connect, and send cap_ready. Without this
+// wait, Do() races against worker startup and gets ErrNoWorkers.
+func waitForCaps(t *testing.T, pp *Pepper, ctx context.Context, caps ...string) error {
+	t.Helper()
+	for {
+		all := true
+		for _, cap := range caps {
+			if !pp.WorkerReady(cap) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			// Report which caps are still missing.
+			missing := make([]string, 0, len(caps))
+			for _, cap := range caps {
+				if !pp.WorkerReady(cap) {
+					missing = append(missing, cap)
+				}
+			}
+			return fmt.Errorf("timed out — caps still not ready: %v", missing)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// Song analysis pipeline
+
+// mp3ToWAVCapSrc converts any audio format to 16kHz mono WAV using ffmpeg.
+// This is stage 1 of the song analysis pipeline.
+const mp3ToWAVCapSrc = `# pepper:name    = audio.convert
+# pepper:version = 1.0.0
+# pepper:groups  = cpu,default
+
+import subprocess
+import tempfile
+import os
+from pathlib import Path
+
+def run(inputs: dict) -> dict:
+    src = inputs.get("audio_path", "")
+    if not src or not Path(src).exists():
+        return {"error": f"audio_path not found: {src!r}"}
+
+    dst = Path(tempfile.gettempdir()) / f"pepper_converted_{os.getpid()}.wav"
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-ar", "16000",   # 16 kHz — Whisper's native rate
+            "-ac", "1",       # mono
+            "-f", "wav",
+            str(dst),
+        ],
+        capture_output=True, timeout=60,
+    )
+    if result.returncode != 0:
+        return {"error": result.stderr.decode(errors="replace")[-500:]}
+
+    size = dst.stat().st_size
+    return {
+        "audio_path":   str(dst),  # passed straight to speech.transcribe
+        "converted_from": src,
+        "wav_size_bytes": size,
+    }
+`
+
+// testMP3Path returns the path to the test MP3, preferring PEPPER_TEST_MP3
+// env var over the committed testdata placeholder.
+func testMP3Path(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("PEPPER_TEST_MP3"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("PEPPER_TEST_MP3=%s not found: %v", p, err)
+		}
+		t.Logf("Audio: %s (from PEPPER_TEST_MP3)", p)
+		return p
+	}
+	// Fall back to the committed placeholder.
+	p := filepath.Join("testdata", "audio", "sample.mp3")
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("testdata/audio/sample.mp3 not found and PEPPER_TEST_MP3 not set: %v", err)
+	}
+	t.Logf("Audio: %s (placeholder — replace with real audio for meaningful transcript)", p)
+	return p
 }
 
 // buildSongPrompt builds the LLM prompt from a Whisper transcript.

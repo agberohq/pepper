@@ -19,7 +19,6 @@ from runtime import (
     pepper, _origin_id_var, _cancelled_ids, _cancelled_lock,
 )
 
-
 class MockRouter:
     """TCP mock router. Spawns on a random port."""
 
@@ -81,7 +80,6 @@ class MockRouter:
         assert self.conn is not None
         self.conn.sendall(len(data).to_bytes(4, "big") + data)
 
-
 import pytest
 
 @pytest.fixture
@@ -89,7 +87,6 @@ def mock_router():
     router = MockRouter()
     yield router
     router.close()
-
 
 @pytest.fixture
 def env_setup(mock_router):
@@ -106,13 +103,11 @@ def env_setup(mock_router):
     os.environ.clear()
     os.environ.update(old)
 
-
 class TestCodec:
     def test_json_roundtrip(self):
         c = _Codec("json")
         data = {"hello": "world", "n": 42}
         assert c.unmarshal(c.marshal(data)) == data
-
 
 class TestFraming:
     def test_encode_msg(self):
@@ -126,7 +121,6 @@ class TestFraming:
         assert _reply_topic({"msg_type": "err", "origin_id": "01HZ9K"}) == "pepper.res.01HZ9K"
         assert _reply_topic({"msg_type": "hb_ping", "worker_id": "w-1"}) == "pepper.hb.w-1"
         assert _reply_topic({"msg_type": "pipe", "topic": "pepper.pipe.x"}) == "pepper.pipe.x"
-
 
 class TestWorkerLifecycle:
     def test_hello_message(self, mock_router, env_setup):
@@ -321,7 +315,6 @@ def run(inputs: dict) -> dict:
         mock_router.send_envelope("pepper.broadcast", {"msg_type": "worker_bye"})
         t.join(timeout=2.0)
 
-
 class TestPepperAPI:
     def test_context_vars(self, mock_router, env_setup, tmp_path: Path):
         cap_file = tmp_path / "ctx.py"
@@ -374,7 +367,6 @@ def run(inputs: dict) -> dict:
         mock_router.send_envelope("pepper.broadcast", {"msg_type": "worker_bye"})
         t.join(timeout=2.0)
 
-
 class TestBlobWriter:
     def test_writes_file(self, tmp_path: Path):
         BlobWriter._dir = str(tmp_path)
@@ -391,19 +383,17 @@ class TestBlobWriter:
         assert Path(ref["path"]).exists()
         assert Path(ref["path"]).read_bytes() == b"binary data"
 
-
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
 
-# ── Transport tests ───────────────────────────────────────────────────────────
+# Transport tests
 # These test the BusTransport class that Python workers use to connect to the
 # Pepper router bus.  Redis and NATS tests skip automatically when the service
 # is not reachable — no mocks, no secrets required.
 
 import socket as _socket
 import os as _os
-
 
 def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
     """Return True if TCP host:port is reachable within timeout."""
@@ -413,12 +403,10 @@ def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
     except OSError:
         return False
 
-
 _REDIS_HOST = _os.environ.get("PEPPER_TEST_REDIS_HOST", "127.0.0.1")
 _REDIS_PORT = int(_os.environ.get("PEPPER_TEST_REDIS_PORT", "6379"))
 _NATS_HOST  = _os.environ.get("PEPPER_TEST_NATS_HOST", "127.0.0.1")
 _NATS_PORT  = int(_os.environ.get("PEPPER_TEST_NATS_PORT", "4222"))
-
 
 class TestBusTransportParsing:
     """URL parsing is pure logic — no network required."""
@@ -450,7 +438,6 @@ class TestBusTransportParsing:
         t = BusTransport("nats://127.0.0.1:4222")
         assert t.scheme == "nats"
         assert t.port == 4222
-
 
 class TestBusTransportTCP:
     """Verifies the mula/TCP transport against a real local echo server."""
@@ -492,7 +479,6 @@ class TestBusTransportTCP:
 
         assert received == [b"hello-pepper"]
 
-
 class TestRedisWorkerConnectivity:
     """
     Verifies that a Python worker can reach Redis when PEPPER_BUS_URL points
@@ -530,7 +516,6 @@ class TestRedisWorkerConnectivity:
         assert t.scheme == "redis"
         assert t.host == _REDIS_HOST
         assert t.port == _REDIS_PORT
-
 
 class TestNATSWorkerConnectivity:
     """

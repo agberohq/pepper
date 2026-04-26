@@ -16,7 +16,7 @@ import (
 )
 
 // Stage is a single step in a pipeline.
-// Obtain via Pipe, PipeTransform, PipeReturn, PipeScatter, or PipeBranch.
+// Obtain via Pipe, Transform, PipeReturn, PipeScatter, or PipeBranch.
 type Stage = compose.Stage
 
 // Pipe creates a worker-dispatched pipeline stage.
@@ -27,7 +27,7 @@ func Pipe(cap string) *compose.PipeStage {
 	return compose.Pipe(cap)
 }
 
-// PipeTransform creates a router-side transform stage.
+// Transform creates a router-side transform stage.
 // The function runs in the Go process (no worker dispatch) and can reshape
 // the payload between stages.
 //
@@ -35,7 +35,7 @@ func Pipe(cap string) *compose.PipeStage {
 //	    transcript, _ := in["text"].(string)
 //	    return map[string]any{"prompt": "Analyse: " + transcript}, nil
 //	})
-func PipeTransform(fn func(map[string]any) (map[string]any, error)) *compose.TransformStage {
+func Transform(fn func(map[string]any) (map[string]any, error)) *compose.TransformStage {
 	// Wrap the user's simple func into the internal signature that carries
 	// the full envelope — users don't need envelope details.
 	return compose.Transform(func(_ envelope.Envelope, in map[string]any) (map[string]any, error) {
@@ -67,7 +67,7 @@ type EnvelopeInfo struct {
 	Meta      map[string]any
 }
 
-// PipeTransformWithEnv is like PipeTransform but also receives envelope metadata.
+// PipeTransformWithEnv is like Transform but also receives envelope metadata.
 // Use this escape hatch when a transform stage needs the session ID, correlation
 // ID, or request meta — for example to prepend a session-scoped prompt prefix.
 //

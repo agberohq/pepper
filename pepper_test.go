@@ -21,6 +21,41 @@ import (
 	"github.com/agberohq/pepper/internal/core"
 )
 
+func writeTestCap(path, src string) {
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(src), 0644)
+}
+
+const echoCapSource = `# pepper:name    = echo
+# pepper:version = 1.0.0
+# pepper:groups  = default
+
+def run(inputs):
+    return {"msg": inputs.get("msg", "")}
+`
+
+const reverseCapSource = `# pepper:name    = reverse
+# pepper:version = 1.0.0
+# pepper:groups  = default
+
+def run(inputs):
+    text = inputs.get("text", "")
+    return {"text": text[::-1]}
+`
+
+// TestMain writes test capability sources to testdata/caps/ before running tests.
+func TestMain(m *testing.M) {
+	if err := os.MkdirAll("testdata/caps", 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir testdata/caps: %v\n", err)
+		os.Exit(1)
+	}
+	writeTestCap("testdata/caps/echo.py", echoCapSource)
+	writeTestCap("testdata/caps/reverse.py", reverseCapSource)
+	os.Exit(m.Run())
+}
+
 // TestMultipleCapabilities registers two capabilities and calls both.
 func TestMultipleCapabilities(t *testing.T) {
 	if !pythonAvailable() {
@@ -345,7 +380,7 @@ func TestPipelineNoInternalImports(t *testing.T) {
 
 	err = pp.Compose("test.pipeline",
 		Pipe("stage.one"),
-		PipeTransform(func(in In2) (In2, error) {
+		Transform(func(in In2) (In2, error) {
 			return In2{"result": "transformed"}, nil
 		}),
 		PipeTransformWithEnv(func(env EnvelopeInfo, in In2) (In2, error) {
@@ -427,52 +462,6 @@ func TestExecuteAndProcess(t *testing.T) {
 	}
 	t.Logf("Execute/Wait ok — processID=%s", proc.ID())
 }
-
-// helpers
-
-func pythonAvailable() bool {
-	_, err := exec.LookPath("python3")
-	return err == nil
-}
-
-func msgpackAvailable() bool {
-	return exec.Command("python3", "-c", "import msgpack").Run() == nil
-}
-
-// TestMain writes test capability sources to testdata/caps/ before running tests.
-func TestMain(m *testing.M) {
-	if err := os.MkdirAll("testdata/caps", 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir testdata/caps: %v\n", err)
-		os.Exit(1)
-	}
-	writeTestCap("testdata/caps/echo.py", echoCapSource)
-	writeTestCap("testdata/caps/reverse.py", reverseCapSource)
-	os.Exit(m.Run())
-}
-
-func writeTestCap(path, src string) {
-	if _, err := os.Stat(path); err == nil {
-		return
-	}
-	_ = os.WriteFile(path, []byte(src), 0644)
-}
-
-const echoCapSource = `# pepper:name    = echo
-# pepper:version = 1.0.0
-# pepper:groups  = default
-
-def run(inputs):
-    return {"msg": inputs.get("msg", "")}
-`
-
-const reverseCapSource = `# pepper:name    = reverse
-# pepper:version = 1.0.0
-# pepper:groups  = default
-
-def run(inputs):
-    text = inputs.get("text", "")
-    return {"text": text[::-1]}
-`
 
 // TestSessionTouch verifies Touch() replaces the old TTL(d) method.
 func TestSessionTouch(t *testing.T) {
@@ -834,4 +823,15 @@ func TestNewSession(t *testing.T) {
 		t.Fatalf("Session(id): expected %s, got %s", s1.ID(), resumed.ID())
 	}
 	t.Logf("NewSession ok — id=%s", s1.ID())
+}
+
+// helpers
+
+func pythonAvailable() bool {
+	_, err := exec.LookPath("python3")
+	return err == nil
+}
+
+func msgpackAvailable() bool {
+	return exec.Command("python3", "-c", "import msgpack").Run() == nil
 }

@@ -389,7 +389,7 @@ func TestNATS_PushPull_ExactTopic(t *testing.T) {
 	s := newNATSStore(t)
 	ctx := context.Background()
 
-	queue := "pepper.push.default"
+	queue := uniqueKey("pepper.push.default") // was: "pepper.push.default"
 	payload := []byte("test-payload")
 
 	// Push FIRST — no puller is active yet.

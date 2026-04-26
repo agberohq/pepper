@@ -75,13 +75,15 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	rt.bgCtx = bgCtx
 	rt.bgCancel = bgCancel
 
-	if err := sub.Init(); err != nil {
+	sm, err := sub.New()
+	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: sub manager: %w", err)
 	}
+	rt.subManager = sm
 	go func() {
 		<-bgCtx.Done()
-		_ = sub.Dispose()
+		_ = sm.Dispose()
 	}()
 
 	// Bus selection
@@ -99,19 +101,19 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 				"(e.g. \"redis://host:6379\" or \"nats://host:4222\")")
 		}
 	} else {
-		// Single-node mode: Mula TCP bus for local Go↔Python IPC.
+		// Single-node mode: Mula TCP coord store for local Go↔Python IPC.
 		mulaURL := p.cfg.TransportURL
 		if mulaURL == "" {
 			mulaURL = fmt.Sprintf("tcp://127.0.0.1:%d", p.freePort())
 		}
-		m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: mulaURL, SendBuf: 256, RecvBuf: 256})
+		c, err := coord.NewMula(mulaURL)
 		if err != nil {
 			bgCancel()
 			return fmt.Errorf("pepper: bus: %w", err)
 		}
-		theBus = m.AsBus()
-		busAddr = m.Addr()
-		p.shutdown.Register(m)
+		theBus = bus.NewCoordBus(c, mulaURL)
+		busAddr = coord.MulaAddr(c)
+		p.shutdown.Register(c)
 	}
 	rt.bus = theBus
 
@@ -225,6 +227,17 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	}
 
 	// Shutdown hooks
+
+	// In distributed mode the coord bus owns its own lifecycle via Close().
+	// Register it first so it executes LAST (LIFO), ensuring the bus stays open
+	// long enough to broadcast worker_bye and flush pending responses before
+	// the connection is torn down.
+	if p.cfg.Coord != nil {
+		p.shutdown.RegisterWithContext("coord.close", func(_ context.Context) error {
+			return p.cfg.Coord.Close()
+		})
+	}
+
 	p.shutdown.RegisterWithContext("doctor.stop", func(_ context.Context) error {
 		rt.doctor.StopAll(p.cfg.ShutdownTimeout)
 		return nil
@@ -242,13 +255,6 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	p.shutdown.RegisterWithContext("req.reaper.stop", func(_ context.Context) error { rt.reqReaper.Stop(); return nil })
 	p.shutdown.RegisterWithContext("blob.reaper.stop", func(_ context.Context) error { rt.blobReaper.Stop(); return nil })
 	p.shutdown.RegisterWithContext("bg.cancel", func(_ context.Context) error { bgCancel(); return nil })
-
-	// In distributed mode the coord bus owns its own lifecycle via Close().
-	if p.cfg.Coord != nil {
-		p.shutdown.RegisterWithContext("coord.close", func(_ context.Context) error {
-			return p.cfg.Coord.Close()
-		})
-	}
 
 	return nil
 }
@@ -270,6 +276,28 @@ func (p *Pepper) responseLoop(ctx context.Context, ch <-chan bus.Message) {
 func (p *Pepper) routeResponse(data []byte) {
 	var raw map[string]any
 	if err := p.codec.Unmarshal(data, &raw); err != nil {
+		// Previously this was a silent return — any response whose bytes the
+		// Go node could not decode would vanish, and the caller would hang
+		// until the context deadline. That is the root cause of the cluster
+		// test hangs (SessionSharing / WorkerLocalKV / Throughput) when the
+		// Python worker's codec does not match the Go node's codec.
+		//
+		// Surface it as a WARN with the first byte of the payload so codec
+		// mismatches (e.g. 0xDE = msgpack fixmap vs '{' = JSON) are obvious
+		// in logs, and emit a counter metric for production observability.
+		var firstByte byte
+		if len(data) > 0 {
+			firstByte = data[0]
+		}
+		p.logger.Fields(
+			"error", err.Error(),
+			"bytes", len(data),
+			"first_byte", fmt.Sprintf("0x%02x", firstByte),
+			"codec", string(p.cfg.Codec),
+		).Warn("routeResponse: dropped response frame — codec decode failed (likely codec mismatch between Go and worker)")
+		if p.cfg.Metrics != nil {
+			p.cfg.Metrics.Counter("pepper_response_decode_errors", 1, nil)
+		}
 		return
 	}
 	env := envelope.Data(raw)
@@ -390,8 +418,29 @@ func (p *Pepper) handleControl(data []byte) {
 			p.cfg.logger.Fields("worker", wid, "codec", cn).Error("CODEC_MISMATCH")
 			return
 		}
-		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: env.Groups()})
+
+		// In distributed mode (WithCoord), worker_hello is fanned out to every
+		// Pepper node on the shared bus. Only the node that actually spawned
+		// the worker should treat it as its own — register the worker in its
+		// local workerStates, add a patient to the doctor, and send cap_load
+		// for python caps it has registered.
+		//
+		// All nodes — including the non-owning ones — still call
+		// router.RegisterWorker so the router's cluster-wide view is
+		// populated. This is what makes HasCapWorker return true on any node
+		// once cap_ready arrives (see Fix 2 in router.Dispatch).
 		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Groups: env.Groups()})
+
+		if !p.ownsWorker(wid) {
+			// Foreign worker belonging to another node. Don't duplicate
+			// cap_load (that's the job of the owning node) and don't
+			// register a patient we can't supervise. The fan-out of
+			// worker_hello/cap_ready on the shared bus is what lets us
+			// route to this worker even though we don't manage it.
+			return
+		}
+
+		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: env.Groups()})
 		p.registerWorkerPatient(wid)
 		p.logger.Fields("worker", wid, "groups", env.Groups(), "runtime", env["runtime"]).Info("worker connected")
 
@@ -428,14 +477,19 @@ func (p *Pepper) handleControl(data []byte) {
 
 	case "hb_ping":
 		wid := env.WorkerID()
+		rtStr, _ := raw["runtime"].(string)
+		hbCaps := decodeStringSlice(raw["caps"])
 		p.rt.router.UpdateHeartbeat(envelope.HbPing{
 			WorkerID:       wid,
-			Load:           env.Hop(),
+			Runtime:        rtStr,
+			Load:           uint8(env.Int64("load")),
+			Groups:         env.Groups(),
+			Caps:           hbCaps,
 			RequestsServed: uint64(env.Int64("requests_served")),
 			UptimeMs:       env.Int64("uptime_ms"),
 		})
 		if p.cfg.Metrics != nil {
-			p.cfg.Metrics.Gauge(metrics.MetricWorkersLoad, float64(env.Hop()), map[string]string{"worker": wid})
+			p.cfg.Metrics.Gauge(metrics.MetricWorkersLoad, float64(env.Int64("load")), map[string]string{"worker": wid})
 			p.cfg.Metrics.Gauge(metrics.MetricWorkersServed, float64(env.Int64("requests_served")), map[string]string{"worker": wid})
 		}
 		if v, ok := p.rt.workerStates.Load(wid); ok {
@@ -451,7 +505,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	}
 
 	originID := ulid.Make().String()
-	stageCh, err := p.rt.bus.SubscribePrefix(ctx, "pepper.pipe."+p.sanitizeName(name))
+	stageCh, err := p.rt.bus.SubscribePrefix(ctx, "pepper.pipe."+p.sanitizeName(name)+".")
 	if err != nil {
 		return Result{}, err
 	}
@@ -632,6 +686,19 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	}
 }
 
+// ownsWorker reports whether wid is one of the workers this Pepper node was
+// configured to spawn (via WithWorkers). In a clustered setup with shared
+// coord, worker_hello envelopes are fanned out to every node — this lets us
+// distinguish workers we manage from workers belonging to a sibling node.
+func (p *Pepper) ownsWorker(wid string) bool {
+	for _, w := range p.cfg.Workers {
+		if w.ID == wid {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pepper) registerWorkerPatient(workerID string) {
 	hbTimeout := p.cfg.HeartbeatInterval * 3
 	patient := jack.NewPatient(jack.PatientConfig{
@@ -741,7 +808,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	// pdeathsig_*.go build-tag files). On Linux this sets Pdeathsig=SIGKILL;
 	// on macOS/BSD it sets Setpgid so we can kill the process group; on Windows
 	// the Job Object (created in sub.Init) handles it.
-	if err := sub.Configure(cmd); err != nil {
+	if err := p.rt.subManager.ConfigureCommand(cmd); err != nil {
 		return fmt.Errorf("sub.Configure: %w", err)
 	}
 
@@ -769,7 +836,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	}
 	// Register the started process with the sub manager so it is tracked for
 	// cleanup on abnormal parent exit (relevant on macOS/Windows).
-	if err := sub.Track(cmd.Process); err != nil {
+	if err := p.rt.subManager.AddChildProcess(cmd.Process); err != nil {
 		p.logger.Fields("worker", workerID, "error", err).Warn("sub.Track failed")
 	}
 	if logW != nil {
@@ -1012,36 +1079,33 @@ func (p *Pepper) pipeWorkerLogs(r *os.File, workerID string) {
 	}
 }
 
-// newBus creates a Bus from the URL scheme, delegating to coord transports.
-// Lives in runtime.go (the only caller) to avoid a bus→coord import cycle.
+// newBus creates a Bus from the URL scheme.
+// All four backends (memory, mula/tcp, redis, nats) now go through coord.Store
+// → bus.coordBus, giving a single transport path.
 func newBus(url string, cfg bus.Config) (bus.Bus, error) {
-	cfg.URL = url
-
+	var c coord.Store
+	var err error
 	switch {
-	case url == "" || strings.HasPrefix(url, "tcp://") || strings.HasPrefix(url, "mula://"):
-		m, err := bus.NewMulaFromMulaConfig(bus.MulaConfig{URL: url, SendBuf: cfg.SendBuf, RecvBuf: cfg.RecvBuf})
+	case url == "" || strings.HasPrefix(url, "tcp://"):
+		// Mula: default single-node TCP transport.
+		c, err = coord.NewMula(url)
 		if err != nil {
 			return nil, fmt.Errorf("bus: mula: %w", err)
 		}
-		return m.AsBus(), nil
-
 	case strings.HasPrefix(url, "redis://"):
-		c, err := coord.NewRedis(url)
+		c, err = coord.NewRedis(url)
 		if err != nil {
 			return nil, fmt.Errorf("bus: redis: %w", err)
 		}
-		return bus.NewCoordBus(c, url), nil
-
 	case strings.HasPrefix(url, "nats://"):
-		c, err := coord.NewNATS(url)
+		c, err = coord.NewNATS(url)
 		if err != nil {
 			return nil, fmt.Errorf("bus: nats: %w", err)
 		}
-		return bus.NewCoordBus(c, url), nil
-
 	default:
 		return nil, fmt.Errorf("bus: unknown transport URL %q", url)
 	}
+	return bus.NewCoordBus(c, url), nil
 }
 
 // extractMap normalises a value that may be map[string]any (JSON) or
@@ -1060,4 +1124,27 @@ func extractMap(v any) map[string]any {
 		return out
 	}
 	return nil
+}
+
+// decodeStringSlice extracts a []string from a raw msgpack-decoded value.
+// msgpack may decode a Python list-of-strings as []interface{} or []string
+// depending on library version; this handles both, plus nil/empty.
+func decodeStringSlice(v any) []string {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case []string:
+		return val
+	case []any:
+		out := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }

@@ -224,37 +224,42 @@ func TestCancelByIDsEmptyListIsNoop(t *testing.T) {
 	}
 }
 
+// TestConcurrentRegisterResolve is the regression test for the cluster
+// throughput hang. Under high concurrency mappo.Sharded could lose entries
+// between SetIfAbsent and Get, causing Resolve to miss and Do() to hang.
 func TestConcurrentRegisterResolve(t *testing.T) {
 	m := New()
-	const n = 100
+	const n = 1000
 	var wg sync.WaitGroup
 	wg.Add(n)
 
 	for i := 0; i < n; i++ {
-		corrID := fmt.Sprintf("concurrent-%d", i)
-		ch, err := m.Register(corrID)
-		if err != nil {
-			t.Errorf("Register(%q): %v", corrID, err)
-			wg.Done()
-			continue
-		}
-		go func(id string, c <-chan Response) {
+		go func(id int) {
 			defer wg.Done()
-			m.Resolve(id, Response{Payload: []byte(id)})
+			corrID := fmt.Sprintf("corr-%d", id)
+			ch, err := m.Register(corrID)
+			if err != nil {
+				t.Errorf("Register %s: %v", corrID, err)
+				return
+			}
+
+			// Simulate response arriving from another goroutine.
+			go m.Resolve(corrID, Response{Payload: []byte("ok")})
+
 			select {
-			case got := <-c:
-				if string(got.Payload) != id {
-					t.Errorf("payload mismatch for %s", id)
+			case resp := <-ch:
+				if string(resp.Payload) != "ok" {
+					t.Errorf("corr-%d: got %q, want ok", id, resp.Payload)
 				}
 			case <-time.After(2 * time.Second):
-				t.Errorf("timeout for %s", id)
+				t.Errorf("corr-%d: timed out waiting for Resolve — pending entry lost", id)
 			}
-		}(corrID, ch)
+		}(i)
 	}
 
 	wg.Wait()
 	if m.Len() != 0 {
-		t.Errorf("Len = %d after all resolves, want 0", m.Len())
+		t.Errorf("Len = %d after all resolved, want 0", m.Len())
 	}
 }
 

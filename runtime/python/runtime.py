@@ -1,3 +1,4 @@
+
 """
 runtime.py — Pepper Python worker runtime.
 """
@@ -6,13 +7,13 @@ from __future__ import annotations
 import sys
 if __name__ == "__main__":
     sys.modules["runtime"] = sys.modules[__name__]
+
 import contextvars
 import importlib.util
 import inspect
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict
 import socket
 
-# ── Logging — structured JSON to fd 3 (Go reads it), fallback to stderr ──────
+# Logging — structured JSON to fd 3 (Go reads it), fallback to stderr
 # Python MUST NOT write human-readable text to stderr when stdout is used by
 # a CLI capability (e.g. ffmpeg pipe). Go opens fd 3 on the subprocess for
 # structured log lines; if fd 3 is not available we fall back to stderr.
@@ -50,14 +51,13 @@ class _StructuredHandler(logging.Handler):
         except Exception:  # noqa: BLE001
             pass  # never crash the worker because of a log failure
 
-
 _handler = _StructuredHandler()
 logging.root.addHandler(_handler)
 logging.root.setLevel(logging.DEBUG if os.environ.get("PEPPER_LOG_DEBUG") else logging.INFO)
 
 log = logging.getLogger("pepper.runtime")
 
-# ── Context variables ─────────────────────────────────────────────────────────
+# Context variables
 _corr_id_var:    contextvars.ContextVar[str] = contextvars.ContextVar("corr_id", default="")
 _origin_id_var:  contextvars.ContextVar[str] = contextvars.ContextVar("origin_id", default="")
 _meta_var:       contextvars.ContextVar[dict] = contextvars.ContextVar("meta", default={})
@@ -67,13 +67,13 @@ _session_var:    contextvars.ContextVar[dict] = contextvars.ContextVar("session"
 _cancelled_ids:  set[str] = set()
 _cancelled_lock: threading.Lock = threading.Lock()
 
-# ── Retryable errors per spec §4.4 ────────────────────────────────────────────
+# Retryable errors per spec §4.4
 _RETRYABLE_CODES = {
     "DEADLINE_EXCEEDED", "WORKER_OOM", "NO_WORKERS",
     "WORKER_SHUTTING_DOWN", "DISPATCH_TIMEOUT", "MODEL_OOM", "MODEL_TIMEOUT",
 }
 
-# ── Public Python API ─────────────────────────────────────────────────────────
+# Public Python API
 class pepper:
     @staticmethod
     def is_cancelled() -> bool:
@@ -167,17 +167,15 @@ class pepper:
         """
         return _resolve_cache_dir()
 
-
 def _resolve_cache_dir() -> str:
     """Resolve the canonical Pepper cache directory (module-level helper)."""
     d = (
-        os.environ.get("PEPPER_CACHE_DIR")
-        or os.environ.get("HF_HOME")
-        or os.path.join(os.path.expanduser("~"), ".cache", "pepper")
+            os.environ.get("PEPPER_CACHE_DIR")
+            or os.environ.get("HF_HOME")
+            or os.path.join(os.path.expanduser("~"), ".cache", "pepper")
     )
     os.makedirs(d, exist_ok=True)
     return d
-
 
 class _KVStore:
     """Process-local key-value store. One instance per namespace, shared across all caps.
@@ -271,10 +269,8 @@ class SessionProxy:
         updates[key] = value
         self._data[key] = value
 
-
 class _PipeCall:
     def __init__(self, topic: str, payload: dict): self.topic, self.payload = topic, payload
-
 
 class _PipeForwarder:
     _sock: socket.socket | None = None
@@ -317,7 +313,6 @@ class _PipeForwarder:
         for t in threads:
             t.join()
         return results
-
 
 class _CallbackDispatcher:
     _pending: Dict[str, threading.Event] = {}
@@ -377,7 +372,6 @@ class _CallbackDispatcher:
             raise RuntimeError(f"pepper.call: {err}")
         return result if result is not None else {}
 
-
 class BlobWriter:
     _dir: str = os.environ.get("PEPPER_BLOB_DIR", "/dev/shm")
     _lock = threading.Lock()
@@ -404,8 +398,7 @@ class BlobWriter:
             meta.setdefault("_blobs", []).append(blob_id)
         return ref
 
-
-# ── Codec ─────────────────────────────────────────────────────────────────────
+# Codec
 class _Codec:
     def __init__(self, name: str): self.name = name
     def marshal(self, v: Any) -> bytes:
@@ -428,22 +421,18 @@ except ImportError:
 
 _codec = _Codec(os.environ.get("PEPPER_CODEC", "msgpack"))
 
-
 def _make_codec() -> "_Codec":
     """Create a codec from the current environment. Called at Worker init time."""
     return _Codec(os.environ.get("PEPPER_CODEC", "msgpack"))
 
-
-# ── Form A parser — defined in cap.py, imported here for runtime use ──────────
+# Form A parser — defined in cap.py, imported here for runtime use
 from cap import parse_form_a  # noqa: E402
 from transport import BusTransport  # noqa: E402
-
 
 def _parse_bus_url(url: str) -> tuple[str, int]:
     """Parse a bus URL into (host, port). Thin wrapper over BusTransport._parse."""
     _, host, port = BusTransport._parse(url)
     return host, port
-
 
 class LoadedCap:
     def __init__(self, spec: dict, runner: Any, is_class: bool):
@@ -465,7 +454,6 @@ class LoadedCap:
             self.runner.teardown()
         elif not self.is_class and hasattr(self.runner, "teardown"):
             self.runner.teardown()
-
 
 def load_capability(cap_load: dict) -> LoadedCap:
     source_path = cap_load.get("source", "")
@@ -505,8 +493,7 @@ def load_capability(cap_load: dict) -> LoadedCap:
             module.setup(cap_load.get("config", {}))
         return LoadedCap({**form_a_meta, **cap_load}, module, is_class=False)
 
-
-# ── Stream registry ───────────────────────────────────────────────────────────
+# Stream registry
 # Tracks active bidirectional streams opened via pp.OpenStream().
 # Each entry is a queue that the message loop feeds with incoming chunks;
 # the capability reads from it via pepper.stream_chunks() (or a generator).
@@ -530,7 +517,6 @@ class _StreamState:
             if item is None:
                 return
             yield item
-
 
 class _StreamRegistry:
     _streams: Dict[str, _StreamState] = {}
@@ -562,11 +548,9 @@ class _StreamRegistry:
         with cls._lock:
             cls._streams.pop(stream_id, None)
 
-
 import queue  # noqa: E402 — placed here to keep top imports clean
 
-
-# ── Worker ────────────────────────────────────────────────────────────────────
+# Worker
 class Worker:
     def __init__(self):
         self.worker_id = os.environ["PEPPER_WORKER_ID"]
@@ -596,10 +580,10 @@ class Worker:
 
         # Build the list of topics this worker cares about.
         # BusTransport.subscribe() handles the protocol difference:
-        #   Mula:  sends a pipe-separated topic list as the first frame,
-        #          which Mula's handleConn uses to set up push queues.
-        #   Redis: PSUBSCRIBE for control/broadcast, BRPOP loop for push topics.
-        #   NATS:  queue-group SUB for push topics, plain SUB for others.
+        # Mula:  sends a pipe-separated topic list as the first frame,
+        # which Mula's handleConn uses to set up push queues.
+        # Redis: PSUBSCRIBE for control/broadcast, BRPOP loop for push topics.
+        # NATS:  queue-group SUB for push topics, plain SUB for others.
         topics = ["pepper.control", "pepper.broadcast"]
         if self.worker_id:
             topics.append(f"pepper.control.{self.worker_id}")
@@ -610,13 +594,17 @@ class Worker:
 
         self._transport.subscribe(topics)
 
+        # Give transports (Redis/NATS) a moment to process the subscriptions
+        # on their async connections before we announce ourselves, ensuring
+        # we don't miss the immediate cap_load reply.
+        time.sleep(0.1)
+
         # Send worker_hello so the router registers this worker.
         self._send_envelope(self._make_hello())
 
         hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         hb_thread.start()
         self._message_loop()
-
 
     def _message_loop(self):
         while self._running:
@@ -789,7 +777,6 @@ class Worker:
         origin_id = env.get("origin_id", "")
         corr_id = env.get("corr_id", "")
 
-        # ── pepper.inline: raw snippet execution (§16.3) ──────────────────────
         # The router sends cap="pepper.inline" with _snippet in the payload.
         # We handle it here natively — it is never registered via cap_load.
         if cap_name == "pepper.inline":
@@ -906,6 +893,7 @@ class Worker:
             self._send_envelope({
                 "proto_ver": 1, "msg_type": "hb_ping", "worker_id": self.worker_id,
                 "runtime": "python", "load": 0, "groups": self.groups,
+                "caps": list(self.caps.keys()),
                 "requests_served": self.requests_served,
                 "uptime_ms": int((time.time() - self.started_at) * 1000),
             })
@@ -941,7 +929,6 @@ class Worker:
             "retryable": code in _RETRYABLE_CODES,
         }
 
-
 def _recv_exact(conn: socket.socket | None, n: int) -> bytes | None:
     if conn is None:
         return None
@@ -953,11 +940,9 @@ def _recv_exact(conn: socket.socket | None, n: int) -> bytes | None:
         buf.extend(chunk)
     return bytes(buf)
 
-
 def _encode_msg(topic: str, data: bytes) -> bytes:
     tb = topic.encode()
     return len(tb).to_bytes(2, "big") + tb + data
-
 
 def _reply_topic(env: dict) -> str:
     msg_type = env.get("msg_type", "")

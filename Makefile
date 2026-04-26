@@ -96,14 +96,14 @@ go-real-whisper:
 	@echo "HF cache      : $${HF_HOME:-~/.cache/huggingface}"
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealWhisperColdWarm \
-		-timeout 300s .
+		-timeout 120s .
 
 # Worker recycle: MaxRequests=2, sends 4 requests, observes respawn + model reload.
 go-real-recycle:
 	@echo "Whisper model : $(PEPPER_WHISPER_MODEL)"
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealWorkerRecycle \
-		-timeout 300s .
+		-timeout 120s .
 
 # Full pipeline: audio → denoise → Whisper → Ollama LLM.
 # Set PEPPER_TEST_AUDIO=/path/to/speech.wav for a real transcript.
@@ -114,7 +114,7 @@ go-real-pipeline:
 	@echo "Audio input   : $${PEPPER_TEST_AUDIO:-[generated silence]}"
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealFullPipeline \
-		-timeout 300s .
+		-timeout 120s .
 
 # Song analysis: MP3/audio → ffmpeg → Whisper lyrics → Ollama/Gemini analysis.
 # Uses testdata/audio/sample.mp3 by default (placeholder tone).
@@ -128,7 +128,7 @@ go-real-song:
 	@if [ -n "$(PEPPER_GEMINI_KEY)" ]; then echo "LLM backend   : Gemini"; 	  else echo "LLM backend   : Ollama ($${PEPPER_OLLAMA_MODEL:-auto-detect})"; fi
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealSongAnalysis \
-		-timeout 300s .
+		-timeout 120s .
 
 # Run all real tests in dependency order.
 # Each test skips individually if its requirements aren't met.

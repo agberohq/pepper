@@ -9,14 +9,14 @@ import (
 
 // Map is the in-flight request registry. Lock-free reads via mappo.Sharded.
 type Map struct {
-	entries *mappo.Sharded[string, *entry]
+	entries *mappo.Concurrent[string, *entry]
 	len     atomic.Int64
 }
 
 // New returns an empty pending Map.
 func New() *Map {
 	return &Map{
-		entries: mappo.NewSharded[string, *entry](),
+		entries: mappo.NewConcurrent[string, *entry](),
 	}
 }
 

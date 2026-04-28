@@ -517,6 +517,177 @@ class TestRedisWorkerConnectivity:
         assert t.host == _REDIS_HOST
         assert t.port == _REDIS_PORT
 
+    def test_worker_redis_end_to_end_msgpack(self, tmp_path):
+        """
+        End-to-end round-trip through a real Python Worker using Redis transport
+        and MSGPACK codec — exactly the configuration the Go cluster test uses.
+
+        This is the missing integration test that bridges:
+          - transport.py tests (prove BRPOP works)
+          - isolation tests (prove Go dispatch/routing works)
+
+        If this test fails with "No response received", the bug is in the Worker's
+        response publishing path when using Redis+msgpack.
+
+        Previously failed because the response SUBSCRIBE was set up AFTER the LPUSH,
+        creating a race: echo cap runs in 0ms so the PUBLISH arrives before the
+        SUBSCRIBE is registered. Fixed by setting up the PSUBSCRIBE listener on a
+        background thread BEFORE the LPUSH, matching how the Go runtime works
+        (PSubscribe to pepper.res.* in bootRuntime before workers start).
+        """
+        import pytest
+        self._require_redis()
+
+        try:
+            import msgpack as _mp
+        except ImportError:
+            pytest.skip("msgpack not installed")
+
+        import os
+        import threading
+        import time
+        import socket as _sock
+
+        WORKER_ID = f"test-worker-{int(time.time())}"
+        PUSH_QUEUE = f"pepper.push.{WORKER_ID}"
+        CORR_ID = "test-corr-01"
+        ORIGIN_ID = "test-origin-01"
+        CAP_NAME = "test.echo"
+        REPLY_TOPIC = f"pepper.res.{ORIGIN_ID}"
+
+        # Write a simple echo cap.
+        cap_file = tmp_path / "echo.py"
+        cap_file.write_text(
+            "# pepper:name = test.echo\n"
+            "def run(inputs: dict) -> dict:\n"
+            "    return {**inputs, 'echoed': True}\n"
+        )
+
+        # Step 1: Set up PSUBSCRIBE listener BEFORE anything else
+        # This mirrors how the Go runtime sets up PSubscribe before workers start,
+        # so responses are never missed even for instant caps (0ms exec time).
+        from transport import _resp_cmd as rc, _BufReader, _resp_read
+        res_conn = _sock.create_connection((_REDIS_HOST, _REDIS_PORT), timeout=5)
+        res_conn.sendall(rc("PSUBSCRIBE", "pepper.res.*"))
+        # Drain the psubscribe confirmation.
+        res_reader = _BufReader(res_conn)
+        res_conn.settimeout(2.0)
+        try:
+            _resp_read(res_reader)   # *4 psubscribe pepper.res.* 1
+        except Exception:
+            pass
+        res_conn.settimeout(None)
+
+        # Collect responses on a background thread so we don't block the main thread.
+        received_responses: list[dict] = []
+        res_event = threading.Event()
+
+        def _listen_for_response():
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                res_conn.settimeout(max(0.1, deadline - time.monotonic()))
+                try:
+                    msg = _resp_read(res_reader)
+                    # PSubscribe delivers: ["pmessage", pattern, channel, payload]
+                    if isinstance(msg, list) and len(msg) >= 4 and msg[0] in ("pmessage", b"pmessage"):
+                        raw_payload = msg[-1]
+                        if isinstance(raw_payload, bytes) and raw_payload:
+                            env = _mp.unpackb(raw_payload, raw=False)
+                            received_responses.append(env)
+                            res_event.set()
+                            return
+                except Exception:
+                    break
+
+        listener = threading.Thread(target=_listen_for_response, daemon=True)
+        listener.start()
+
+        # Step 2: Set env and start worker
+        old_env = dict(os.environ)
+        os.environ.update({
+            "PEPPER_WORKER_ID": WORKER_ID,
+            "PEPPER_BUS_URL": f"redis://{_REDIS_HOST}:{_REDIS_PORT}",
+            "PEPPER_GROUPS": "default",
+            "PEPPER_HEARTBEAT_MS": "5000",
+            "PEPPER_MAX_CONCURRENT": "4",
+            "PEPPER_CODEC": "msgpack",
+        })
+
+        worker = Worker()
+
+        def run_worker():
+            try:
+                worker.run()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=run_worker, daemon=True)
+        t.start()
+
+        try:
+            # Wait for worker to connect and subscribe (BRPOP + pubsub).
+            time.sleep(0.3)
+
+            # Step 3: Send cap_load via PUBLISH
+            cap_load_env = {
+                "proto_ver": 1, "msg_type": "cap_load",
+                "worker_id": WORKER_ID, "cap": CAP_NAME,
+                "source": str(cap_file), "config": {},
+            }
+            cap_load_bytes = _mp.packb(cap_load_env, use_bin_type=True)
+            raw = _sock.create_connection((_REDIS_HOST, _REDIS_PORT), timeout=2)
+            raw.sendall(rc("PUBLISH", f"pepper.control.{WORKER_ID}", cap_load_bytes))
+            raw.recv(64)
+            raw.close()
+
+            time.sleep(0.3)  # let cap_load + cap_ready complete
+
+            # Step 4: LPUSH the request
+            # The PSUBSCRIBE listener is already running, so even a 0ms cap response is caught.
+            payload = _mp.packb({"msg": "hello"}, use_bin_type=True)
+            req_env = {
+                "proto_ver": 1, "msg_type": "req",
+                "corr_id": CORR_ID, "origin_id": ORIGIN_ID,
+                "cap": CAP_NAME, "group": "default", "worker_id": "",
+                "reply_to": REPLY_TOPIC,
+                "payload": payload, "meta": {}, "deadline_ms": 0,
+                "dispatch": "any", "hop": 0, "max_hops": 10,
+            }
+            req_bytes = _mp.packb(req_env, use_bin_type=True)
+            raw2 = _sock.create_connection((_REDIS_HOST, _REDIS_PORT), timeout=2)
+            raw2.sendall(rc("LPUSH", PUSH_QUEUE, req_bytes))
+            raw2.recv(64)
+            raw2.close()
+
+            # Step 5: Wait for response
+            got = res_event.wait(timeout=10.0)
+
+            assert got and received_responses, (
+                "No response received within 10s after exec_done. "
+                "The Python Worker executed the cap but failed to publish "
+                f"the response to {REPLY_TOPIC}. "
+                "Check: send_frame, _try_publish, pub_conn state."
+            )
+
+            response_env = received_responses[0]
+            assert response_env.get("msg_type") in ("res", "err"), (
+                f"Unexpected msg_type: {response_env}"
+            )
+            assert response_env.get("corr_id") == CORR_ID, (
+                f"corr_id mismatch: got {response_env.get('corr_id')!r}, want {CORR_ID!r}"
+            )
+            if response_env.get("msg_type") == "res":
+                result = _mp.unpackb(response_env["payload"], raw=False)
+                assert result.get("echoed") is True, f"echo cap returned wrong result: {result}"
+
+        finally:
+            worker._running = False
+            res_conn.close()
+            listener.join(timeout=1.0)
+            os.environ.clear()
+            os.environ.update(old_env)
+            t.join(timeout=3.0)
+
 class TestNATSWorkerConnectivity:
     """
     Verifies that a Python worker can reach NATS when PEPPER_BUS_URL points

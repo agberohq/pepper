@@ -88,8 +88,10 @@ func (s *redisStore) Subscribe(ctx context.Context, channelPrefix string) (<-cha
 		for {
 			select {
 			case <-ctx.Done():
-				return
-			case <-s.stopCh:
+				// Caller cancelled — this subscription's work is done.
+				// Do NOT select on s.stopCh here: the store may be shared
+				// across multiple Pepper nodes (e.g. in cluster tests), and
+				// closing one node must not kill another node's subscriptions.
 				return
 			case msg, ok := <-msgCh:
 				if !ok {
@@ -98,8 +100,6 @@ func (s *redisStore) Subscribe(ctx context.Context, channelPrefix string) (<-cha
 				select {
 				case ch <- Event{Channel: msg.Channel, Value: []byte(msg.Payload)}:
 				case <-ctx.Done():
-					return
-				case <-s.stopCh:
 					return
 				}
 			}

@@ -17,6 +17,7 @@ dev = [
     # Tests skip gracefully when these are absent or the service is down.
     "nats-py>=2.6",
     "redis>=4.0",
+
 ]
 
 [tool.setuptools.packages.find]

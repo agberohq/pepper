@@ -1,35 +1,38 @@
-# The scheme in PEPPER_BUS_URL selects the transport:
-#   mula://host:port   — Pepper's pure-Go TCP bus (default for single-node)
-#   tcp://host:port    — alias for mula://
-#   redis://host:port  — Redis pub/sub + BRPOP queue (distributed mode)
-#   nats://host:port   — NATS core pub/sub + queue groups (distributed mode)
-#
-# Go passes PEPPER_BUS_URL with the full scheme so the runtime selects
-# the right transport without guessing. Mula is used when no WithCoord is
-# set. Redis or NATS is used when WithCoord(coord.NewRedis/NewNATS) is set.
+"""
+transport.py — Pepper Python worker bus transport.
+
+One file, three backends:
+  mula  — raw TCP framing (Pepper's custom protocol, no library available)
+  redis — redis-py (RESP handled by the library)
+  nats  — nats-py (core NATS + JetStream handled by the library)
+
+The Go side defines the Store interface; this is the Python equivalent.
+"""
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import queue
 import socket
+import sys
 import threading
 import time
-import os
-import sys
-import struct
-import logging
-import queue as _queue
-import select
+from typing import Callable
 
 log = logging.getLogger("pepper.transport")
 
+SEND_TIMEOUT_S: float = 5.0
+
 class BusTransport:
-    """Pluggable bus transport. Scheme in PEPPER_BUS_URL selects implementation."""
+    """Pluggable bus transport. Scheme in PEPPER_BUS_URL selects backend."""
 
     SUPPORTED = ("mula", "tcp", "redis", "nats")
 
-    def __init__(self, url: str):
+    def __init__(self, url: str) -> None:
         self.url = url.strip()
         self.scheme, self.host, self.port = self._parse(self.url)
-        self._impl: "_TransportImpl | None" = None
+        self._impl: _TransportImpl | None = None
 
     @staticmethod
     def _parse(url: str) -> tuple[str, str, int]:
@@ -38,8 +41,12 @@ class BusTransport:
             return "mula", host or "127.0.0.1", int(port) if port else 7731
         scheme, rest = url.split("://", 1)
         scheme = scheme.lower()
-        host, _, port_str = rest.rpartition(":")
-        return scheme, host or "127.0.0.1", int(port_str) if port_str else _default_port(scheme)
+        if ":" in rest:
+            host, _, port_str = rest.rpartition(":")
+            port = int(port_str)
+        else:
+            host, port = rest, _default_port(scheme)
+        return scheme, host or "127.0.0.1", port
 
     def connect(self, retries: int = 10) -> None:
         if self.scheme in ("mula", "tcp"):
@@ -62,7 +69,6 @@ class BusTransport:
         return self._impl.recv_frame()
 
     def subscribe(self, topics: list[str]) -> None:
-        """Register interest in topics. Mula uses frame protocol; coord uses native sub."""
         if self._impl is not None:
             self._impl.subscribe(topics)
 
@@ -80,8 +86,6 @@ class BusTransport:
 def _default_port(scheme: str) -> int:
     return {"redis": 6379, "nats": 4222, "mula": 7731, "tcp": 7731}.get(scheme, 7731)
 
-# Internal transport implementations
-
 class _TransportImpl:
     def connect(self, retries: int) -> None: ...
     def send_frame(self, data: bytes) -> None: ...
@@ -89,10 +93,12 @@ class _TransportImpl:
     def subscribe(self, topics: list[str]) -> None: ...
     def close(self) -> None: ...
 
-class _MulaTransport(_TransportImpl):
-    """Pepper's custom TCP framing: 4-byte big-endian length prefix."""
+# Mula (raw TCP — no library exists)
 
-    def __init__(self, host: str, port: int):
+class _MulaTransport(_TransportImpl):
+    """Pepper's custom TCP transport. Frame: 4-byte BE length + payload."""
+
+    def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = port
         self._conn: socket.socket | None = None
@@ -108,14 +114,12 @@ class _MulaTransport(_TransportImpl):
                 return
             except OSError as exc:
                 log.debug("mula connect attempt %d failed: %s", attempt + 1, exc)
-                time.sleep(0.1 * (2 ** attempt))
+                time.sleep(min(0.1 * (2 ** attempt), 4.0))
         log.error("mula: could not connect to %s:%s after %d attempts", self._host, self._port, retries)
         sys.exit(1)
 
     def subscribe(self, topics: list[str]) -> None:
-        # Mula subscription: send pipe-separated topics as first frame.
-        frame = "|".join(topics).encode("utf-8")
-        self.send_frame(frame)
+        self.send_frame("|".join(topics).encode("utf-8"))
 
     def send_frame(self, data: bytes) -> None:
         assert self._conn is not None
@@ -125,12 +129,12 @@ class _MulaTransport(_TransportImpl):
     def recv_frame(self) -> bytes | None:
         hdr = _recv_exact(self._conn, 4)
         if hdr is None:
-            raise ConnectionResetError("router closed connection")
+            raise ConnectionResetError("mula: router closed connection")
         size = int.from_bytes(hdr, "big")
         if size == 0:
-            return None  # keepalive ping
+            return None
         if size > 64 * 1024 * 1024:
-            raise ValueError(f"frame too large: {size} bytes")
+            raise ValueError(f"mula: frame too large: {size} bytes")
         return _recv_exact(self._conn, size)
 
     def close(self) -> None:
@@ -141,471 +145,297 @@ class _MulaTransport(_TransportImpl):
                 pass
             self._conn = None
 
+# Redis (redis-py)
+
 class _RedisTransport(_TransportImpl):
-    """
-    Redis transport for distributed mode.
+    """Redis transport backed by redis-py. Thread-safe, connection-pooled."""
 
-    Send path:  PUBLISH to the response/control channel.
-    Receive path: BRPOP from the worker's push queue (pepper.push.{group})
-                  and PSUBSCRIBE for broadcast/control channels.
-
-    Uses two connections:
-      - _pub_conn: PUBLISH commands (protected by send_lock)
-      - _sub_conn: PSUBSCRIBE for control/broadcast topics
-    Queue polling runs in a background thread and pushes into _inbox.
-    """
-
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = port
-        self._pub_conn: socket.socket | None = None
-        self._sub_conn: socket.socket | None = None
-        self._pub_reader: _BufReader | None = None
-        self._send_lock = threading.Lock()
-        self._inbox: _queue.Queue[bytes] = _queue.Queue(maxsize=512)
+        # _client: used for PUBLISH and pubsub (socket_timeout ok for non-blocking ops)
+        self._client: "redis.Redis" | None = None
+        # _brpop_client: dedicated no-socket-timeout connection for BRPOP.
+        # BRPOP blocks server-side for up to `timeout` seconds; if socket_timeout
+        # is set shorter than that the Python socket fires first, the reply is
+        # discarded, and recv always times out.
+        self._brpop_client: "redis.Redis" | None = None
+        self._pubsub: "redis.client.PubSub" | None = None
+        self._pubsub_thread: threading.Thread | None = None
+        self._inbox: queue.Queue[bytes] = queue.Queue(maxsize=512)
         self._queues: list[str] = []
         self._sub_topics: list[str] = []
         self._stop = threading.Event()
 
-    def _dial(self) -> socket.socket:
-        conn = socket.create_connection((self._host, self._port), timeout=5)
-        conn.settimeout(None)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        return conn
-
     def connect(self, retries: int = 10) -> None:
+        import redis
+
         for attempt in range(retries):
             try:
-                self._pub_conn = self._dial()
-                self._pub_reader = _BufReader(self._pub_conn)
-                # _sub_conn is created and owned by _pubsub_loop, not here.
-                # Creating it eagerly then sending SUBSCRIBE on it produces a
-                # zombie connection: _pubsub_loop immediately opens its OWN
-                # connection and overwrites self._sub_conn, leaving the original
-                # connection subscribed but unread — its OS receive buffer fills,
-                # Redis's client-output buffer grows until the connection is killed,
-                # and in the process Redis may delay delivery on all connections.
+                self._client = redis.Redis(
+                    host=self._host, port=self._port,
+                    socket_connect_timeout=5, socket_timeout=5,
+                )
+                self._client.ping()
+                # Dedicated client for BRPOP — socket_timeout=None so the
+                # blocking read is never cut short by a Python-level timeout.
+                self._brpop_client = redis.Redis(
+                    host=self._host, port=self._port,
+                    socket_connect_timeout=5, socket_timeout=None,
+                )
                 return
-            except OSError as exc:
+            except Exception as exc:
                 log.debug("redis connect attempt %d: %s", attempt + 1, exc)
-                time.sleep(0.1 * (2 ** attempt))
+                time.sleep(min(0.1 * (2 ** attempt), 4.0))
         log.error("redis: could not connect to %s:%s", self._host, self._port)
         sys.exit(1)
 
     def subscribe(self, topics: list[str]) -> None:
-        # Split topics: queues (pepper.push.*) go to BRPOP loop,
-        # pub/sub topics (pepper.pub.*, pepper.control*, pepper.broadcast) go to SUBSCRIBE.
-        self._queues = [t for t in topics if t.startswith("pepper.push.")]
-        sub_topics = [t for t in topics if not t.startswith("pepper.push.")]
+        import redis
 
-        self._sub_topics = sub_topics
-        if self._sub_topics:
-            # Do NOT send SUBSCRIBE here on _sub_conn — _pubsub_loop creates its
-            # own connection and handles subscription entirely. Sending SUBSCRIBE
-            # here would create a second, unread zombie subscription (see connect()).
-            t = threading.Thread(target=self._pubsub_loop, daemon=True)
-            t.start()
+        self._queues = [t for t in topics if t.startswith("pepper.push.")]
+        self._sub_topics = [t for t in topics if not t.startswith("pepper.push.")]
+
+        if self._sub_topics and self._client:
+            self._pubsub = self._client.pubsub()
+            self._pubsub.subscribe(**{t: self._on_pubsub for t in self._sub_topics})
+            self._pubsub_thread = self._pubsub.run_in_thread(sleep_time=0.001)
 
         if self._queues:
-            t = threading.Thread(target=self._brpop_loop, daemon=True)
-            t.start()
+            ready = threading.Event()
+            threading.Thread(target=self._brpop_loop, args=(ready,), daemon=True, name="redis-brpop").start()
+            if not ready.wait(timeout=10.0):
+                log.warning("redis: BRPOP did not become ready in 10 s")
 
-    def _brpop_loop(self) -> None:
-        """Background thread: BRPOP from worker push queues."""
+    def _on_pubsub(self, message: dict) -> None:
+        if message.get("type") == "message":
+            self._enqueue(message["data"])
+
+    def _brpop_loop(self, ready: threading.Event) -> None:
+        ready.set()
         while not self._stop.is_set():
             try:
-                conn = self._dial()
-                reader = _BufReader(conn)
-                while not self._stop.is_set():
-                    cmd = _resp_cmd("BRPOP", *self._queues, "2")
-                    conn.sendall(cmd)
-                    reply = _resp_read(reader)
-                    if reply is None or not isinstance(reply, list) or len(reply) < 2:
-                        continue
-                    data = reply[1]  # raw bytes
-                    while not self._stop.is_set():
-                        try:
-                            self._inbox.put(_wrap_payload(data), timeout=1)
-                            break
-                        except _queue.Full:
-                            continue
-                conn.close()
+                assert self._brpop_client
+                # Use the dedicated no-socket-timeout client so the 2s server-side
+                # block is never cut short by a Python socket timeout.
+                result = self._brpop_client.brpop(self._queues, timeout=2)
+                if result is not None and len(result) == 2:
+                    self._enqueue(result[1])
             except Exception as exc:
                 if not self._stop.is_set():
-                    log.warning("redis brpop error: %s — retrying", exc)
+                    log.warning("redis: brpop error: %s — retrying", exc)
                     time.sleep(0.5)
-
-    def _pubsub_loop(self) -> None:
-        """Background thread: read PSUBSCRIBE messages."""
-        while not self._stop.is_set():
-            conn: socket.socket | None = None
-            try:
-                conn = self._dial()
-                cmd = _resp_cmd("SUBSCRIBE", *self._sub_topics)
-                conn.sendall(cmd)
-                self._sub_conn = conn
-                reader = _BufReader(conn)
-                while not self._stop.is_set():
-                    # Use select to unblock periodically without touching settimeout,
-                    # which would cause recv() to raise mid-message and discard buffered bytes.
-                    if not reader.buf:
-                        r, _, _ = select.select([conn], [], [], 1.0)
-                        if not r:
-                            continue
-                    reply = _resp_read(reader)
-                    if not isinstance(reply, list) or len(reply) < 3:
-                        continue
-                    kind = reply[0]
-                    if kind not in ("message", b"message", "pmessage", b"pmessage"):
-                        continue
-                    data = reply[-1]  # raw bytes
-                    while not self._stop.is_set():
-                        try:
-                            self._inbox.put(_wrap_payload(data), timeout=1)
-                            break
-                        except _queue.Full:
-                            continue
-            except Exception as exc:
-                if not self._stop.is_set():
-                    log.warning("redis pubsub error: %s — retrying", exc)
-                    time.sleep(0.5)
-            finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
 
     def send_frame(self, data: bytes) -> None:
         topic, payload = _unwrap_frame(data)
-        if not topic:
+        if not topic or self._client is None:
             return
-        cmd = _resp_cmd("PUBLISH", topic, payload)  # raw bytes, no hex
-        with self._send_lock:
-            try:
-                self._pub_conn.sendall(cmd)
-                _resp_read(self._pub_reader)
-            except Exception as exc:
-                log.warning("redis publish error: %s — reconnecting", exc)
-                try:
-                    self._pub_conn.close()
-                except Exception:
-                    pass
-                try:
-                    self._pub_conn = self._dial()
-                    self._pub_reader = _BufReader(self._pub_conn)
-                    self._pub_conn.sendall(cmd)
-                    _resp_read(self._pub_reader)
-                except Exception as e2:
-                    log.error("redis publish reconnect failed: %s", e2)
+        try:
+            self._client.publish(topic, payload)
+        except Exception as exc:
+            log.warning("redis: publish failed: %s", exc)
 
     def recv_frame(self) -> bytes | None:
         try:
-            return self._inbox.get(timeout=2)
-        except _queue.Empty:
+            return self._inbox.get(timeout=0.05)
+        except queue.Empty:
             return None
 
     def close(self) -> None:
         self._stop.set()
-        for c in (self._pub_conn, self._sub_conn):
-            if c:
-                try:
-                    c.close()
-                except OSError:
-                    pass
+        if self._pubsub_thread:
+            self._pubsub_thread.stop()  # type: ignore[attr-defined]
+        if self._pubsub:
+            self._pubsub.close()
+        if self._brpop_client:
+            self._brpop_client.close()
+        if self._client:
+            self._client.close()
+
+    def _enqueue(self, data: bytes) -> None:
+        while not self._stop.is_set():
+            try:
+                self._inbox.put(_wrap_payload(data), timeout=1)
+                return
+            except queue.Full:
+                continue
+
+# NATS (nats-py)
 
 class _NATSTransport(_TransportImpl):
-    """
-    NATS transport for distributed mode.
+    """NATS transport backed by nats-py. Asyncio bridge for JetStream pull."""
 
-    Send path:  PUB to the response/control subject.
-    Receive path: queue-group SUB on push subjects (pepper.push.*) for
-                  exactly-once delivery, plain SUB for broadcast/control.
-
-    Uses one persistent connection per direction (pub / sub).
-    """
-
-    def __init__(self, host: str, port: int):
-        self._host = host
-        self._port = port
-        self._pub_conn: socket.socket | None = None
-        self._sub_conn: socket.socket | None = None
-        self._send_lock = threading.Lock()
-        self._inbox: _queue.Queue[bytes] = _queue.Queue(maxsize=512)
+    def __init__(self, host: str, port: int) -> None:
+        self._url = f"nats://{host}:{port}"
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="nats-asyncio")
+        self._nc: "nats.NATS" | None = None
+        self._js: "nats.js.JetStreamContext" | None = None
+        self._inbox: queue.Queue[bytes] = queue.Queue(maxsize=512)
         self._stop = threading.Event()
-        self._sid = 0
+        self._push_topics: list[str] = []
+        self._other_topics: list[str] = []
+        self._subs: list = []
 
-    def _dial(self) -> socket.socket:
-        conn = socket.create_connection((self._host, self._port), timeout=5)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Drain lines until INFO is seen.
-        buf = b""
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                raise ConnectionResetError("nats: server closed on connect")
-            buf += chunk
-            if b"\r\n" in buf:
-                line, buf = buf.split(b"\r\n", 1)
-                if line.startswith(b"INFO"):
-                    break
-        # Send CONNECT.
-        conn.sendall(b"CONNECT {}\r\n")
-        # Drain the server's immediate post-CONNECT PING and respond.
-        conn.settimeout(0.5)
-        try:
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\r\n" in buf:
-                    line, buf = buf.split(b"\r\n", 1)
-                    line_s = line.decode("utf-8", errors="replace").strip()
-                    if line_s == "PING":
-                        conn.sendall(b"PONG\r\n")
-                    elif line_s:
-                        raise StopIteration
-        except (TimeoutError, socket.timeout, StopIteration, OSError):
-            pass
-        conn.settimeout(None)
-        return conn
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     def connect(self, retries: int = 10) -> None:
+        import nats
+
+        self._thread.start()
         for attempt in range(retries):
             try:
-                self._pub_conn = self._dial()
-                self._sub_conn = self._dial()
-                t = threading.Thread(target=self._pub_pong_loop, daemon=True)
-                t.start()
+                self._nc = self._run(nats.connect(self._url))
+                self._js = self._nc.jetstream()
                 return
-            except OSError as exc:
+            except Exception as exc:
                 log.debug("nats connect attempt %d: %s", attempt + 1, exc)
-                time.sleep(0.1 * (2 ** attempt))
-        log.error("nats: could not connect to %s:%s", self._host, self._port)
+                time.sleep(min(0.1 * (2 ** attempt), 4.0))
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=2.0)
+        log.error("nats: could not connect to %s", self._url)
         sys.exit(1)
 
-    def _pub_pong_loop(self) -> None:
-        """Background thread: respond to PING on _pub_conn to keep it alive."""
-        reader = _BufReader(self._pub_conn)
-        while not self._stop.is_set():
-            try:
-                if not reader.buf:
-                    r, _, _ = select.select([self._pub_conn], [], [], 2.0)
-                    if not r:
-                        continue
-                line = reader.read_until(b"\r\n").decode(errors="replace").strip()
-                if line == "PING":
-                    try:
-                        with self._send_lock:
-                            self._pub_conn.sendall(b"PONG\r\n")
-                    except OSError:
-                        return
-            except OSError:
-                break
-
     def subscribe(self, topics: list[str]) -> None:
-        push_topics = [t for t in topics if t.startswith("pepper.push.")]
-        other_topics = [t for t in topics if not t.startswith("pepper.push.")]
+        import nats.js.api as jsapi
 
-        for topic in push_topics:
-            self._sid += 1
-            sub_cmd = f"SUB {topic} pepper-workers {self._sid}\r\n"
-            self._sub_conn.sendall(sub_cmd.encode())
+        push = [t for t in topics if t.startswith("pepper.push.")]
+        other = [t for t in topics if not t.startswith("pepper.push.")]
+        self._push_topics = push
+        self._other_topics = other
 
-        for topic in other_topics:
-            self._sid += 1
-            subj = topic.replace("*", ">")
-            sub_cmd = f"SUB {subj} {self._sid}\r\n"
-            self._sub_conn.sendall(sub_cmd.encode())
+        # Ensure work-queue stream exists.
+        async def _ensure_stream() -> None:
+            assert self._js
+            try:
+                await self._js.add_stream(jsapi.StreamConfig(
+                    name="pepper-work",
+                    subjects=["pepper.push.>"],
+                    retention="workqueue",
+                    storage="file",
+                ))
+            except Exception:
+                pass  # already exists
 
-        t = threading.Thread(target=self._recv_loop, daemon=True)
-        t.start()
+        self._run(_ensure_stream())
 
-    def _recv_loop(self) -> None:
-        reader = _BufReader(self._sub_conn)
-        self._sub_conn.settimeout(None)
+        for subject in push:
+            ready = threading.Event()
+            asyncio.run_coroutine_threadsafe(self._jspull_coro(subject, ready), self._loop)
+            if not ready.wait(timeout=15.0):
+                log.warning("nats: jspull not ready in 15 s [subject=%s]", subject)
+
+        for subject in other:
+            sub = self._run(self._nc.subscribe(subject, cb=self._on_core_message_async))
+            self._subs.append(sub)
+
+    async def _on_core_message_async(self, msg) -> None:
+        """Async callback required by nats-py for subscriptions."""
+        self._enqueue(msg.data)
+
+    async def _jspull_coro(self, subject: str, ready: threading.Event) -> None:
+        import nats.js.api as jsapi
+
+        assert self._js
+        cname = _js_consumer_name(subject)
+
+        try:
+            await self._js.add_consumer("pepper-work", jsapi.ConsumerConfig(
+                durable_name=cname,
+                filter_subject=subject,
+                ack_policy="explicit",
+                deliver_policy="all",
+                max_ack_pending=1,
+                ack_wait=30.0,  # seconds — nats-py multiplies by 1e9 before sending
+                max_deliver=5,
+            ))
+        except Exception:
+            pass  # already exists — consumer is shared between workers
+
+        # pull_subscribe checks consumer_info first; if the durable already
+        # exists (created by add_consumer above, or by a peer worker) it skips
+        # creation and calls pull_subscribe_bind directly — no hang.
+        sub = await self._js.pull_subscribe(subject, durable=cname,
+                                            stream="pepper-work")
+        ready.set()  # signal only after the pull subscriber is bound
+
+        log.info("nats: jspull ready [subject=%s consumer=%s]", subject, cname)
+
         while not self._stop.is_set():
             try:
-                if not reader.buf:
-                    r, _, _ = select.select([self._sub_conn], [], [], 1.0)
-                    if not r:
-                        continue
-                line = reader.read_until(b"\r\n").decode("utf-8", errors="replace")
-                if line == "PING":
-                    try:
-                        self._sub_conn.sendall(b"PONG\r\n")
-                    except OSError:
-                        pass
-                    continue
-                if not line.startswith("MSG"):
-                    continue
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                try:
-                    n = int(parts[-1])
-                except (ValueError, IndexError):
-                    continue
-                data = reader.read_exact(n)
-                reader.read_until(b"\r\n")  # consume trailing CRLF
-                while not self._stop.is_set():
-                    try:
-                        self._inbox.put(_wrap_payload(data), timeout=1)
-                        break
-                    except _queue.Full:
-                        continue
-            except OSError as exc:
-                if not self._stop.is_set():
-                    log.warning("nats recv error: %s", exc)
-                break
+                msgs = await sub.fetch(batch=1, timeout=2.5)
+                for msg in msgs:
+                    self._enqueue(msg.data)
+                    await msg.ack()
+            except asyncio.TimeoutError:
+                continue
             except Exception as exc:
                 if not self._stop.is_set():
-                    log.warning("nats recv error: %s", exc)
-                break
+                    log.warning("nats: jspull error: %s [subject=%s] — retrying", exc, subject)
+                    await asyncio.sleep(0.5)
 
     def send_frame(self, data: bytes) -> None:
         topic, payload = _unwrap_frame(data)
-        if not topic:
+        if not topic or self._nc is None:
             return
-        cmd = f"PUB {topic} {len(payload)}\r\n".encode() + payload + b"\r\n"
-        with self._send_lock:
-            try:
-                self._pub_conn.sendall(cmd)
-            except Exception as exc:
-                log.warning("nats publish error: %s — reconnecting", exc)
-                try:
-                    self._pub_conn.close()
-                except Exception:
-                    pass
-                try:
-                    self._pub_conn = self._dial()
-                    self._pub_conn.sendall(cmd)
-                except Exception as e2:
-                    log.error("nats publish reconnect failed: %s", e2)
+        try:
+            self._run(self._nc.publish(topic, payload))
+        except Exception as exc:
+            log.warning("nats: publish failed: %s", exc)
 
     def recv_frame(self) -> bytes | None:
         try:
-            return self._inbox.get(timeout=2)
-        except _queue.Empty:
+            return self._inbox.get(timeout=0.05)
+        except queue.Empty:
             return None
 
     def close(self) -> None:
         self._stop.set()
-        for c in (self._pub_conn, self._sub_conn):
-            if c:
-                try:
-                    c.close()
-                except OSError:
-                    pass
+        for sub in self._subs:
+            try:
+                self._run(sub.unsubscribe())
+            except Exception:
+                pass
+        if self._nc:
+            try:
+                self._run(self._nc.close())
+            except Exception:
+                pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=2.0)
 
-# Wire helpers
+    def _enqueue(self, data: bytes) -> None:
+        while not self._stop.is_set():
+            try:
+                self._inbox.put(_wrap_payload(data), timeout=1)
+                return
+            except queue.Full:
+                continue
+
+# Shared helpers
 
 def _recv_exact(conn: socket.socket | None, n: int) -> bytes | None:
     if conn is None:
         return None
-    buf = b""
+    buf = bytearray()
     while len(buf) < n:
         chunk = conn.recv(n - len(buf))
         if not chunk:
             return None
-        buf += chunk
-    return buf
-
-def _resp_cmd(*parts) -> bytes:
-    """Encode a RESP command. Accepts str or bytes; bytes pass through unchanged."""
-    out = bytearray()
-    out.extend(f"*{len(parts)}\r\n".encode())
-    for p in parts:
-        if isinstance(p, str):
-            p = p.encode("utf-8")
-        out.extend(f"${len(p)}\r\n".encode())
-        out.extend(p + b"\r\n")
-    return bytes(out)
-
-class _BufReader:
-    """Persistent byte buffer over a socket — never discards unread data."""
-
-    def __init__(self, conn: socket.socket) -> None:
-        self.conn = conn
-        self.buf = bytearray()
-
-    def read_until(self, sep: bytes) -> bytes:
-        """Return bytes up to (not including) sep, consuming sep from buf."""
-        while True:
-            idx = self.buf.find(sep)
-            if idx != -1:
-                res = bytes(self.buf[:idx])
-                del self.buf[:idx + len(sep)]
-                return res
-            chunk = self.conn.recv(4096)
-            if not chunk:
-                raise ConnectionResetError("connection closed")
-            self.buf.extend(chunk)
-
-    def read_exact(self, n: int) -> bytes:
-        """Return exactly n bytes, blocking until available."""
-        while len(self.buf) < n:
-            chunk = self.conn.recv(4096)
-            if not chunk:
-                raise ConnectionResetError("connection closed")
-            self.buf.extend(chunk)
-        res = bytes(self.buf[:n])
-        del self.buf[:n]
-        return res
-
-
-def _resp_read(reader: _BufReader) -> object:
-    """Read one RESP value from reader (synchronous, blocking). Bulk strings are raw bytes."""
-    line = reader.read_until(b"\r\n").decode(errors="replace")
-    if not line:
-        return None
-    if line[0] == "+":
-        return line[1:]
-    if line[0] == "-":
-        raise RuntimeError(f"redis error: {line[1:]}")
-    if line[0] == ":":
-        return int(line[1:])
-    if line[0] == "$":
-        n = int(line[1:])
-        if n < 0:
-            return None
-        data = reader.read_exact(n)
-        reader.read_until(b"\r\n")  # consume trailing CRLF
-        return data
-    if line[0] == "*":
-        n = int(line[1:])
-        if n < 0:
-            return None
-        return [_resp_read(reader) for _ in range(n)]
-    return None
+        buf.extend(chunk)
+    return bytes(buf)
 
 def _wrap_payload(payload: bytes) -> bytes:
-    """
-    Wrap a raw payload as a Mula-style received frame so Worker._message_loop
-    can decode it without modification.
-
-    Mula frame layout (as sent by router to worker):
-        2 bytes: topic length (big-endian)
-        N bytes: topic
-        M bytes: msgpack/json payload
-
-    For coord transport the topic is not embedded in the frame — the router
-    publishes to the topic implicitly. We set topic_len=0 so the worker
-    skips topic parsing and reads the payload directly.
-    """
+    """Prepend zero-length topic header for Worker._message_loop compatibility."""
     return b"\x00\x00" + payload
 
 def _unwrap_frame(data: bytes) -> tuple[str, bytes]:
-    """
-    Extract topic and payload from a frame about to be sent by the worker.
-
-    Workers call _send_envelope which calls _send_frame with a frame
-    containing the response envelope. In Mula mode this is sent raw over
-    TCP. In coord mode we need to PUBLISH to the correct topic.
-
-    Returns ("", payload) if the topic cannot be determined — caller skips.
-    """
+    """Extract (topic, payload) from a Worker._send_envelope frame."""
     if len(data) < 2:
         return "", data
     topic_len = int.from_bytes(data[:2], "big")
@@ -613,6 +443,76 @@ def _unwrap_frame(data: bytes) -> tuple[str, bytes]:
         return "", data[2:]
     if len(data) < 2 + topic_len:
         return "", data
-    topic = data[2:2 + topic_len].decode("utf-8", errors="replace")
-    payload = data[2 + topic_len:]
-    return topic, payload
+    return (
+        data[2 : 2 + topic_len].decode("utf-8", errors="replace"),
+        data[2 + topic_len :],
+    )
+
+def _js_consumer_name(subject: str) -> str:
+    """Mirror Go's consumerName()."""
+    return "c-" + subject.replace(".", "_")
+
+# Minimal RESP helpers (used by test_runtime integration tests)
+
+def _resp_cmd(*args: str | bytes) -> bytes:
+    """Encode a RESP array command, e.g. _resp_cmd('PSUBSCRIBE', 'pepper.res.*')."""
+    parts = [f"*{len(args)}\r\n".encode()]
+    for arg in args:
+        if isinstance(arg, str):
+            arg = arg.encode("utf-8")
+        parts.append(f"${len(arg)}\r\n".encode())
+        parts.append(arg)
+        parts.append(b"\r\n")
+    return b"".join(parts)
+
+class _BufReader:
+    """Buffered line reader over a raw socket for RESP parsing."""
+
+    def __init__(self, conn: socket.socket) -> None:
+        self._conn = conn
+        self._buf = bytearray()
+
+    def readline(self) -> bytes:
+        while b"\r\n" not in self._buf:
+            chunk = self._conn.recv(4096)
+            if not chunk:
+                raise ConnectionResetError("RESP: connection closed")
+            self._buf.extend(chunk)
+        idx = self._buf.index(b"\r\n")
+        line = bytes(self._buf[: idx + 2])
+        del self._buf[: idx + 2]
+        return line
+
+    def read_exact(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            chunk = self._conn.recv(4096)
+            if not chunk:
+                raise ConnectionResetError("RESP: connection closed")
+            self._buf.extend(chunk)
+        data = bytes(self._buf[:n])
+        del self._buf[:n]
+        return data
+
+def _resp_read(reader: _BufReader):
+    """Read one RESP value from *reader*. Returns str/int/bytes/list/None."""
+    line = reader.readline().rstrip(b"\r\n")
+    prefix = chr(line[0])
+    rest = line[1:]
+    if prefix == "+":
+        return rest.decode("utf-8", errors="replace")
+    if prefix == "-":
+        raise RuntimeError(f"RESP error: {rest.decode()}")
+    if prefix == ":":
+        return int(rest)
+    if prefix == "$":
+        length = int(rest)
+        if length == -1:
+            return None
+        data = reader.read_exact(length + 2)  # +2 for CRLF
+        return data[:length]
+    if prefix == "*":
+        count = int(rest)
+        if count == -1:
+            return None
+        return [_resp_read(reader) for _ in range(count)]
+    raise ValueError(f"RESP: unknown prefix {prefix!r} in {line!r}")

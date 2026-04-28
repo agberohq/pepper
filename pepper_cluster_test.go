@@ -1,4 +1,3 @@
-//
 // These tests spin up two or more Pepper instances connected via a shared
 // Redis or NATS coordination store, then verify that:
 //
@@ -87,16 +86,22 @@ func requireNATSCluster(t *testing.T) string {
 
 // clusterSetup holds two Pepper nodes sharing a coord backend.
 type clusterSetup struct {
-	nodeA *Pepper
-	nodeB *Pepper
-	coord coord.Store
-	url   string
+	nodeA  *Pepper
+	nodeB  *Pepper
+	coordA coord.Store // owned by nodeA
+	coordB coord.Store // owned by nodeB
+	flush  coord.Store // used only for pre-test queue flushing
+	url    string
 }
 
 func (c *clusterSetup) stop() {
 	c.nodeA.Stop()
 	c.nodeB.Stop()
-	c.coord.Close()
+	// coordA and coordB are closed by their respective nodes' shutdown hooks.
+	// flush store is a separate connection used only for the pre-test cleanup.
+	if c.flush != nil {
+		c.flush.Close()
+	}
 }
 
 // waitReady blocks until nodeB's router has registered at least one worker
@@ -112,30 +117,50 @@ func (c *clusterSetup) waitReady(t *testing.T, cap string, timeout time.Duration
 	}
 }
 
-// newCluster creates two Pepper nodes wired to the same coord store.
+// newCluster creates two Pepper nodes each with their own coord connection.
 // nodeA owns the Python/Go workers; nodeB is a pure orchestrator (no workers)
 // that routes requests through the coord queue to nodeA's workers.
+//
+// Each node gets its own coord.Store so that Stop() on one node does not
+// close the shared stopCh and kill the other node's subscription goroutines.
 func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Store, error)) *clusterSetup {
 	t.Helper()
 
-	c, err := newCoord(coordURL)
+	// Separate flush connection: used only for pre-test queue cleanup.
+	// This avoids any lifecycle entanglement with the node connections.
+	flush, err := newCoord(coordURL)
 	if err != nil {
-		t.Fatalf("coord connect %s: %v", coordURL, err)
+		t.Fatalf("coord connect (flush) %s: %v", coordURL, err)
 	}
 
 	// Flush any stale queue items left by previous test runs.
 	// Without this, failed subtests leave items in pepper.push.* that get
 	// picked up by workers in the next subtest, causing "cap not found" errors.
 	ctx := context.Background()
-	if keys, err := c.List(ctx, "pepper.push."); err == nil {
+	if keys, err := flush.List(ctx, "pepper.push."); err == nil {
 		for _, k := range keys {
-			_ = c.Delete(ctx, k)
+			_ = flush.Delete(ctx, k)
 		}
 	}
-	if keys, err := c.List(ctx, "pepper:cap:"); err == nil {
+	if keys, err := flush.List(ctx, "pepper:cap:"); err == nil {
 		for _, k := range keys {
-			_ = c.Delete(ctx, k)
+			_ = flush.Delete(ctx, k)
 		}
+	}
+
+	// Each node gets its own coord connection so that nodeA.Stop() closing
+	// its coord store does not cancel nodeB's subscription goroutines.
+	coordA, err := newCoord(coordURL)
+	if err != nil {
+		flush.Close()
+		t.Fatalf("coord connect (nodeA) %s: %v", coordURL, err)
+	}
+
+	coordB, err := newCoord(coordURL)
+	if err != nil {
+		flush.Close()
+		coordA.Close()
+		t.Fatalf("coord connect (nodeB) %s: %v", coordURL, err)
 	}
 
 	// nodeA — has the workers, registered capabilities execute here
@@ -144,28 +169,31 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 			NewWorker("cluster-worker-a1").Groups("default"),
 			NewWorker("cluster-worker-a2").Groups("default"),
 		),
-		WithCoord(c),
+		WithCoord(coordA),
 		WithTransportURL(coordURL),
 		WithShutdownTimeout(10*time.Second),
 	)
 	if err != nil {
-		c.Close()
+		flush.Close()
+		coordA.Close()
+		coordB.Close()
 		t.Fatalf("nodeA New: %v", err)
 	}
 
 	// nodeB — orchestrator only, routes Do() calls via coord queue
 	nodeB, err := New(
-		WithCoord(c),
+		WithCoord(coordB),
 		WithTransportURL(coordURL),
 		WithShutdownTimeout(10*time.Second),
 	)
 	if err != nil {
 		nodeA.Stop()
-		c.Close()
+		flush.Close()
+		coordB.Close()
 		t.Fatalf("nodeB New: %v", err)
 	}
 
-	return &clusterSetup{nodeA: nodeA, nodeB: nodeB, coord: c, url: coordURL}
+	return &clusterSetup{nodeA: nodeA, nodeB: nodeB, coordA: coordA, coordB: coordB, flush: flush, url: coordURL}
 }
 
 // capability sources
@@ -450,6 +478,26 @@ func testConcurrentThroughput(t *testing.T, url string, newCoord func(string) (c
 		n, elapsed.Round(time.Millisecond), throughput, errCount.Load())
 
 	if errCount.Load() > 0 {
+		// Check whether failed items are still sitting in the Redis queue (never
+		// BRPOPped) or were consumed but their responses never arrived (routing bug).
+		// Use the flush coord which has an idle connection for diagnostic reads.
+		diagCtx, diagCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer diagCancel()
+		// Pull without blocking — if items are in the queue they will be returned
+		// immediately; if the queue is empty, Pull will block and we cancel.
+		queueLen := 0
+		for {
+			_, err := cl.flush.Pull(diagCtx, "pepper.push.default")
+			if err != nil {
+				break
+			}
+			queueLen++
+		}
+		if queueLen > 0 {
+			t.Logf("DIAGNOSIS: %d items still in pepper.push.default — workers never BRPOPped them (transport/BRPOP bug)", queueLen)
+		} else {
+			t.Logf("DIAGNOSIS: pepper.push.default is empty — items were BRPOPped but responses were lost (response routing bug)")
+		}
 		t.Errorf("%d/%d requests failed", errCount.Load(), n)
 	}
 }

@@ -1,19 +1,9 @@
-// Package pepper integration tests.
-//
-// Run:
-//
-//	go test ./... -run TestEchoRoundTrip -v -timeout 30s
-//
-// Requires Python 3 with msgpack:
-//
-//	pip install msgpack
 package pepper
 
 import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -45,23 +35,23 @@ def run(inputs):
     return {"text": text[::-1]}
 `
 
-// TestMain writes test capability sources to testdata/caps/ before running tests.
+// TestMain writes test capability sources to tests/testdata/caps/ before running tests.
 func TestMain(m *testing.M) {
-	if err := os.MkdirAll("testdata/caps", 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir testdata/caps: %v\n", err)
+	if err := os.MkdirAll("tests/testdata/caps", 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir tests/testdata/caps: %v\n", err)
 		os.Exit(1)
 	}
-	writeTestCap("testdata/caps/echo.py", echoCapSource)
-	writeTestCap("testdata/caps/reverse.py", reverseCapSource)
+	writeTestCap("tests/testdata/caps/echo.py", echoCapSource)
+	writeTestCap("tests/testdata/caps/reverse.py", reverseCapSource)
 	os.Exit(m.Run())
 }
 
 // TestMultipleCapabilities registers two capabilities and calls both.
 func TestMultipleCapabilities(t *testing.T) {
-	if !pythonAvailable() {
+	if !defaultFinder.HasPython() {
 		t.Skip("python3 not available")
 	}
-	if !msgpackAvailable() {
+	if !defaultFinder.HasPythonMsgpack() {
 		t.Skip("pip install msgpack required")
 	}
 
@@ -74,10 +64,10 @@ func TestMultipleCapabilities(t *testing.T) {
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Script("echo", "./testdata/caps/echo.py")); err != nil {
+	if err := pp.Register(Script("echo", "./tests/testdata/caps/echo.py")); err != nil {
 		t.Fatalf("Register echo: %v", err)
 	}
-	if err := pp.Register(Script("reverse", "./testdata/caps/reverse.py")); err != nil {
+	if err := pp.Register(Script("reverse", "./tests/testdata/caps/reverse.py")); err != nil {
 		t.Fatalf("Register reverse: %v", err)
 	}
 
@@ -169,7 +159,7 @@ func TestCapabilityRegistration(t *testing.T) {
 	defer pp.Stop()
 
 	// Python via new unified Register
-	if err := pp.Register(Script("echo", "./testdata/caps/echo.py")); err != nil {
+	if err := pp.Register(Script("echo", "./tests/testdata/caps/echo.py")); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -823,15 +813,4 @@ func TestNewSession(t *testing.T) {
 		t.Fatalf("Session(id): expected %s, got %s", s1.ID(), resumed.ID())
 	}
 	t.Logf("NewSession ok — id=%s", s1.ID())
-}
-
-// helpers
-
-func pythonAvailable() bool {
-	_, err := exec.LookPath("python3")
-	return err == nil
-}
-
-func msgpackAvailable() bool {
-	return exec.Command("python3", "-c", "import msgpack").Run() == nil
 }

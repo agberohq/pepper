@@ -28,7 +28,7 @@
 //	PEPPER_REAL_TESTS=1 go test -v -run TestRealClusterRedis -timeout 120s .
 //	PEPPER_REAL_TESTS=1 go test -v -run TestRealClusterNATS  -timeout 120s .
 
-package pepper
+package tests
 
 import (
 	"context"
@@ -40,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agberohq/pepper"
 	"github.com/agberohq/pepper/internal/coord"
 	"github.com/agberohq/pepper/internal/core"
 )
@@ -86,8 +87,8 @@ func requireNATSCluster(t *testing.T) string {
 
 // clusterSetup holds two Pepper nodes sharing a coord backend.
 type clusterSetup struct {
-	nodeA  *Pepper
-	nodeB  *Pepper
+	nodeA  *pepper.Pepper
+	nodeB  *pepper.Pepper
 	coordA coord.Store // owned by nodeA
 	coordB coord.Store // owned by nodeB
 	flush  coord.Store // used only for pre-test queue flushing
@@ -164,14 +165,14 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 	}
 
 	// nodeA — has the workers, registered capabilities execute here
-	nodeA, err := New(
-		WithWorkers(
-			NewWorker("cluster-worker-a1").Groups("default"),
-			NewWorker("cluster-worker-a2").Groups("default"),
+	nodeA, err := pepper.New(
+		pepper.WithWorkers(
+			pepper.NewWorker("cluster-worker-a1").Groups("default"),
+			pepper.NewWorker("cluster-worker-a2").Groups("default"),
 		),
-		WithCoord(coordA),
-		WithTransportURL(coordURL),
-		WithShutdownTimeout(10*time.Second),
+		pepper.WithCoord(coordA),
+		pepper.WithTransportURL(coordURL),
+		pepper.WithShutdownTimeout(10*time.Second),
 	)
 	if err != nil {
 		flush.Close()
@@ -181,10 +182,10 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 	}
 
 	// nodeB — orchestrator only, routes Do() calls via coord queue
-	nodeB, err := New(
-		WithCoord(coordB),
-		WithTransportURL(coordURL),
-		WithShutdownTimeout(10*time.Second),
+	nodeB, err := pepper.New(
+		pepper.WithCoord(coordB),
+		pepper.WithTransportURL(coordURL),
+		pepper.WithShutdownTimeout(10*time.Second),
 	)
 	if err != nil {
 		nodeA.Stop()
@@ -278,7 +279,7 @@ func testCrossNodeDispatch(t *testing.T, url string, newCoord func(string) (coor
 	capDir := t.TempDir()
 	echoPath := writeCap(t, capDir, "echo.py", echoClusterCapSrc)
 
-	if err := cl.nodeA.Register(Script("cluster.echo", echoPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.echo", echoPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -322,7 +323,7 @@ func testSessionSharing(t *testing.T, url string, newCoord func(string) (coord.S
 	capDir := t.TempDir()
 	counterPath := writeCap(t, capDir, "counter.py", counterCapSrc)
 
-	if err := cl.nodeA.Register(Script("cluster.counter", counterPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.counter", counterPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -345,7 +346,7 @@ func testSessionSharing(t *testing.T, url string, newCoord func(string) (coord.S
 	for i := 1; i <= 3; i++ {
 		result, err := cl.nodeB.Do(doCtx, "cluster.counter",
 			core.In{"key": "hits"},
-			WithCallSession(sessionID),
+			pepper.WithCallSession(sessionID),
 		)
 		if err != nil {
 			t.Fatalf("Do #%d: %v", i, err)
@@ -375,7 +376,7 @@ func testWorkerLocalKV(t *testing.T, url string, newCoord func(string) (coord.St
 	capDir := t.TempDir()
 	counterPath := writeCap(t, capDir, "counter.py", counterCapSrc)
 
-	if err := cl.nodeA.Register(Script("cluster.counter", counterPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.counter", counterPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -397,7 +398,7 @@ func testWorkerLocalKV(t *testing.T, url string, newCoord func(string) (coord.St
 	for i := 0; i < 5; i++ {
 		result, err := cl.nodeB.Do(doCtx, "cluster.counter",
 			core.In{"key": "local-hits"},
-			WithCallWorker("cluster-worker-a1"),
+			pepper.WithCallWorker("cluster-worker-a1"),
 		)
 		if err != nil {
 			t.Fatalf("Do #%d: %v", i+1, err)
@@ -429,7 +430,7 @@ func testConcurrentThroughput(t *testing.T, url string, newCoord func(string) (c
 	capDir := t.TempDir()
 	echoPath := writeCap(t, capDir, "echo.py", echoClusterCapSrc)
 
-	if err := cl.nodeA.Register(Script("cluster.echo", echoPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.echo", echoPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -512,7 +513,7 @@ func testExactlyOnceDelivery(t *testing.T, url string, newCoord func(string) (co
 	capDir := t.TempDir()
 	echoPath := writeCap(t, capDir, "echo.py", echoClusterCapSrc)
 
-	if err := cl.nodeA.Register(Script("cluster.echo", echoPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.echo", echoPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -572,10 +573,10 @@ func testNodeBOrchestrates(t *testing.T, url string, newCoord func(string) (coor
 	echoPath := writeCap(t, capDir, "echo.py", echoClusterCapSrc)
 	slowPath := writeCap(t, capDir, "slow.py", slowCapSrc)
 
-	if err := cl.nodeA.Register(Script("cluster.echo", echoPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.echo", echoPath)); err != nil {
 		t.Fatalf("Register echo: %v", err)
 	}
-	if err := cl.nodeA.Register(Script("cluster.slow", slowPath)); err != nil {
+	if err := cl.nodeA.Register(pepper.Script("cluster.slow", slowPath)); err != nil {
 		t.Fatalf("Register slow: %v", err)
 	}
 

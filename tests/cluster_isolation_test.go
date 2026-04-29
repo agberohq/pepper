@@ -11,7 +11,7 @@
 // Run with:
 //   go test -v -run TestClusterIsolation -count=1 -timeout 20s .
 
-package pepper
+package tests
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agberohq/pepper"
 	"github.com/agberohq/pepper/internal/coord"
 	"github.com/agberohq/pepper/internal/core"
 )
@@ -49,11 +50,11 @@ func TestClusterIsolation_GoSideDeliversToCoordQueue(t *testing.T) {
 	// entirely: we stand up Pepper in distributed mode and manually
 	// inject a fake "worker_hello" into the coord bus so the router
 	// thinks there's a live worker for the "default" group.
-	node, err := New(
-		WithCodec(CodecJSON),
-		WithCoord(store),
-		WithTransportURL("mem://iso"),
-		WithShutdownTimeout(2*time.Second),
+	node, err := pepper.New(
+		pepper.WithCodec(pepper.CodecJSON),
+		pepper.WithCoord(store),
+		pepper.WithTransportURL("mem://iso"),
+		pepper.WithShutdownTimeout(2*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -189,11 +190,11 @@ func TestClusterIsolation_CodecMismatchCausesSilentHang(t *testing.T) {
 	store := coord.NewMemory()
 	defer store.Close()
 
-	node, err := New(
-		WithCodec(CodecJSON),
-		WithCoord(store),
-		WithTransportURL("mem://codec"),
-		WithShutdownTimeout(2*time.Second),
+	node, err := pepper.New(
+		pepper.WithCodec(pepper.CodecJSON),
+		pepper.WithCoord(store),
+		pepper.WithTransportURL("mem://codec"),
+		pepper.WithShutdownTimeout(2*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -270,11 +271,11 @@ func TestClusterIsolation_EnvelopeShapeOnTheWire(t *testing.T) {
 	store := coord.NewMemory()
 	defer store.Close()
 
-	node, err := New(
-		WithCodec(CodecJSON),
-		WithCoord(store),
-		WithTransportURL("mem://shape"),
-		WithShutdownTimeout(2*time.Second),
+	node, err := pepper.New(
+		pepper.WithCodec(pepper.CodecJSON),
+		pepper.WithCoord(store),
+		pepper.WithTransportURL("mem://shape"),
+		pepper.WithShutdownTimeout(2*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -318,7 +319,7 @@ func TestClusterIsolation_EnvelopeShapeOnTheWire(t *testing.T) {
 		var env map[string]any
 		if err := json.Unmarshal(data, &env); err != nil {
 			t.Logf("NOTE: envelope is not JSON — codec is likely msgpack. "+
-				"First 32 bytes: % x", data[:minInt(32, len(data))])
+				"First 32 bytes: % x", data[:min(32, len(data))])
 			t.Logf("If Python worker is configured for JSON but Go is sending msgpack " +
 				"(or vice-versa), the worker's _message_loop will fail to decode and " +
 				"never dispatch to the capability. Check PEPPER_CODEC env var passed to " +
@@ -350,11 +351,4 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

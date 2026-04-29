@@ -117,14 +117,14 @@ go-real-pipeline:
 		-timeout 240s .
 
 # Song analysis: MP3/audio → ffmpeg → Whisper lyrics → Ollama/Gemini analysis.
-# Uses testdata/audio/sample.mp3 by default (placeholder tone).
+# Uses tests/testdata/audio/sample.mp3 by default (placeholder tone).
 # Replace with a real song for a meaningful transcript.
 #   Ollama:  make go-real-song                                 (needs Ollama running)
 #   Gemini:  make go-real-song PEPPER_GEMINI_KEY=AIza...      (cloud, no local GPU)
 #   Custom:  make go-real-song PEPPER_TEST_MP3=/path/to/song.mp3
 go-real-song:
 	@echo "Whisper model : $(PEPPER_WHISPER_MODEL)"
-	@echo "Audio input   : $${PEPPER_TEST_MP3:-testdata/audio/sample.mp3 (placeholder)}"
+	@echo "Audio input   : $${PEPPER_TEST_MP3:-tests/testdata/audio/sample.mp3 (placeholder)}"
 	@if [ -n "$(PEPPER_GEMINI_KEY)" ]; then echo "LLM backend   : Gemini"; 	  else echo "LLM backend   : Ollama ($${PEPPER_OLLAMA_MODEL:-auto-detect})"; fi
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealSongAnalysis \
@@ -138,7 +138,7 @@ go-real:
 	@echo "  Whisper model : $(PEPPER_WHISPER_MODEL)"
 	@echo "  HF cache      : $${HF_HOME:-~/.cache/huggingface}"
 	@echo "  Audio (WAV)   : $${PEPPER_TEST_AUDIO:-[generated silence]}"
-	@echo "  Audio (MP3)   : $${PEPPER_TEST_MP3:-testdata/audio/sample.mp3}"
+	@echo "  Audio (MP3)   : $${PEPPER_TEST_MP3:-tests/testdata/audio/sample.mp3}"
 	@echo "  Ollama model  : $${PEPPER_OLLAMA_MODEL:-auto-detect}"
 	@if [ -n "$${PEPPER_GEMINI_KEY}" ]; then echo "  LLM backend   : Gemini (song test)"; fi
 	@echo "═══════════════════════════════════════════════"

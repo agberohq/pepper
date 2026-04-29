@@ -18,6 +18,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from typing import Callable
 
 log = logging.getLogger("pepper.transport")
@@ -153,12 +154,7 @@ class _RedisTransport(_TransportImpl):
     def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = port
-        # _client: used for PUBLISH and pubsub (socket_timeout ok for non-blocking ops)
         self._client: "redis.Redis" | None = None
-        # _brpop_client: dedicated no-socket-timeout connection for BRPOP.
-        # BRPOP blocks server-side for up to `timeout` seconds; if socket_timeout
-        # is set shorter than that the Python socket fires first, the reply is
-        # discarded, and recv always times out.
         self._brpop_client: "redis.Redis" | None = None
         self._pubsub: "redis.client.PubSub" | None = None
         self._pubsub_thread: threading.Thread | None = None
@@ -177,8 +173,6 @@ class _RedisTransport(_TransportImpl):
                     socket_connect_timeout=5, socket_timeout=5,
                 )
                 self._client.ping()
-                # Dedicated client for BRPOP — socket_timeout=None so the
-                # blocking read is never cut short by a Python-level timeout.
                 self._brpop_client = redis.Redis(
                     host=self._host, port=self._port,
                     socket_connect_timeout=5, socket_timeout=None,
@@ -216,8 +210,6 @@ class _RedisTransport(_TransportImpl):
         while not self._stop.is_set():
             try:
                 assert self._brpop_client
-                # Use the dedicated no-socket-timeout client so the 2s server-side
-                # block is never cut short by a Python socket timeout.
                 result = self._brpop_client.brpop(self._queues, timeout=2)
                 if result is not None and len(result) == 2:
                     self._enqueue(result[1])
@@ -276,6 +268,11 @@ class _NATSTransport(_TransportImpl):
         self._push_topics: list[str] = []
         self._other_topics: list[str] = []
         self._subs: list = []
+        # Unique suffix so every transport instance gets its own durable
+        # consumer. NATS work-queue retention then distributes messages
+        # across instances (queue-group behaviour).
+        self._instance_id = uuid.uuid4().hex[:6]
+        self._consumer_names: list[str] = []
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -309,7 +306,6 @@ class _NATSTransport(_TransportImpl):
         self._push_topics = push
         self._other_topics = other
 
-        # Ensure work-queue stream exists.
         async def _ensure_stream() -> None:
             assert self._js
             try:
@@ -342,29 +338,63 @@ class _NATSTransport(_TransportImpl):
         import nats.js.api as jsapi
 
         assert self._js
-        cname = _js_consumer_name(subject)
+        # Each transport instance gets a unique consumer so that multiple
+        # workers can drain the same subject in parallel (queue-group
+        # behaviour via work-queue retention).
+        cname = f"{_js_consumer_name(subject)}-{self._instance_id}"
+        self._consumer_names.append(cname)
 
+        sub = None
         try:
-            await self._js.add_consumer("pepper-work", jsapi.ConsumerConfig(
-                durable_name=cname,
-                filter_subject=subject,
-                ack_policy="explicit",
-                deliver_policy="all",
-                max_ack_pending=1,
-                ack_wait=30.0,  # seconds — nats-py multiplies by 1e9 before sending
-                max_deliver=5,
-            ))
-        except Exception:
-            pass  # already exists — consumer is shared between workers
+            for attempt in range(3):
+                try:
+                    # Create consumer and bind in one call.  The explicit
+                    # add_consumer + pull_subscribe sequence we used before
+                    # raced when two transports started concurrently.
+                    sub = await asyncio.wait_for(
+                        self._js.pull_subscribe(
+                            subject,
+                            durable=cname,
+                            stream="pepper-work",
+                            config=jsapi.ConsumerConfig(
+                                durable_name=cname,
+                                filter_subject=subject,
+                                ack_policy="explicit",
+                                deliver_policy="all",
+                                max_ack_pending=1,
+                                ack_wait=30.0,
+                                max_deliver=5,
+                            ),
+                        ),
+                        timeout=5.0,
+                    )
+                    log.info("nats: jspull ready [subject=%s consumer=%s]", subject, cname)
+                    break
+                except Exception as exc:
+                    err = str(exc).lower()
+                    # If the consumer already exists (unclean prior test run)
+                    # try binding without the config object.
+                    if "already exists" in err or "consumer name already in use" in err:
+                        try:
+                            sub = await asyncio.wait_for(
+                                self._js.pull_subscribe(subject, durable=cname,
+                                                        stream="pepper-work"),
+                                timeout=5.0,
+                            )
+                            log.info("nats: jspull bound to existing consumer [subject=%s consumer=%s]", subject, cname)
+                            break
+                        except Exception as exc2:
+                            log.debug("nats: bind fallback failed [subject=%s]: %s", subject, exc2)
+                    log.debug("nats: pull_subscribe attempt %d failed [subject=%s]: %s", attempt + 1, subject, exc)
+                    if attempt < 2:
+                        await asyncio.sleep(0.5)
+        finally:
+            # Always signal readiness so subscribe() never hangs indefinitely.
+            ready.set()
 
-        # pull_subscribe checks consumer_info first; if the durable already
-        # exists (created by add_consumer above, or by a peer worker) it skips
-        # creation and calls pull_subscribe_bind directly — no hang.
-        sub = await self._js.pull_subscribe(subject, durable=cname,
-                                            stream="pepper-work")
-        ready.set()  # signal only after the pull subscriber is bound
-
-        log.info("nats: jspull ready [subject=%s consumer=%s]", subject, cname)
+        if sub is None:
+            log.error("nats: pull_subscribe failed after 3 attempts [subject=%s]", subject)
+            return
 
         while not self._stop.is_set():
             try:
@@ -396,6 +426,14 @@ class _NATSTransport(_TransportImpl):
 
     def close(self) -> None:
         self._stop.set()
+        # Delete durable consumers so repeated test runs don't exhaust
+        # the JetStream consumer limit on the pepper-work stream.
+        if self._js:
+            for cname in self._consumer_names:
+                try:
+                    self._run(self._js.delete_consumer("pepper-work", cname))
+                except Exception:
+                    pass
         for sub in self._subs:
             try:
                 self._run(sub.unsubscribe())

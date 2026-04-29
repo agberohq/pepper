@@ -32,7 +32,7 @@
 // faster-whisper caches to ~/.cache/huggingface by default.
 // Set HF_HOME or TRANSFORMERS_CACHE to redirect.
 // This test prints the cache directory so you can observe it.
-package pepper
+package tests
 
 import (
 	"context"
@@ -48,6 +48,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agberohq/pepper"
 	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/runtime/adapter"
 )
@@ -303,16 +304,16 @@ func TestRealDenoisePassthrough(t *testing.T) {
 	audioPath := silentWAV(t, 1.0)
 	defer os.Remove(audioPath)
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-cpu-1").Groups("cpu", "default")),
-		WithShutdownTimeout(10*time.Second),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-cpu-1").Groups("cpu", "default")),
+		pepper.WithShutdownTimeout(10*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Script("audio.denoise", denoisePath)); err != nil {
+	if err := pp.Register(pepper.Script("audio.denoise", denoisePath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -358,18 +359,18 @@ func TestRealWhisperColdWarm(t *testing.T) {
 	modelSize := whisperModel()
 	t.Logf("Using Whisper model: %s", modelSize)
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-whisper").Groups("cpu", "gpu")),
-		WithDefaultTimeout(120*time.Second),
-		WithShutdownTimeout(10*time.Second),
-		Resource("whisper", map[string]any{"model_size": modelSize}),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-whisper").Groups("cpu", "gpu")),
+		pepper.WithDefaultTimeout(120*time.Second),
+		pepper.WithShutdownTimeout(10*time.Second),
+		pepper.Resource("whisper", map[string]any{"model_size": modelSize}),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
+	if err := pp.Register(pepper.Script("speech.transcribe", transcribePath), pepper.WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -450,14 +451,14 @@ func TestRealFullPipeline(t *testing.T) {
 		t.Logf("Using audio file: %s", audioPath)
 	}
 
-	pp, err := New(
-		WithWorkers(
-			NewWorker("w-cpu").Groups("cpu"),
-			NewWorker("w-gpu").Groups("gpu", "cpu"),
+	pp, err := pepper.New(
+		pepper.WithWorkers(
+			pepper.NewWorker("w-cpu").Groups("cpu"),
+			pepper.NewWorker("w-gpu").Groups("gpu", "cpu"),
 		),
-		WithDefaultTimeout(120*time.Second),
-		WithShutdownTimeout(15*time.Second),
-		Resource("whisper", map[string]any{"model_size": modelSize}),
+		pepper.WithDefaultTimeout(120*time.Second),
+		pepper.WithShutdownTimeout(15*time.Second),
+		pepper.Resource("whisper", map[string]any{"model_size": modelSize}),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -465,30 +466,30 @@ func TestRealFullPipeline(t *testing.T) {
 	defer pp.Stop()
 
 	// Stage 1: CPU denoise via Python runtime
-	if err := pp.Register(Script("audio.denoise", denoisePath)); err != nil {
+	if err := pp.Register(pepper.Script("audio.denoise", denoisePath)); err != nil {
 		t.Fatalf("Register audio.denoise: %v", err)
 	}
 
 	// Stage 2: Whisper transcription via Python runtime
-	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
+	if err := pp.Register(pepper.Script("speech.transcribe", transcribePath), pepper.WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register speech.transcribe: %v", err)
 	}
 
 	// Stage 3: LLM response via Ollama HTTP adapter
-	if err := pp.Register(HTTP("chat.respond", "http://localhost:11434").
+	if err := pp.Register(pepper.HTTP("chat.respond", "http://localhost:11434").
 		With(adapter.Ollama).
 		Groups("llm", "default").
 		Timeout(60*time.Second),
-		WithConfig(map[string]any{"model": model}),
+		pepper.WithConfig(map[string]any{"model": model}),
 	); err != nil {
 		t.Fatalf("Use chat.respond: %v", err)
 	}
 
 	// Compose: denoise → transcribe → transform → chat
 	if err := pp.Compose("audio.process",
-		Pipe("audio.denoise").WithGroup("cpu"),
-		Pipe("speech.transcribe").WithGroup("gpu"),
-		Transform(func(in map[string]any) (map[string]any, error) {
+		pepper.Pipe("audio.denoise").WithGroup("cpu"),
+		pepper.Pipe("speech.transcribe").WithGroup("gpu"),
+		pepper.Transform(func(in map[string]any) (map[string]any, error) {
 			text, _ := in["text"].(string)
 			if text == "" {
 				text = "[silence or inaudible audio]"
@@ -498,7 +499,7 @@ func TestRealFullPipeline(t *testing.T) {
 				"prompt": fmt.Sprintf("The user said: %q — respond briefly and helpfully.", text),
 			}, nil
 		}),
-		Pipe("chat.respond").WithGroup("default"),
+		pepper.Pipe("chat.respond").WithGroup("default"),
 	); err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -570,19 +571,19 @@ func TestRealWorkerRecycle(t *testing.T) {
 
 	modelSize := whisperModel()
 
-	pp, err := New(
+	pp, err := pepper.New(
 		// Recycle after 2 requests so we can observe the respawn in this test.
-		WithWorkers(NewWorker("w-recycle").Groups("cpu").MaxRequests(2)),
-		WithDefaultTimeout(60*time.Second),
-		WithShutdownTimeout(10*time.Second),
-		Resource("whisper", map[string]any{"model_size": modelSize}),
+		pepper.WithWorkers(pepper.NewWorker("w-recycle").Groups("cpu").MaxRequests(2)),
+		pepper.WithDefaultTimeout(60*time.Second),
+		pepper.WithShutdownTimeout(10*time.Second),
+		pepper.Resource("whisper", map[string]any{"model_size": modelSize}),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
+	if err := pp.Register(pepper.Script("speech.transcribe", transcribePath), pepper.WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -626,9 +627,9 @@ func TestRealCLIAdapter(t *testing.T) {
 	audioPath := silentWAV(t, 1.0)
 	defer os.Remove(audioPath)
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-probe").Groups("default")),
-		WithShutdownTimeout(5*time.Second),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-probe").Groups("default")),
+		pepper.WithShutdownTimeout(5*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -654,7 +655,7 @@ def run(inputs: dict) -> dict:
 		t.Fatalf("write probe cap: %v", err)
 	}
 
-	if err := pp.Register(Script("audio.probe", probeCapPath)); err != nil {
+	if err := pp.Register(pepper.Script("audio.probe", probeCapPath)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -730,14 +731,14 @@ func TestRealSongAnalysis(t *testing.T) {
 	convertPath := writeCap(t, capDir, "convert.py", mp3ToWAVCapSrc)
 	transcribePath := writeCap(t, capDir, "transcribe.py", transcribeCapSrc)
 
-	pp, err := New(
-		WithWorkers(
-			NewWorker("w-cpu").Groups("cpu", "default"),
-			NewWorker("w-asr").Groups("cpu", "default"), // second worker so convert + transcribe can overlap
+	pp, err := pepper.New(
+		pepper.WithWorkers(
+			pepper.NewWorker("w-cpu").Groups("cpu", "default"),
+			pepper.NewWorker("w-asr").Groups("cpu", "default"), // second worker so convert + transcribe can overlap
 		),
-		WithDefaultTimeout(180*time.Second),
-		WithShutdownTimeout(15*time.Second),
-		WithTracking(true),
+		pepper.WithDefaultTimeout(180*time.Second),
+		pepper.WithShutdownTimeout(15*time.Second),
+		pepper.WithTracking(true),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -745,12 +746,12 @@ func TestRealSongAnalysis(t *testing.T) {
 	defer pp.Stop()
 
 	// Stage 1 — ffmpeg conversion (Python subprocess)
-	if err := pp.Register(Script("audio.convert", convertPath)); err != nil {
+	if err := pp.Register(pepper.Script("audio.convert", convertPath)); err != nil {
 		t.Fatalf("Register audio.convert: %v", err)
 	}
 
 	// Stage 2 — Whisper transcription
-	if err := pp.Register(Script("speech.transcribe", transcribePath), WithConfig(map[string]any{"model_size": modelSize})); err != nil {
+	if err := pp.Register(pepper.Script("speech.transcribe", transcribePath), pepper.WithConfig(map[string]any{"model_size": modelSize})); err != nil {
 		t.Fatalf("Register speech.transcribe: %v", err)
 	}
 
@@ -758,7 +759,7 @@ func TestRealSongAnalysis(t *testing.T) {
 	if useGemini {
 		// Gemini 1.5 Flash via REST — no local GPU needed.
 		apiKey := os.Getenv("PEPPER_GEMINI_KEY")
-		if err := pp.Register(HTTP("song.analyze", "https://generativelanguage.googleapis.com").
+		if err := pp.Register(pepper.HTTP("song.analyze", "https://generativelanguage.googleapis.com").
 			Auth(adapter.APIKey("x-goog-api-key", apiKey)).
 			Timeout(60 * time.Second).
 			Groups("default").
@@ -801,11 +802,11 @@ func TestRealSongAnalysis(t *testing.T) {
 		}
 	} else {
 		// Ollama local model.
-		if err := pp.Register(HTTP("song.analyze", "http://localhost:11434").
+		if err := pp.Register(pepper.HTTP("song.analyze", "http://localhost:11434").
 			With(adapter.Ollama).
 			Groups("default").
 			Timeout(90*time.Second),
-			WithConfig(map[string]any{"model": llmModel}),
+			pepper.WithConfig(map[string]any{"model": llmModel}),
 		); err != nil {
 			t.Fatalf("Use song.analyze (Ollama): %v", err)
 		}
@@ -813,9 +814,9 @@ func TestRealSongAnalysis(t *testing.T) {
 
 	// Compose the four stages.
 	if err := pp.Compose("song.pipeline",
-		Pipe("audio.convert").WithGroup("cpu"),
-		Pipe("speech.transcribe").WithGroup("cpu"),
-		Transform(func(in map[string]any) (map[string]any, error) {
+		pepper.Pipe("audio.convert").WithGroup("cpu"),
+		pepper.Pipe("speech.transcribe").WithGroup("cpu"),
+		pepper.Transform(func(in map[string]any) (map[string]any, error) {
 			transcript, _ := in["text"].(string)
 			language, _ := in["language"].(string)
 			duration, _ := in["duration"].(float64)
@@ -829,7 +830,7 @@ func TestRealSongAnalysis(t *testing.T) {
 				"prompt": buildSongPrompt(transcript),
 			}, nil
 		}),
-		Pipe("song.analyze").WithGroup("default"),
+		pepper.Pipe("song.analyze").WithGroup("default"),
 	); err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -860,7 +861,7 @@ func TestRealSongAnalysis(t *testing.T) {
 	t.Logf("Running pipeline on: %s", mp3Path)
 	p0 := time.Now()
 
-	proc, err := Call[map[string]any]{
+	proc, err := pepper.Call[map[string]any]{
 		Cap:   "song.pipeline",
 		Input: core.In{"audio_path": mp3Path},
 	}.Bind(pp).Execute(doCtx)
@@ -873,11 +874,11 @@ func TestRealSongAnalysis(t *testing.T) {
 	go func() {
 		for event := range proc.Events() {
 			switch event.Status {
-			case StatusRunning:
+			case pepper.StatusRunning:
 				t.Logf("  → stage started  : %-24s worker=%s", event.Stage, event.WorkerID)
-			case StatusDone:
+			case pepper.StatusDone:
 				t.Logf("  ✓ stage done     : %-24s worker=%s duration=%dms", event.Stage, event.WorkerID, event.DurationMs)
-			case StatusFailed:
+			case pepper.StatusFailed:
 				t.Logf("  ✗ stage failed   : %-24s worker=%s duration=%dms error=%s", event.Stage, event.WorkerID, event.DurationMs, event.Error)
 			}
 		}
@@ -936,7 +937,7 @@ func TestRealSongAnalysis(t *testing.T) {
 // workers (Ollama, HTTP) which register synchronously. Python subprocess workers
 // take a few extra seconds to boot, connect, and send cap_ready. Without this
 // wait, Do() races against worker startup and gets ErrNoWorkers.
-func waitForCaps(t *testing.T, pp *Pepper, ctx context.Context, caps ...string) error {
+func waitForCaps(t *testing.T, pp *pepper.Pepper, ctx context.Context, caps ...string) error {
 	t.Helper()
 	for {
 		all := true

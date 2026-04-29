@@ -243,6 +243,25 @@ func (b BoundExec) Do(ctx context.Context) error {
 	return err
 }
 
+// Event is emitted for every stage transition.
+type Event struct {
+	Stage      string
+	WorkerID   string
+	Status     Status
+	DurationMs int64
+	Error      string
+}
+
+// Checkpoint is a point-in-time snapshot of a process.
+type Checkpoint struct {
+	ID          string
+	Cap         string
+	Status      Status
+	PercentDone int
+	Actions     []Event
+	Error       string
+}
+
 // Process is the handle for an asynchronously executing capability or pipeline.
 // Obtained via BoundCall[Out].Execute(ctx).
 //
@@ -263,46 +282,29 @@ type Process[Out any] struct {
 	pp       *Pepper
 }
 
-// ProcessEvent is emitted for every stage transition.
-type ProcessEvent struct {
-	Stage      string
-	WorkerID   string
-	Status     Status
-	DurationMs int64
-	Error      string
-}
-
-// ProcessState is a point-in-time snapshot of a process.
-type ProcessState struct {
-	ID          string
-	Cap         string
-	Status      Status
-	PercentDone int
-	Actions     []ProcessEvent
-	Error       string
-}
-
 func (p *Process[Out]) ID() string { return p.id }
 
-// Events returns a channel that receives one ProcessEvent per stage transition.
+func (p *Process[Out]) OriginID() string { return p.originID }
+
+// Events returns a channel that receives one Event per stage transition.
 // Closed when the process reaches StatusDone or StatusFailed.
-func (p *Process[Out]) Events() <-chan ProcessEvent {
+func (p *Process[Out]) Events() <-chan Event {
 	if p.pp.tracker == nil {
-		ch := make(chan ProcessEvent)
+		ch := make(chan Event)
 		close(ch)
 		return ch
 	}
 	raw := p.pp.tracker.Watch(p.id)
 	if raw == nil {
-		ch := make(chan ProcessEvent)
+		ch := make(chan Event)
 		close(ch)
 		return ch
 	}
-	out := make(chan ProcessEvent, 32)
+	out := make(chan Event, 32)
 	go func() {
 		defer close(out)
 		for a := range raw {
-			out <- ProcessEvent{
+			out <- Event{
 				Stage:      a.Stage,
 				WorkerID:   a.WorkerID,
 				Status:     Status(a.Status),
@@ -329,15 +331,15 @@ func (p *Process[Out]) Wait(ctx context.Context) (Out, error) {
 }
 
 // State returns a point-in-time snapshot without blocking.
-func (p *Process[Out]) State() ProcessState {
+func (p *Process[Out]) State() Checkpoint {
 	if p.pp.tracker == nil {
-		return ProcessState{ID: p.id, Status: StatusPending}
+		return Checkpoint{ID: p.id, Status: StatusPending}
 	}
 	raw, ok := p.pp.tracker.Check(p.id)
 	if !ok {
-		return ProcessState{ID: p.id, Status: StatusPending}
+		return Checkpoint{ID: p.id, Status: StatusPending}
 	}
-	state := ProcessState{
+	state := Checkpoint{
 		ID:          raw.ID,
 		Cap:         raw.Cap,
 		Status:      Status(raw.Status),
@@ -345,7 +347,7 @@ func (p *Process[Out]) State() ProcessState {
 		Error:       raw.Error,
 	}
 	for _, a := range raw.Actions {
-		state.Actions = append(state.Actions, ProcessEvent{
+		state.Actions = append(state.Actions, Event{
 			Stage:      a.Stage,
 			WorkerID:   a.WorkerID,
 			Status:     Status(a.Status),

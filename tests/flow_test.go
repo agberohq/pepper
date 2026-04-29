@@ -1,4 +1,4 @@
-package pepper
+package tests
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agberohq/pepper"
 	"github.com/agberohq/pepper/internal/core"
 	"github.com/olekukonko/ll"
 )
@@ -16,26 +17,26 @@ var (
 
 // TestFlowEchoRoundTrip verifies the full Go→Python→Go request path.
 func TestFlowEchoRoundTrip(t *testing.T) {
-	if !pythonAvailable() {
+	if !runtimeFinder.HasPython() {
 		t.Skip("python3 not available")
 	}
-	if !msgpackAvailable() {
+	if !runtimeFinder.HasPythonMsgpack() {
 		t.Skip("pip install msgpack required")
 	}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-test-1").Groups("default")),
-		WithCodec(CodecMsgPack),
-		WithTransport(TransportTCPLoopback),
-		WithShutdownTimeout(3*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-test-1").Groups("default")),
+		pepper.WithCodec(pepper.CodecMsgPack),
+		pepper.WithTransport(pepper.TransportTCPLoopback),
+		pepper.WithShutdownTimeout(3*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Script("echo", "./testdata/caps/echo.py")); err != nil {
+	if err := pp.Register(pepper.Script("echo", "./testdata/caps/echo.py")); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -67,24 +68,24 @@ func TestFlowEchoRoundTrip(t *testing.T) {
 
 // TestFlowTypedDo verifies the generic Do[O] free function compiles and decodes.
 func TestFlowTypedDo(t *testing.T) {
-	if !pythonAvailable() {
+	if !runtimeFinder.HasPython() {
 		t.Skip("python3 not available")
 	}
-	if !msgpackAvailable() {
+	if !runtimeFinder.HasPythonMsgpack() {
 		t.Skip("pip install msgpack required")
 	}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-typed").Groups("default")),
-		WithShutdownTimeout(3*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-typed").Groups("default")),
+		pepper.WithShutdownTimeout(3*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Script("echo", "./testdata/caps/echo.py")); err != nil {
+	if err := pp.Register(pepper.Script("echo", "./testdata/caps/echo.py")); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -101,7 +102,7 @@ func TestFlowTypedDo(t *testing.T) {
 	type EchoResult struct {
 		Msg string `msgpack:"msg"`
 	}
-	out, err := Do[EchoResult](doCtx, pp, "echo", core.In{"msg": "typed"})
+	out, err := pepper.Do[EchoResult](doCtx, pp, "echo", core.In{"msg": "typed"})
 	if err != nil {
 		t.Fatalf("Do[EchoResult]: %v", err)
 	}
@@ -121,17 +122,17 @@ func TestFlowGoFuncCallTyped(t *testing.T) {
 		Text string `json:"text"`
 	}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-gofunc").Groups("default")),
-		WithShutdownTimeout(2*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-gofunc").Groups("default")),
+		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Func("text.upper",
+	if err := pp.Register(pepper.Func("text.upper",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
 			return TextOut{Text: strings.ToUpper(in.Text)}, nil
 		},
@@ -146,7 +147,7 @@ func TestFlowGoFuncCallTyped(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	out, err := Call[TextOut]{
+	out, err := pepper.Call[TextOut]{
 		Cap:   "text.upper",
 		Input: TextIn{Text: "hello flow"},
 	}.Bind(pp).Do(ctx)
@@ -168,18 +169,18 @@ func TestFlowExecuteProcess(t *testing.T) {
 		Text string `json:"text"`
 	}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-proc").Groups("default")),
-		WithTracking(true),
-		WithShutdownTimeout(2*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-proc").Groups("default")),
+		pepper.WithTracking(true),
+		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Func("text.reverse",
+	if err := pp.Register(pepper.Func("text.reverse",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
 			r := []rune(in.Text)
 			for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
@@ -198,7 +199,7 @@ func TestFlowExecuteProcess(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	proc, err := Call[TextOut]{
+	proc, err := pepper.Call[TextOut]{
 		Cap:   "text.reverse",
 		Input: TextIn{Text: "pepper"},
 	}.Bind(pp).Execute(ctx)
@@ -209,12 +210,12 @@ func TestFlowExecuteProcess(t *testing.T) {
 		t.Fatal("expected non-empty process ID")
 	}
 	// originID must be threaded through (not empty)
-	if proc.originID == "" {
+	if proc.OriginID() == "" {
 		t.Fatal("Process.originID must be non-empty — needed for Cancel()")
 	}
 
 	// Drain events in background
-	events := make([]ProcessEvent, 0)
+	events := make([]pepper.Event, 0)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -234,7 +235,7 @@ func TestFlowExecuteProcess(t *testing.T) {
 	}
 
 	state := proc.State()
-	if state.Status != StatusDone {
+	if state.Status != pepper.StatusDone {
 		t.Fatalf("expected StatusDone, got %s", state.Status)
 	}
 	t.Logf("Execute + Process.Wait ok — text=%s events=%d", out.Text, len(events))
@@ -245,18 +246,18 @@ func TestFlowExecuteProcess(t *testing.T) {
 func TestFlowProcessWaitNoPoll(t *testing.T) {
 	type Void struct{}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-fast").Groups("default")),
-		WithTracking(true),
-		WithShutdownTimeout(2*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-fast").Groups("default")),
+		pepper.WithTracking(true),
+		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Func("noop",
+	if err := pp.Register(pepper.Func("noop",
 		func(ctx context.Context, in Void) (Void, error) {
 			return Void{}, nil
 		},
@@ -272,7 +273,7 @@ func TestFlowProcessWaitNoPoll(t *testing.T) {
 	}
 
 	start := time.Now()
-	proc, err := Call[Void]{Cap: "noop", Input: Void{}}.Bind(pp).Execute(ctx)
+	proc, err := pepper.Call[Void]{Cap: "noop", Input: Void{}}.Bind(pp).Execute(ctx)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -298,17 +299,17 @@ func TestFlowAllParallel(t *testing.T) {
 		Text string `json:"text"`
 	}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-all").Groups("default")),
-		WithShutdownTimeout(2*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-all").Groups("default")),
+		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Func("text.upper",
+	if err := pp.Register(pepper.Func("text.upper",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
 			return TextOut{Text: strings.ToUpper(in.Text)}, nil
 		},
@@ -324,12 +325,12 @@ func TestFlowAllParallel(t *testing.T) {
 	}
 
 	inputs := []string{"alpha", "beta", "gamma"}
-	calls := make([]CallArgs, len(inputs))
+	calls := make([]pepper.CallArgs, len(inputs))
 	for i, s := range inputs {
-		calls[i] = MakeCall("text.upper", In{"text": s})
+		calls[i] = pepper.MakeCall("text.upper", pepper.In{"text": s})
 	}
 
-	results, err := All[TextOut](ctx, pp, calls...)
+	results, err := pepper.All[TextOut](ctx, pp, calls...)
 	if err != nil {
 		t.Fatalf("All[TextOut]: %v", err)
 	}
@@ -364,24 +365,24 @@ func TestFlowPipelineWithGoFunc(t *testing.T) {
 		Text string `json:"text"`
 	}
 
-	pp, err := New(
-		WithWorkers(NewWorker("w-pipe").Groups("default")),
-		WithShutdownTimeout(2*time.Second),
-		WithLogger(testLogger),
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("w-pipe").Groups("default")),
+		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer pp.Stop()
 
-	if err := pp.Register(Func("text.upper",
+	if err := pp.Register(pepper.Func("text.upper",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
 			return TextOut{Text: strings.ToUpper(in.Text)}, nil
 		},
 	)); err != nil {
 		t.Fatalf("Register upper: %v", err)
 	}
-	if err := pp.Register(Func("text.exclaim",
+	if err := pp.Register(pepper.Func("text.exclaim",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
 			return TextOut{Text: in.Text + "!"}, nil
 		},
@@ -390,12 +391,12 @@ func TestFlowPipelineWithGoFunc(t *testing.T) {
 	}
 
 	if err := pp.Compose("text.shout",
-		Pipe("text.upper"),
-		Transform(func(in map[string]any) (map[string]any, error) {
+		pepper.Pipe("text.upper"),
+		pepper.Transform(func(in map[string]any) (map[string]any, error) {
 			// Pass through unchanged — just verifying PipeTransform in the chain
 			return in, nil
 		}),
-		Pipe("text.exclaim"),
+		pepper.Pipe("text.exclaim"),
 	); err != nil {
 		t.Fatalf("Compose: %v", err)
 	}
@@ -407,7 +408,7 @@ func TestFlowPipelineWithGoFunc(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	out, err := Call[TextOut]{
+	out, err := pepper.Call[TextOut]{
 		Cap:   "text.shout",
 		Input: TextIn{Text: "hello"},
 	}.Bind(pp).Do(ctx)

@@ -6,7 +6,7 @@
 // Run with:
 //
 //	go test -v -run TestClusterDiag -count=1 -timeout 60s .
-package pepper
+package tests
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agberohq/pepper"
 	"github.com/agberohq/pepper/internal/coord"
 	"github.com/agberohq/pepper/internal/core"
 )
@@ -34,13 +35,13 @@ func TestClusterDiag_WorkerHelloIsFannedOutToBothNodes(t *testing.T) {
 
 	// Two independent Pepper nodes sharing one coord store — mirrors the
 	// real cluster test exactly.
-	nodeA, err := New(WithCoord(store), WithTransportURL("mem://a"), WithShutdownTimeout(2*time.Second))
+	nodeA, err := pepper.New(pepper.WithCoord(store), pepper.WithTransportURL("mem://a"), pepper.WithShutdownTimeout(2*time.Second))
 	if err != nil {
 		t.Fatalf("nodeA: %v", err)
 	}
 	defer nodeA.Stop()
 
-	nodeB, err := New(WithCoord(store), WithTransportURL("mem://b"), WithShutdownTimeout(2*time.Second))
+	nodeB, err := pepper.New(pepper.WithCoord(store), pepper.WithTransportURL("mem://b"), pepper.WithShutdownTimeout(2*time.Second))
 	if err != nil {
 		t.Fatalf("nodeB: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestClusterDiag_DistributedModeSilentlyAcceptsUnregisteredCap(t *testing.T)
 	// Two nodes, neither has the cap registered, neither has workers.
 	// This is deliberate: we want to see what happens when Do() is called on
 	// a cap that has no workers in distributed mode.
-	node, err := New(WithCoord(store), WithTransportURL("mem://x"), WithShutdownTimeout(2*time.Second))
+	node, err := pepper.New(pepper.WithCoord(store), pepper.WithTransportURL("mem://x"), pepper.WithShutdownTimeout(2*time.Second))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -382,21 +383,21 @@ func TestClusterDiag_NodeBRegistersNodeAsWorkersViaFannedOutHellos(t *testing.T)
 	defer store.Close()
 
 	// nodeA has a real worker registered; nodeB has none.
-	nodeA, err := New(
-		WithWorkers(NewWorker("real-w1").Groups("default")),
-		WithCoord(store),
-		WithTransportURL("mem://a"),
-		WithShutdownTimeout(2*time.Second),
+	nodeA, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("real-w1").Groups("default")),
+		pepper.WithCoord(store),
+		pepper.WithTransportURL("mem://a"),
+		pepper.WithShutdownTimeout(2*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("nodeA: %v", err)
 	}
 	defer nodeA.Stop()
 
-	nodeB, err := New(
-		WithCoord(store),
-		WithTransportURL("mem://b"),
-		WithShutdownTimeout(2*time.Second),
+	nodeB, err := pepper.New(
+		pepper.WithCoord(store),
+		pepper.WithTransportURL("mem://b"),
+		pepper.WithShutdownTimeout(2*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("nodeB: %v", err)

@@ -76,6 +76,45 @@ func (f *RuntimeFinder) Runtime(specs []*registry.Spec) string {
 	return ""
 }
 
+// HasPython checks if a Python interpreter is available on the system
+func (f *RuntimeFinder) HasPython() bool {
+	python := f.Python()
+	if python == "" {
+		return false
+	}
+
+	// Verify Python actually works
+	return exec.Command(python, "--version").Run() == nil
+}
+
+// HasPythonMsgpack checks if the Python interpreter has msgpack available
+func (f *RuntimeFinder) HasPythonMsgpack() bool {
+	python := f.Python()
+	return exec.Command(python, "-c", "import msgpack").Run() == nil
+}
+
+// HasPythonRedis checks if Python has redis client library available
+func (f *RuntimeFinder) HasPythonRedis() bool {
+	python := f.Python()
+	if python == "" {
+		return false
+	}
+
+	// Check if redis-py is installed
+	return exec.Command(python, "-c", "import redis").Run() == nil
+}
+
+// HasPythonNats checks if Python has nats client library available
+func (f *RuntimeFinder) HasPythonNats() bool {
+	python := f.Python()
+	if python == "" {
+		return false
+	}
+
+	// Check if nats-py is installed
+	return exec.Command(python, "-c", "import nats").Run() == nil
+}
+
 // ClearCache forces re-scanning on next call
 func (f *RuntimeFinder) ClearCache() {
 	f.cache.Store((*string)(nil))

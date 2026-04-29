@@ -1,117 +1,111 @@
 """
-transport.py — Pepper Python worker bus transport.
+Pepper bus transport layer.
 
-One file, three backends:
+Three backends:
   mula  — raw TCP framing (Pepper's custom protocol, no library available)
   redis — redis-py (RESP handled by the library)
-  nats  — nats-py (core NATS + JetStream handled by the library)
+  nats  — nats-py (JetStream push consumers for pepper.push.* work queues;
+          core NATS subscribe for control/broadcast channels)
 
-The Go side defines the Store interface; this is the Python equivalent.
+The NATS backend uses JetStream queue-group push consumers for pepper.push.*
+because coord/nats.go Push() uses js.Publish(), which lands messages in the
+"pepper-work" JetStream stream. A plain nc.subscribe() would never see those
+messages — JetStream intercepts them. Queue-group push consumers load-balance
+work across all worker instances while retaining at-least-once delivery
+semantics (each message is ACKed after the capability executes).
 """
-from __future__ import annotations
+
+SEND_TIMEOUT_S: float = 5.0  # socket send timeout used by Mula and Redis transports
 
 import asyncio
-import json
-import logging
+import os
 import queue
 import socket
 import sys
 import threading
 import time
-import uuid
-from typing import Callable
 
-log = logging.getLogger("pepper.transport")
-
-SEND_TIMEOUT_S: float = 5.0
+log = __import__("logging").getLogger("pepper.transport")
 
 class BusTransport:
-    """Pluggable bus transport. Scheme in PEPPER_BUS_URL selects backend."""
+    """Unified transport façade. Selects backend from PEPPER_BUS_URL."""
 
     SUPPORTED = ("mula", "tcp", "redis", "nats")
 
     def __init__(self, url: str) -> None:
-        self.url = url.strip()
+        self.url = url
         self.scheme, self.host, self.port = self._parse(self.url)
-        self._impl: _TransportImpl | None = None
+        self._impl: "_TransportImpl" = self._make()
 
-    @staticmethod
-    def _parse(url: str) -> tuple[str, str, int]:
+    def _parse(self, url: str):
         if "://" not in url:
-            host, _, port = url.rpartition(":")
+            host, _, port = url.partition(":")
             return "mula", host or "127.0.0.1", int(port) if port else 7731
         scheme, rest = url.split("://", 1)
         scheme = scheme.lower()
-        if ":" in rest:
-            host, _, port_str = rest.rpartition(":")
-            port = int(port_str)
-        else:
-            host, port = rest, _default_port(scheme)
+        host, _, port_str = rest.partition(":")
+        try:
+            port = int(port_str) if port_str else _default_port(scheme)
+        except ValueError:
+            port = _default_port(scheme)
         return scheme, host or "127.0.0.1", port
 
-    def connect(self, retries: int = 10) -> None:
+    def _make(self) -> "_TransportImpl":
         if self.scheme in ("mula", "tcp"):
-            self._impl = _MulaTransport(self.host, self.port)
+            return _MulaTransport(self.host, self.port)
         elif self.scheme == "redis":
-            self._impl = _RedisTransport(self.host, self.port)
+            return _RedisTransport(self.host, self.port)
         elif self.scheme == "nats":
-            self._impl = _NATSTransport(self.host, self.port)
+            return _NATSTransport(self.host, self.port)
         else:
-            raise NotImplementedError(f"unsupported bus scheme: {self.scheme!r}")
-        self._impl.connect(retries)
+            return _UnknownTransport(self.scheme)
+
+    def connect(self, retries: int = 10) -> None:
+        self._impl.connect(retries=retries)
         log.info("bus connected [scheme=%s addr=%s:%s]", self.scheme, self.host, self.port)
 
+    @property
+    def raw_conn(self):
+        return getattr(self._impl, "_conn", None)
+
+    def subscribe(self, topics: list[str]) -> None:
+        self._impl.subscribe(topics)
+
     def send_frame(self, data: bytes) -> None:
-        assert self._impl is not None, "not connected"
         self._impl.send_frame(data)
 
     def recv_frame(self) -> bytes | None:
-        assert self._impl is not None, "not connected"
         return self._impl.recv_frame()
 
-    def subscribe(self, topics: list[str]) -> None:
-        if self._impl is not None:
-            self._impl.subscribe(topics)
-
-    @property
-    def raw_conn(self) -> socket.socket | None:
-        if isinstance(self._impl, _MulaTransport):
-            return self._impl._conn
-        return None
-
     def close(self) -> None:
-        if self._impl:
-            self._impl.close()
-            self._impl = None
+        self._impl.close()
 
 def _default_port(scheme: str) -> int:
     return {"redis": 6379, "nats": 4222, "mula": 7731, "tcp": 7731}.get(scheme, 7731)
 
+# abstract base
+
 class _TransportImpl:
-    def connect(self, retries: int) -> None: ...
+    def connect(self, retries: int = 10) -> None: ...
+    def subscribe(self, topics: list[str]) -> None: ...
     def send_frame(self, data: bytes) -> None: ...
     def recv_frame(self) -> bytes | None: ...
-    def subscribe(self, topics: list[str]) -> None: ...
     def close(self) -> None: ...
 
-# Mula (raw TCP — no library exists)
+# Mula (raw TCP)
 
 class _MulaTransport(_TransportImpl):
-    """Pepper's custom TCP transport. Frame: 4-byte BE length + payload."""
-
     def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = port
         self._conn: socket.socket | None = None
-        self._send_lock = threading.Lock()
 
     def connect(self, retries: int = 10) -> None:
         for attempt in range(retries):
             try:
-                conn = socket.create_connection((self._host, self._port), timeout=5)
-                conn.settimeout(None)
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self._conn = conn
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect((self._host, self._port))
+                self._conn = s
                 return
             except OSError as exc:
                 log.debug("mula connect attempt %d failed: %s", attempt + 1, exc)
@@ -120,23 +114,24 @@ class _MulaTransport(_TransportImpl):
         sys.exit(1)
 
     def subscribe(self, topics: list[str]) -> None:
-        self.send_frame("|".join(topics).encode("utf-8"))
+        frame = "|".join(topics).encode("utf-8")
+        self.send_frame(frame)
 
     def send_frame(self, data: bytes) -> None:
-        assert self._conn is not None
-        with self._send_lock:
-            self._conn.sendall(len(data).to_bytes(4, "big") + data)
+        if self._conn is None:
+            return
+        length = len(data).to_bytes(4, "big")
+        try:
+            self._conn.sendall(length + data)
+        except OSError as exc:
+            log.warning("mula: send failed: %s", exc)
 
     def recv_frame(self) -> bytes | None:
-        hdr = _recv_exact(self._conn, 4)
-        if hdr is None:
+        header = _recv_exact(self._conn, 4)
+        if header is None:
             raise ConnectionResetError("mula: router closed connection")
-        size = int.from_bytes(hdr, "big")
-        if size == 0:
-            return None
-        if size > 64 * 1024 * 1024:
-            raise ValueError(f"mula: frame too large: {size} bytes")
-        return _recv_exact(self._conn, size)
+        n = int.from_bytes(header, "big")
+        return _recv_exact(self._conn, n)
 
     def close(self) -> None:
         if self._conn:
@@ -144,13 +139,18 @@ class _MulaTransport(_TransportImpl):
                 self._conn.close()
             except OSError:
                 pass
-            self._conn = None
 
-# Redis (redis-py)
+class _UnknownTransport(_TransportImpl):
+    """Placeholder for unsupported schemes — raises NotImplementedError on connect()."""
+    def __init__(self, scheme: str) -> None:
+        self._scheme = scheme
+
+    def connect(self, retries: int = 10) -> None:
+        raise NotImplementedError(f"unsupported bus scheme: {self._scheme!r}")
+
+# Redis
 
 class _RedisTransport(_TransportImpl):
-    """Redis transport backed by redis-py. Thread-safe, connection-pooled."""
-
     def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = port
@@ -207,12 +207,25 @@ class _RedisTransport(_TransportImpl):
 
     def _brpop_loop(self, ready: threading.Event) -> None:
         ready.set()
+        log.debug("redis: brpop loop started [queues=%s]", self._queues)
+        dequeued = 0
+        timeouts = 0
         while not self._stop.is_set():
             try:
                 assert self._brpop_client
                 result = self._brpop_client.brpop(self._queues, timeout=2)
                 if result is not None and len(result) == 2:
+                    dequeued += 1
+                    timeouts = 0  # reset timeout counter on success
+                    queue_name = result[0].decode() if isinstance(result[0], bytes) else result[0]
+                    log.info("redis: brpop dequeued item #%d [queue=%s size=%d]",
+                             dequeued, queue_name, len(result[1]))
                     self._enqueue(result[1])
+                else:
+                    timeouts += 1
+                    if timeouts <= 5:  # log first few timeouts to see if loop is alive
+                        log.info("redis: brpop timeout #%d (no items, queues=%s)",
+                                 timeouts, self._queues)
             except Exception as exc:
                 if not self._stop.is_set():
                     log.warning("redis: brpop error: %s — retrying", exc)
@@ -248,14 +261,31 @@ class _RedisTransport(_TransportImpl):
         while not self._stop.is_set():
             try:
                 self._inbox.put(_wrap_payload(data), timeout=1)
+                log.debug("redis: enqueued to inbox [inbox_size=%d]", self._inbox.qsize())
                 return
             except queue.Full:
+                log.warning("redis: inbox full — retrying")
                 continue
+        log.warning("redis: _enqueue exited early due to _stop (item lost!)")
 
 # NATS (nats-py)
 
 class _NATSTransport(_TransportImpl):
-    """NATS transport backed by nats-py. Asyncio bridge for JetStream pull."""
+    """NATS transport backed by nats-py.
+
+    Work queues (pepper.push.*):
+        Uses JetStream queue-group push consumers. Go's coord/nats.Push() calls
+        js.Publish(), which lands the message in the "pepper-work" JetStream
+        stream. A plain nc.subscribe() would never see those messages because
+        JetStream intercepts publishes to matching stream subjects. Queue-group
+        push consumers distribute work across worker instances with ACK-based
+        at-least-once delivery (matching the workqueue retention policy on the
+        stream).
+
+    Control/broadcast channels (everything else):
+        Uses plain nc.subscribe() — these are core NATS pub/sub topics that
+        Go publishes via nc.Publish(), not through JetStream.
+    """
 
     def __init__(self, host: str, port: int) -> None:
         self._url = f"nats://{host}:{port}"
@@ -265,14 +295,8 @@ class _NATSTransport(_TransportImpl):
         self._js: "nats.js.JetStreamContext" | None = None
         self._inbox: queue.Queue[bytes] = queue.Queue(maxsize=512)
         self._stop = threading.Event()
-        self._push_topics: list[str] = []
-        self._other_topics: list[str] = []
-        self._subs: list = []
-        # Unique suffix so every transport instance gets its own durable
-        # consumer. NATS work-queue retention then distributes messages
-        # across instances (queue-group behaviour).
-        self._instance_id = uuid.uuid4().hex[:6]
-        self._consumer_names: list[str] = []
+        self._subs: list = []                    # all subscriptions (core + JetStream)
+        self._js_push_subs: list = []            # JetStream push sub handles for close()
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -299,115 +323,82 @@ class _NATSTransport(_TransportImpl):
         sys.exit(1)
 
     def subscribe(self, topics: list[str]) -> None:
-        import nats.js.api as jsapi
+        push_topics = [t for t in topics if t.startswith("pepper.push.")]
+        core_topics = [t for t in topics if not t.startswith("pepper.push.")]
 
-        push = [t for t in topics if t.startswith("pepper.push.")]
-        other = [t for t in topics if not t.startswith("pepper.push.")]
-        self._push_topics = push
-        self._other_topics = other
-
-        async def _ensure_stream() -> None:
-            assert self._js
-            try:
-                await self._js.add_stream(jsapi.StreamConfig(
-                    name="pepper-work",
-                    subjects=["pepper.push.>"],
-                    retention="workqueue",
-                    storage="file",
-                ))
-            except Exception:
-                pass  # already exists
-
-        self._run(_ensure_stream())
-
-        for subject in push:
-            ready = threading.Event()
-            asyncio.run_coroutine_threadsafe(self._jspull_coro(subject, ready), self._loop)
-            if not ready.wait(timeout=15.0):
-                log.warning("nats: jspull not ready in 15 s [subject=%s]", subject)
-
-        for subject in other:
-            sub = self._run(self._nc.subscribe(subject, cb=self._on_core_message_async))
+        # Core NATS subscribe for control/broadcast channels.
+        # Go publishes these via nc.Publish() (not JetStream), so plain SUB works.
+        for subject in core_topics:
+            sub = self._run(self._nc.subscribe(subject, cb=self._on_core_msg))
             self._subs.append(sub)
 
-    async def _on_core_message_async(self, msg) -> None:
-        """Async callback required by nats-py for subscriptions."""
-        self._enqueue(msg.data)
+        # JetStream queue-group push consumers for work queues.
+        # Go publishes requests via js.Publish() → "pepper-work" stream.
+        # Queue group = subject name (sanitised) so multiple worker instances
+        # load-balance; each message goes to exactly one worker.
+        for subject in push_topics:
+            ready = threading.Event()
+            asyncio.run_coroutine_threadsafe(
+                self._js_push_subscribe(subject, ready), self._loop
+            )
+            if not ready.wait(timeout=15.0):
+                log.warning("nats: js push consumer not ready in 15 s [subject=%s]", subject)
 
-    async def _jspull_coro(self, subject: str, ready: threading.Event) -> None:
-        import nats.js.api as jsapi
-
+    async def _js_push_subscribe(self, subject: str, ready: threading.Event) -> None:
+        """Create a durable JetStream queue-group push consumer for subject."""
         assert self._js
-        # Each transport instance gets a unique consumer so that multiple
-        # workers can drain the same subject in parallel (queue-group
-        # behaviour via work-queue retention).
-        cname = f"{_js_consumer_name(subject)}-{self._instance_id}"
-        self._consumer_names.append(cname)
+        # Ephemeral JetStream push consumer with queue group.
+        # - No durable name: ephemeral consumers are auto-cleaned up when all
+        # subscribers disconnect, avoiding leftover consumer state between test runs.
+        # - queue= enables load balancing: NATS delivers each message to exactly
+        # one subscriber in the group (queue-group semantics).
+        # - durable + queue is rejected by NATS when the consumer was previously
+        # created without a deliver group, so we keep it ephemeral.
+        queue_group = _js_consumer_name(subject)
 
         sub = None
         try:
             for attempt in range(3):
                 try:
-                    # Create consumer and bind in one call.  The explicit
-                    # add_consumer + pull_subscribe sequence we used before
-                    # raced when two transports started concurrently.
                     sub = await asyncio.wait_for(
-                        self._js.pull_subscribe(
+                        self._js.subscribe(
                             subject,
-                            durable=cname,
+                            queue=queue_group,
                             stream="pepper-work",
-                            config=jsapi.ConsumerConfig(
-                                durable_name=cname,
-                                filter_subject=subject,
-                                ack_policy="explicit",
-                                deliver_policy="all",
-                                max_ack_pending=1,
-                                ack_wait=30.0,
-                                max_deliver=5,
-                            ),
+                            manual_ack=True,
+                            cb=self._on_js_msg,
                         ),
-                        timeout=5.0,
+                        timeout=10.0,
                     )
-                    log.info("nats: jspull ready [subject=%s consumer=%s]", subject, cname)
+                    log.info(
+                        "nats: js push consumer ready [subject=%s queue=%s]",
+                        subject, queue_group,
+                    )
+                    self._js_push_subs.append(sub)
                     break
                 except Exception as exc:
-                    err = str(exc).lower()
-                    # If the consumer already exists (unclean prior test run)
-                    # try binding without the config object.
-                    if "already exists" in err or "consumer name already in use" in err:
-                        try:
-                            sub = await asyncio.wait_for(
-                                self._js.pull_subscribe(subject, durable=cname,
-                                                        stream="pepper-work"),
-                                timeout=5.0,
-                            )
-                            log.info("nats: jspull bound to existing consumer [subject=%s consumer=%s]", subject, cname)
-                            break
-                        except Exception as exc2:
-                            log.debug("nats: bind fallback failed [subject=%s]: %s", subject, exc2)
-                    log.debug("nats: pull_subscribe attempt %d failed [subject=%s]: %s", attempt + 1, subject, exc)
+                    log.warning(
+                        "nats: js subscribe attempt %d failed [subject=%s]: %s",
+                        attempt + 1, subject, exc,
+                    )
                     if attempt < 2:
                         await asyncio.sleep(0.5)
+            else:
+                log.error("nats: js push consumer failed after 3 attempts [subject=%s]", subject)
         finally:
-            # Always signal readiness so subscribe() never hangs indefinitely.
             ready.set()
 
-        if sub is None:
-            log.error("nats: pull_subscribe failed after 3 attempts [subject=%s]", subject)
-            return
+    async def _on_js_msg(self, msg) -> None:
+        """Callback for JetStream push consumer messages."""
+        self._enqueue(msg.data)
+        try:
+            await msg.ack()
+        except Exception as exc:
+            log.debug("nats: ack failed: %s", exc)
 
-        while not self._stop.is_set():
-            try:
-                msgs = await sub.fetch(batch=1, timeout=2.5)
-                for msg in msgs:
-                    self._enqueue(msg.data)
-                    await msg.ack()
-            except asyncio.TimeoutError:
-                continue
-            except Exception as exc:
-                if not self._stop.is_set():
-                    log.warning("nats: jspull error: %s [subject=%s] — retrying", exc, subject)
-                    await asyncio.sleep(0.5)
+    async def _on_core_msg(self, msg) -> None:
+        """Callback for core NATS subscribe messages."""
+        self._enqueue(msg.data)
 
     def send_frame(self, data: bytes) -> None:
         topic, payload = _unwrap_frame(data)
@@ -426,14 +417,13 @@ class _NATSTransport(_TransportImpl):
 
     def close(self) -> None:
         self._stop.set()
-        # Delete durable consumers so repeated test runs don't exhaust
-        # the JetStream consumer limit on the pepper-work stream.
-        if self._js:
-            for cname in self._consumer_names:
-                try:
-                    self._run(self._js.delete_consumer("pepper-work", cname))
-                except Exception:
-                    pass
+        # Drain JetStream push subscriptions.
+        for sub in self._js_push_subs:
+            try:
+                self._run(sub.drain())
+            except Exception:
+                pass
+        # Unsubscribe core subs.
         for sub in self._subs:
             try:
                 self._run(sub.unsubscribe())
@@ -451,9 +441,12 @@ class _NATSTransport(_TransportImpl):
         while not self._stop.is_set():
             try:
                 self._inbox.put(_wrap_payload(data), timeout=1)
+                log.debug("redis: enqueued to inbox [inbox_size=%d]", self._inbox.qsize())
                 return
             except queue.Full:
+                log.warning("redis: inbox full — retrying")
                 continue
+        log.warning("redis: _enqueue exited early due to _stop (item lost!)")
 
 # Shared helpers
 
@@ -506,7 +499,7 @@ def _resp_cmd(*args: str | bytes) -> bytes:
 class _BufReader:
     """Buffered line reader over a raw socket for RESP parsing."""
 
-    def __init__(self, conn: socket.socket) -> None:
+    def __init__(self, conn) -> None:
         self._conn = conn
         self._buf = bytearray()
 

@@ -41,18 +41,20 @@ func NewNATS(url string) (Store, error) {
 		}
 	}
 
-	_, err = js.AddStream(&nats.StreamConfig{
+	// Delete and recreate the work stream to purge any stale durable consumers
+	// left by previous runs. Stale consumers that were created without a deliver
+	// group prevent new queue-group push subscriptions from succeeding.
+	// Recreating the stream is simpler than enumerating consumers and handles
+	// all nats.go API versions without type assertions.
+	_ = js.DeleteStream(natsWorkStream)
+	if _, err = js.AddStream(&nats.StreamConfig{
 		Name:      natsWorkStream,
 		Subjects:  []string{"pepper.push.>"},
 		Retention: nats.WorkQueuePolicy,
 		Storage:   nats.FileStorage,
-	})
-	if err != nil && !isNATSAlreadyExists(err) {
-		_, err2 := js.StreamInfo(natsWorkStream)
-		if err2 != nil {
-			nc.Close()
-			return nil, fmt.Errorf("coord/nats: work stream: %w", err)
-		}
+	}); err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("coord/nats: recreate work stream: %w", err)
 	}
 
 	return &natsStore{

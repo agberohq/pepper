@@ -203,7 +203,10 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 			}
 		}
 
-		bootTimeout := p.cfg.DefaultTimeout
+		bootTimeout := p.cfg.BootTimeout
+		if bootTimeout <= 0 {
+			bootTimeout = p.cfg.DefaultTimeout
+		}
 		if bootTimeout <= 0 {
 			bootTimeout = DefaultShutdownTimeout
 		}

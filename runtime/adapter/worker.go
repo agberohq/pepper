@@ -42,6 +42,12 @@ func NewBusWorker(
 	c codec.Codec,
 	log *ll.Logger,
 ) *BusWorker {
+
+	if a == nil {
+		log.Fields("cap", capName).Warn("adapter is nil — using no-op adapter")
+		a = &noopAdapter{}
+	}
+
 	return &BusWorker{
 		id:        workerID,
 		capName:   capName,

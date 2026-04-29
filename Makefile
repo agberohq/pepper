@@ -77,6 +77,23 @@ go-test-unit:
 # Absolute path to the venv python3 — used to prepend PATH for real tests.
 VENV_PYTHON_DIR := $(abspath $(VENV)/bin)
 
+
+# Smoke: Python subprocess + bus round-trip only. No model, no GPU.
+go-real-nomic:
+	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
+		-run "^TestNomic" \
+		-timeout 300s \
+		./tests/...
+
+go-real-nomic-bench:
+	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -bench=BenchmarkNomic \
+		-run=^$ \
+		-benchmem \
+		-benchtime=10s \
+		-count=2 \
+		-timeout 300s \
+		./tests/...
+
 # Smoke: Python subprocess + bus round-trip only. No model, no GPU.
 go-real-smoke:
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
@@ -128,7 +145,7 @@ go-real-song:
 	@if [ -n "$(PEPPER_GEMINI_KEY)" ]; then echo "LLM backend   : Gemini"; 	  else echo "LLM backend   : Ollama ($${PEPPER_OLLAMA_MODEL:-auto-detect})"; fi
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealSongAnalysis \
-		-timeout 240s .
+		-timeout 240s ./tests/...
 
 # Run all real tests in dependency order.
 # Each test skips individually if its requirements aren't met.
@@ -167,13 +184,13 @@ go-real-cluster-redis:
 	@echo "Cluster backend : Redis ($(PEPPER_TEST_REDIS_HOST):$(PEPPER_TEST_REDIS_PORT))"
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealClusterRedis \
-		-timeout 240s .
+		-timeout 240s ./tests/...
 
 go-real-cluster-nats:
 	@echo "Cluster backend : NATS ($(PEPPER_TEST_NATS_HOST):$(PEPPER_TEST_NATS_PORT))"
 	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
 		-run TestRealClusterNATS \
-		-timeout 240s .
+		-timeout 240s ./tests/...
 
 go-real-cluster: go-real-cluster-redis go-real-cluster-nats
 
@@ -198,6 +215,8 @@ $(VENV)/bin/pytest: $(PYTHON_DIR)/pyproject.toml
 # Run this once before make go-real-whisper / go-real-song / go-real-pipeline.
 python-setup-real: python-setup
 	$(PIP) install faster-whisper
+	$(PIP) install msgpack
+	$(PIP) install nomic
 
 # ─── Both ─────────────────────────────────────────────────────────────────────
 test: go-test python-test

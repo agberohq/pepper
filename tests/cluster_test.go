@@ -173,6 +173,7 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 		pepper.WithCoord(coordA),
 		pepper.WithTransportURL(coordURL),
 		pepper.WithShutdownTimeout(10*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		flush.Close()
@@ -186,6 +187,7 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 		pepper.WithCoord(coordB),
 		pepper.WithTransportURL(coordURL),
 		pepper.WithShutdownTimeout(10*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		nodeA.Stop()

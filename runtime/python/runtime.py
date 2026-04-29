@@ -629,10 +629,17 @@ class Worker:
             if msg_type == "cap_load":
                 self._handle_cap_load(env)
             elif msg_type == "req":
-                log.debug("req received [cap=%s corr_id=%s worker=%s hop=%s]",
-                          env.get("cap", ""), env.get("corr_id", ""),
+                self._msgs_received = getattr(self, "_msgs_received", 0) + 1
+                log.info("req received #%d [cap=%s corr_id=%s worker=%s hop=%s]",
+                          self._msgs_received, env.get("cap", ""), env.get("corr_id", ""),
                           self.worker_id, env.get("hop", 0))
-                self.executor.submit(self._handle_request_and_reply, env)
+                fut = self.executor.submit(self._handle_request_and_reply, env)
+                # Surface any uncaught exceptions from the executor task immediately
+                def _log_exc(f, cap=env.get("cap",""), cid=env.get("corr_id","")):
+                    exc = f.exception()
+                    if exc:
+                        log.error("executor task crashed [cap=%s corr_id=%s]: %s", cap, cid, exc, exc_info=exc)
+                fut.add_done_callback(_log_exc)
             elif msg_type == "worker_bye":
                 self._running = False
                 break

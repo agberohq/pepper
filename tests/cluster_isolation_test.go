@@ -55,6 +55,7 @@ func TestClusterIsolation_GoSideDeliversToCoordQueue(t *testing.T) {
 		pepper.WithCoord(store),
 		pepper.WithTransportURL("mem://iso"),
 		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -195,6 +196,7 @@ func TestClusterIsolation_CodecMismatchCausesSilentHang(t *testing.T) {
 		pepper.WithCoord(store),
 		pepper.WithTransportURL("mem://codec"),
 		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -276,6 +278,7 @@ func TestClusterIsolation_EnvelopeShapeOnTheWire(t *testing.T) {
 		pepper.WithCoord(store),
 		pepper.WithTransportURL("mem://shape"),
 		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)

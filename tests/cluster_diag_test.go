@@ -35,13 +35,13 @@ func TestClusterDiag_WorkerHelloIsFannedOutToBothNodes(t *testing.T) {
 
 	// Two independent Pepper nodes sharing one coord store — mirrors the
 	// real cluster test exactly.
-	nodeA, err := pepper.New(pepper.WithCoord(store), pepper.WithTransportURL("mem://a"), pepper.WithShutdownTimeout(2*time.Second))
+	nodeA, err := pepper.New(pepper.WithLogger(testLogger), pepper.WithCoord(store), pepper.WithTransportURL("mem://a"), pepper.WithShutdownTimeout(2*time.Second))
 	if err != nil {
 		t.Fatalf("nodeA: %v", err)
 	}
 	defer nodeA.Stop()
 
-	nodeB, err := pepper.New(pepper.WithCoord(store), pepper.WithTransportURL("mem://b"), pepper.WithShutdownTimeout(2*time.Second))
+	nodeB, err := pepper.New(pepper.WithLogger(testLogger), pepper.WithCoord(store), pepper.WithTransportURL("mem://b"), pepper.WithShutdownTimeout(2*time.Second))
 	if err != nil {
 		t.Fatalf("nodeB: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestClusterDiag_DistributedModeSilentlyAcceptsUnregisteredCap(t *testing.T)
 	// Two nodes, neither has the cap registered, neither has workers.
 	// This is deliberate: we want to see what happens when Do() is called on
 	// a cap that has no workers in distributed mode.
-	node, err := pepper.New(pepper.WithCoord(store), pepper.WithTransportURL("mem://x"), pepper.WithShutdownTimeout(2*time.Second))
+	node, err := pepper.New(pepper.WithLogger(testLogger), pepper.WithCoord(store), pepper.WithTransportURL("mem://x"), pepper.WithShutdownTimeout(2*time.Second))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -388,6 +388,7 @@ func TestClusterDiag_NodeBRegistersNodeAsWorkersViaFannedOutHellos(t *testing.T)
 		pepper.WithCoord(store),
 		pepper.WithTransportURL("mem://a"),
 		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("nodeA: %v", err)
@@ -398,6 +399,7 @@ func TestClusterDiag_NodeBRegistersNodeAsWorkersViaFannedOutHellos(t *testing.T)
 		pepper.WithCoord(store),
 		pepper.WithTransportURL("mem://b"),
 		pepper.WithShutdownTimeout(2*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("nodeB: %v", err)

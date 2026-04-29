@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "pepper-runtime"
 version = "0.1.0"
 description = "Pepper Python worker runtime"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
@@ -17,7 +17,12 @@ dev = [
     # Tests skip gracefully when these are absent or the service is down.
     "nats-py>=2.6",
     "redis>=4.0",
-
+]
+nomic = [
+    # nomic>=3.x uses Python 3.10+ syntax (X|Y unions, list[str] generics).
+    # Install with: pip install "pepper-runtime[nomic]"
+    "nomic>=3.0.0",
+    "msgpack>=1.0",
 ]
 
 [tool.setuptools.packages.find]

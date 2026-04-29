@@ -8,11 +8,6 @@ import (
 
 	"github.com/agberohq/pepper"
 	"github.com/agberohq/pepper/internal/core"
-	"github.com/olekukonko/ll"
-)
-
-var (
-	testLogger = ll.New("test").Enable()
 )
 
 // TestFlowEchoRoundTrip verifies the full Go→Python→Go request path.

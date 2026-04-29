@@ -307,6 +307,7 @@ func TestRealDenoisePassthrough(t *testing.T) {
 	pp, err := pepper.New(
 		pepper.WithWorkers(pepper.NewWorker("w-cpu-1").Groups("cpu", "default")),
 		pepper.WithShutdownTimeout(10*time.Second),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -364,6 +365,7 @@ func TestRealWhisperColdWarm(t *testing.T) {
 		pepper.WithDefaultTimeout(120*time.Second),
 		pepper.WithShutdownTimeout(10*time.Second),
 		pepper.Resource("whisper", map[string]any{"model_size": modelSize}),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -459,6 +461,7 @@ func TestRealFullPipeline(t *testing.T) {
 		pepper.WithDefaultTimeout(120*time.Second),
 		pepper.WithShutdownTimeout(15*time.Second),
 		pepper.Resource("whisper", map[string]any{"model_size": modelSize}),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -577,6 +580,7 @@ func TestRealWorkerRecycle(t *testing.T) {
 		pepper.WithDefaultTimeout(60*time.Second),
 		pepper.WithShutdownTimeout(10*time.Second),
 		pepper.Resource("whisper", map[string]any{"model_size": modelSize}),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -739,6 +743,7 @@ func TestRealSongAnalysis(t *testing.T) {
 		pepper.WithDefaultTimeout(180*time.Second),
 		pepper.WithShutdownTimeout(15*time.Second),
 		pepper.WithTracking(true),
+		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)

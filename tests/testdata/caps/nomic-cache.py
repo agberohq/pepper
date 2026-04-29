@@ -9,44 +9,52 @@ Nomic Embed Text capability for Pepper.
 Requires:
     pip install nomic
 
-The first call loads the model (may take a few seconds).
-Subsequent calls reuse the cached model via pepper.kv().
+Model is loaded once in setup() via nomic's internal module-level cache.
+All run() calls reuse that cached model — no weight reload per request.
+Supports both single text ("text") and batch ("texts") inputs.
 """
 
 from runtime import pepper
 
 
 def setup(config: dict) -> None:
-    """Load the Nomic embedding model once per worker."""
+    """Prime nomic's internal model cache once per worker process."""
     from nomic import embed
+    import time
+    import sys
 
     model_name = config.get("model", "nomic-embed-text-v1.5")
+    kv_key = f"nomic-ready-{model_name}"
 
     def _load():
-        import time
         t0 = time.monotonic()
-        # We don't actually load here — nomic embeds on first call.
-        # But we warm up by doing a tiny embedding.
-        _ = embed.text(
+        # Forces nomic to build its _EmbeddingModel singleton for this model.
+        # Subsequent embed.text() calls hit that singleton — no re-load.
+        embed.text(
             texts=["warmup"],
             model=model_name,
             inference_mode="local",
         )
-        return {
-            "loaded": True,
-            "model": model_name,
-        }
+        load_s = round(time.monotonic() - t0, 3)
+        print(
+            f"[nomic.embed] model loaded: {model_name} in {load_s}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"ready": True, "model": model_name, "load_s": load_s}
 
-    pepper.kv("models").get_or_set(f"nomic-{model_name}", _load)
+    entry = pepper.kv("models").get_or_set(kv_key, _load)
+    print(f"[nomic.embed] setup complete: {entry}", file=sys.stderr, flush=True)
 
 
 def run(inputs: dict) -> dict:
-    """Embed one or more texts using Nomic."""
+    """Embed one or more texts using the cached Nomic model."""
     from nomic import embed
+    import time
 
+    # Accept either "texts" (batch) or "text" (single)
     texts = inputs.get("texts")
     if texts is None:
-        # Single text fallback
         text = inputs.get("text", "")
         if not text:
             return {"error": "no 'texts' or 'text' provided"}
@@ -57,23 +65,19 @@ def run(inputs: dict) -> dict:
 
     model_name = pepper.config().get("model", "nomic-embed-text-v1.5")
 
-    # Load from cache (or load fresh if first call)
-    _ = pepper.kv("models").get(f"nomic-{model_name}")
-
-    import time
     t0 = time.monotonic()
-
     output = embed.text(
         texts=texts,
         model=model_name,
         inference_mode="local",
     )
-
     latency = time.monotonic() - t0
 
+    embeddings = output["embeddings"]
+
     return {
-        "embeddings": output["embeddings"],
-        "count": len(texts),
-        "dimensions": len(output["embeddings"][0]) if output["embeddings"] else 0,
+        "embeddings": embeddings,
+        "count": len(embeddings),
+        "dimensions": len(embeddings[0]) if embeddings else 0,
         "latency_s": round(latency, 3),
     }

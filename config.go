@@ -33,6 +33,7 @@ type Config struct {
 
 	// Timeouts
 	DefaultTimeout    time.Duration
+	BootTimeout       time.Duration // max wait for first worker ready; 0 = use DefaultTimeout
 	HeartbeatInterval time.Duration
 	ShutdownTimeout   time.Duration
 
@@ -109,6 +110,7 @@ func defaultConfig() Config {
 		Transport:           TransportAuto,
 		MaxConcurrent:       DefaultMaxConcurrent,
 		DefaultTimeout:      DefaultTimeout,
+		BootTimeout:         0, // 0 = inherit DefaultTimeout at runtime
 		HeartbeatInterval:   DefaultHeartbeatInterval,
 		ShutdownTimeout:     DefaultShutdownTimeout,
 		MaxRetries:          DefaultMaxRetries,
@@ -134,6 +136,13 @@ func WithLogger(l *ll.Logger) Option     { return func(cfg *Config) { cfg.logger
 func WithMaxConcurrent(n int) Option            { return func(cfg *Config) { cfg.MaxConcurrent = n } }
 func WithMemoryBudget(b string) Option          { return func(cfg *Config) { cfg.MemoryBudget = b } }
 func WithDefaultTimeout(d time.Duration) Option { return func(cfg *Config) { cfg.DefaultTimeout = d } }
+
+// WithBootTimeout sets how long Start() waits for at least one worker to become
+// ready (i.e. all cap setup() calls to complete). Use this when capabilities
+// have heavy setup — model downloads, database connections, etc. — that take
+// longer than the default per-request timeout.
+// A value of 0 (the default) falls back to DefaultTimeout.
+func WithBootTimeout(d time.Duration) Option { return func(cfg *Config) { cfg.BootTimeout = d } }
 func WithHeartbeatInterval(d time.Duration) Option {
 	return func(cfg *Config) { cfg.HeartbeatInterval = d }
 }

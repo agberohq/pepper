@@ -1,4 +1,4 @@
-// transport.js — Pepper bus transport layer for Node.js workers.
+
 //
 // Three backends matching transport.py exactly:
 //   mula  — raw TCP framing (4-byte big-endian length prefix)
@@ -11,9 +11,7 @@
 const net = require("net");
 const { EventEmitter } = require("events");
 
-// ---------------------------------------------------------------------------
 // Wire helpers
-// ---------------------------------------------------------------------------
 
 /** Decode (topic, payload) from a Worker._send_envelope frame. */
 function unwrapFrame(data) {
@@ -33,9 +31,7 @@ function wrapPayload(payload) {
   return Buffer.concat([prefix, payload]);
 }
 
-// ---------------------------------------------------------------------------
 // Mula transport  (raw TCP, 4-byte big-endian framing)
-// ---------------------------------------------------------------------------
 
 class MulaTransport extends EventEmitter {
   constructor(host, port) {
@@ -130,9 +126,7 @@ class MulaTransport extends EventEmitter {
   }
 }
 
-// ---------------------------------------------------------------------------
 // Redis transport
-// ---------------------------------------------------------------------------
 
 class RedisTransport extends EventEmitter {
   constructor(host, port) {
@@ -217,9 +211,7 @@ class RedisTransport extends EventEmitter {
   }
 }
 
-// ---------------------------------------------------------------------------
 // NATS transport
-// ---------------------------------------------------------------------------
 
 class NATSTransport extends EventEmitter {
   constructor(host, port) {
@@ -311,9 +303,7 @@ class NATSTransport extends EventEmitter {
   }
 }
 
-// ---------------------------------------------------------------------------
 // BusTransport — public façade
-// ---------------------------------------------------------------------------
 
 function parseUrl(url) {
   if (!url.includes("://")) {

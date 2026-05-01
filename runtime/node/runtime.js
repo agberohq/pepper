@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// runtime.js — Pepper Node.js worker runtime.
+
 //
 // Launched by Go as: node runtime.js
 //
@@ -19,9 +19,7 @@ const RUNTIME_DIR = process.env.PEPPER_NODE_RUNTIME_DIR || __dirname;
 const { parseFormA, readBlob, initResources, closeResources } = require(path.join(RUNTIME_DIR, "cap.js"));
 const { BusTransport } = require(path.join(RUNTIME_DIR, "transport.js"));
 
-// ---------------------------------------------------------------------------
 // Structured logging (fd 3 → Go log pipe, fallback to stderr)
-// ---------------------------------------------------------------------------
 
 let _logFd;
 try {
@@ -41,9 +39,7 @@ const log = {
   debug: (msg, ex) => _log("DEBUG", msg, ex),
 };
 
-// ---------------------------------------------------------------------------
 // Codec
-// ---------------------------------------------------------------------------
 
 class Codec {
   constructor(name) { this.name = name; }
@@ -69,9 +65,7 @@ class Codec {
   }
 }
 
-// ---------------------------------------------------------------------------
 // AsyncLocalStorage — per-request context (equivalent of Python contextvars)
-// ---------------------------------------------------------------------------
 
 const _reqCtx = new AsyncLocalStorage();
 
@@ -87,9 +81,7 @@ function configCtx()    { return { ...(getCtx("config", {})) }; }
 function deliveryCount(){ return getCtx("delivery", 0); }
 function sessionData()  { return { ...(getCtx("session", {})) }; }
 
-// ---------------------------------------------------------------------------
 // Cancel tracking
-// ---------------------------------------------------------------------------
 
 const _cancelledIds = new Set();
 
@@ -103,9 +95,7 @@ function isCancelled() {
   return oid ? _cancelledIds.has(oid) : false;
 }
 
-// ---------------------------------------------------------------------------
 // KV store  (process-local, keyed by worker+namespace)
-// ---------------------------------------------------------------------------
 
 const _kvStores = new Map();
 
@@ -134,9 +124,7 @@ function getKV(namespace, workerId) {
   return _kvStores.get(storeKey);
 }
 
-// ---------------------------------------------------------------------------
 // Session proxy
-// ---------------------------------------------------------------------------
 
 class SessionProxy {
   constructor(data, store) { this._data = data; this._store = store; }
@@ -149,9 +137,7 @@ class SessionProxy {
   }
 }
 
-// ---------------------------------------------------------------------------
 // Pepper public API (injected into capability modules as global `pepper`)
-// ---------------------------------------------------------------------------
 
 function makePepperAPI(worker) {
   return {
@@ -184,9 +170,7 @@ function makePepperAPI(worker) {
 // Global pepper — set once at worker startup so top-level cap code can use it.
 let _pepperAPI = null;
 
-// ---------------------------------------------------------------------------
 // Capability loader
-// ---------------------------------------------------------------------------
 
 async function loadCapability(capLoad, pepperAPI) {
   const sourcePath = capLoad.source || "";
@@ -229,9 +213,7 @@ async function loadCapability(capLoad, pepperAPI) {
   };
 }
 
-// ---------------------------------------------------------------------------
 // Wire helpers
-// ---------------------------------------------------------------------------
 
 function encodeMsg(topic, data) {
   const tb = Buffer.from(topic, "utf8");
@@ -253,9 +235,7 @@ const RETRYABLE = new Set([
   "WORKER_SHUTTING_DOWN", "DISPATCH_TIMEOUT", "MODEL_OOM", "MODEL_TIMEOUT",
 ]);
 
-// ---------------------------------------------------------------------------
 // Worker
-// ---------------------------------------------------------------------------
 
 class Worker {
   constructor() {
@@ -450,9 +430,7 @@ class Worker {
   }
 }
 
-// ---------------------------------------------------------------------------
 // Main
-// ---------------------------------------------------------------------------
 
 (async () => {
   const worker = new Worker();

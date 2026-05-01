@@ -7,6 +7,8 @@ type Runtime string
 
 const (
 	RuntimePython   Runtime = "python"
+	RuntimeJulia    Runtime = "julia"
+	RuntimeNode     Runtime = "node"
 	RuntimeGo       Runtime = "go"
 	RuntimeHTTP     Runtime = "http"
 	RuntimeCLI      Runtime = "cli"
@@ -22,7 +24,7 @@ type Spec struct {
 
 	// Execution
 	Runtime  Runtime
-	Source   string // .py path, HTTP URL, CLI command, or "" for Go workers
+	Source   string // script path, HTTP URL, CLI command, or "" for Go workers
 	GoWorker any    // non-nil for RuntimeGo — the Worker interface implementation
 
 	// AdapterSpec holds the built adapter for RuntimeHTTP.
@@ -54,7 +56,7 @@ type Spec struct {
 	// Worker config passed to setup()
 	Config map[string]any
 
-	// Schema (populated from Pydantic model or Form B annotations)
+	// Schema (populated from annotations or runtime introspection)
 	InputSchema  map[string]any
 	OutputSchema map[string]any
 }

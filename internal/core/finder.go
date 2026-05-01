@@ -10,11 +10,13 @@ import (
 	"github.com/agberohq/pepper/internal/registry"
 )
 
-// RuntimeFinder handles discovery of Python runtime files
+// RuntimeFinder handles discovery of Python, Julia, and Node.js runtime files.
 type RuntimeFinder struct {
-	cache   atomic.Value // stores string
-	homeEnv string
-	pathEnv string
+	cache      atomic.Value // stores string — path to runtime.py
+	juliaCache atomic.Value // stores string — path to runtime.jl
+	nodeCache  atomic.Value // stores string — path to runtime.js
+	homeEnv    string
+	pathEnv    string
 }
 
 // NewRuntimeFinder creates a new runtime finder instance
@@ -25,9 +27,8 @@ func NewRuntimeFinder() *RuntimeFinder {
 	}
 }
 
-// Python locates the Python interpreter
+// Python locates the Python interpreter.
 func (f *RuntimeFinder) Python() string {
-	// Windows: check for python.exe, py.exe
 	if runtime.GOOS == "windows" {
 		for _, name := range []string{"python.exe", "python3.exe", "py.exe"} {
 			if p, err := exec.LookPath(name); err == nil {
@@ -36,8 +37,6 @@ func (f *RuntimeFinder) Python() string {
 		}
 		return "python.exe"
 	}
-
-	// Unix-like systems
 	for _, name := range []string{"python3", "python"} {
 		if p, err := exec.LookPath(name); err == nil {
 			return p
@@ -46,9 +45,44 @@ func (f *RuntimeFinder) Python() string {
 	return "python3"
 }
 
-// Runtime locates runtime.py with validation
+// Julia locates the Julia interpreter.
+func (f *RuntimeFinder) Julia() string {
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"julia.exe"} {
+			if p, err := exec.LookPath(name); err == nil {
+				return p
+			}
+		}
+		// Common Windows install locations
+		for _, dir := range []string{
+			os.ExpandEnv(`%LOCALAPPDATA%\Programs\Julia\bin`),
+			`C:\Julia\bin`,
+		} {
+			candidate := filepath.Join(dir, "julia.exe")
+			if f.fileExists(candidate) {
+				return candidate
+			}
+		}
+		return "julia.exe"
+	}
+	if p, err := exec.LookPath("julia"); err == nil {
+		return p
+	}
+	// Common Unix install locations
+	for _, candidate := range []string{
+		"/usr/local/bin/julia",
+		"/usr/bin/julia",
+		"/opt/julia/bin/julia",
+	} {
+		if f.fileExists(candidate) {
+			return candidate
+		}
+	}
+	return "julia"
+}
+
+// Runtime locates runtime.py with validation.
 func (f *RuntimeFinder) Runtime(specs []*registry.Spec) string {
-	// Check cache
 	if cached := f.cache.Load(); cached != nil {
 		if path := cached.(string); path != "" && f.fileExists(path) {
 			return path
@@ -56,7 +90,6 @@ func (f *RuntimeFinder) Runtime(specs []*registry.Spec) string {
 		f.cache.Store((*string)(nil))
 	}
 
-	// Search in priority order
 	searchers := []func() string{
 		f.peeperHome,
 		f.currentDir,
@@ -72,62 +105,132 @@ func (f *RuntimeFinder) Runtime(specs []*registry.Spec) string {
 			return path
 		}
 	}
-
 	return ""
 }
 
-// HasPython checks if a Python interpreter is available on the system
+// JuliaRuntime locates runtime.jl with the same search strategy as runtime.py.
+func (f *RuntimeFinder) JuliaRuntime(specs []*registry.Spec) string {
+	if cached := f.juliaCache.Load(); cached != nil {
+		if path := cached.(string); path != "" && f.fileExists(path) {
+			return path
+		}
+		f.juliaCache.Store((*string)(nil))
+	}
+
+	searchers := []func() string{
+		f.juliaHome,
+		f.juliaCurrentDir,
+		f.juliaExecutableDir,
+		f.juliaSystemPaths,
+		func() string { return f.juliaLegacyFallback(specs) },
+	}
+
+	for _, search := range searchers {
+		if path := search(); path != "" {
+			f.juliaCache.Store(path)
+			return path
+		}
+	}
+	return ""
+}
+
+// HasPython checks if a Python interpreter is available on the system.
 func (f *RuntimeFinder) HasPython() bool {
-	python := f.Python()
-	if python == "" {
-		return false
-	}
-
-	// Verify Python actually works
-	return exec.Command(python, "--version").Run() == nil
+	return exec.Command(f.Python(), "--version").Run() == nil
 }
 
-// HasPythonMsgpack checks if the Python interpreter has msgpack available
+// HasPythonMsgpack checks if the Python interpreter has msgpack available.
 func (f *RuntimeFinder) HasPythonMsgpack() bool {
-	python := f.Python()
-	return exec.Command(python, "-c", "import msgpack").Run() == nil
+	return exec.Command(f.Python(), "-c", "import msgpack").Run() == nil
 }
 
-// HasPythonRedis checks if Python has redis client library available
+// HasPythonRedis checks if Python has redis client library available.
 func (f *RuntimeFinder) HasPythonRedis() bool {
-	python := f.Python()
-	if python == "" {
-		return false
-	}
-
-	// Check if redis-py is installed
-	return exec.Command(python, "-c", "import redis").Run() == nil
+	return exec.Command(f.Python(), "-c", "import redis").Run() == nil
 }
 
-// HasPythonNats checks if Python has nats client library available
+// HasPythonNats checks if Python has nats client library available.
 func (f *RuntimeFinder) HasPythonNats() bool {
-	python := f.Python()
-	if python == "" {
-		return false
-	}
-
-	// Check if nats-py is installed
-	return exec.Command(python, "-c", "import nats").Run() == nil
+	return exec.Command(f.Python(), "-c", "import nats").Run() == nil
 }
 
-// ClearCache forces re-scanning on next call
+// HasJulia checks if a Julia interpreter is available on the system.
+func (f *RuntimeFinder) HasJulia() bool {
+	return exec.Command(f.Julia(), "--version").Run() == nil
+}
+
+// HasJuliaMsgpack checks if Julia has MsgPack.jl available.
+func (f *RuntimeFinder) HasJuliaMsgpack() bool {
+	return exec.Command(f.Julia(), "--startup-file=no", "-e",
+		`using MsgPack`).Run() == nil
+}
+
+// ClearCache forces re-scanning on next call.
 func (f *RuntimeFinder) ClearCache() {
 	f.cache.Store((*string)(nil))
+	f.juliaCache.Store((*string)(nil))
+	f.nodeCache.Store((*string)(nil))
 }
 
-// Private search methods
+// Node locates the Node.js interpreter.
+func (f *RuntimeFinder) Node() string {
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"node.exe", "nodejs.exe"} {
+			if p, err := exec.LookPath(name); err == nil {
+				return p
+			}
+		}
+		return "node.exe"
+	}
+	for _, name := range []string{"node", "nodejs"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return "node"
+}
+
+// NodeRuntime locates runtime.js with the same search strategy as runtime.py.
+func (f *RuntimeFinder) NodeRuntime(specs []*registry.Spec) string {
+	if cached := f.nodeCache.Load(); cached != nil {
+		if path := cached.(string); path != "" && f.fileExists(path) {
+			return path
+		}
+		f.nodeCache.Store((*string)(nil))
+	}
+	searchers := []func() string{
+		f.nodeHome,
+		f.nodeCurrentDir,
+		f.nodeExecutableDir,
+		f.nodeSystemPaths,
+		func() string { return f.nodeLegacyFallback(specs) },
+	}
+	for _, search := range searchers {
+		if path := search(); path != "" {
+			f.nodeCache.Store(path)
+			return path
+		}
+	}
+	return ""
+}
+
+// HasNode checks if Node.js is available.
+func (f *RuntimeFinder) HasNode() bool {
+	return exec.Command(f.Node(), "--version").Run() == nil
+}
+
+// HasNodeMsgpack checks if @msgpack/msgpack is available.
+func (f *RuntimeFinder) HasNodeMsgpack() bool {
+	return exec.Command(f.Node(), "-e", `require("@msgpack/msgpack")`).Run() == nil
+}
+
+// Python search methods
+
 func (f *RuntimeFinder) peeperHome() string {
 	if f.homeEnv == "" {
 		return ""
 	}
-
-	subdirs := []string{"", "python", "runtime", "runtime/python"}
-	for _, sub := range subdirs {
+	for _, sub := range []string{"", "python", "runtime", "runtime/python"} {
 		dir := filepath.Join(f.homeEnv, sub)
 		if f.validRuntimeDir(dir) {
 			return filepath.Join(dir, "runtime.py")
@@ -141,7 +244,6 @@ func (f *RuntimeFinder) currentDir() string {
 	if err != nil {
 		return ""
 	}
-
 	for i := 0; i <= 3; i++ {
 		if f.validRuntimeDir(dir) {
 			return filepath.Join(dir, "runtime.py")
@@ -160,7 +262,6 @@ func (f *RuntimeFinder) path() string {
 		if f.validRuntimeDir(dir) {
 			return filepath.Join(dir, "runtime.py")
 		}
-
 		for _, sub := range []string{"peeper", "python", "runtime"} {
 			subDir := filepath.Join(dir, sub)
 			if f.validRuntimeDir(subDir) {
@@ -176,13 +277,7 @@ func (f *RuntimeFinder) executableDir() string {
 	if err != nil {
 		return ""
 	}
-
-	dirs := []string{
-		filepath.Dir(exe),
-		filepath.Dir(filepath.Dir(exe)),
-	}
-
-	for _, dir := range dirs {
+	for _, dir := range []string{filepath.Dir(exe), filepath.Dir(filepath.Dir(exe))} {
 		if f.validRuntimeDir(dir) {
 			return filepath.Join(dir, "runtime.py")
 		}
@@ -192,30 +287,19 @@ func (f *RuntimeFinder) executableDir() string {
 
 func (f *RuntimeFinder) systemPaths() string {
 	var paths []string
-
 	if runtime.GOOS == "windows" {
 		paths = []string{
-			`C:\Program Files\peeper`,
-			`C:\Program Files\peeper\python`,
-			`C:\ProgramData\peeper`,
-			`%PROGRAMFILES%\peeper`,
-			`%LOCALAPPDATA%\peeper`,
-		}
-		// Expand env vars in paths
-		for i, p := range paths {
-			paths[i] = os.ExpandEnv(p)
+			os.ExpandEnv(`%PROGRAMFILES%\peeper`),
+			os.ExpandEnv(`%PROGRAMFILES%\peeper\python`),
+			os.ExpandEnv(`%LOCALAPPDATA%\peeper`),
 		}
 	} else {
 		paths = []string{
-			"/usr/local/bin",
-			"/usr/bin",
-			"/opt/peeper",
-			"/opt/peeper/python",
-			"/usr/local/share/peeper",
-			"/usr/share/peeper",
+			"/usr/local/bin", "/usr/bin",
+			"/opt/peeper", "/opt/peeper/python",
+			"/usr/local/share/peeper", "/usr/share/peeper",
 		}
 	}
-
 	for _, dir := range paths {
 		if f.validRuntimeDir(dir) {
 			return filepath.Join(dir, "runtime.py")
@@ -224,21 +308,13 @@ func (f *RuntimeFinder) systemPaths() string {
 	return ""
 }
 
-func (f *RuntimeFinder) validRuntimeDir(dir string) bool {
-	runtime := filepath.Join(dir, "runtime.py")
-	cap := filepath.Join(dir, "cap.py")
-	return f.fileExists(runtime) && f.fileExists(cap)
-}
-
 func (f *RuntimeFinder) legacyFallback(specs []*registry.Spec) string {
-	// Original logic preserved exactly
 	if f.fileExists("runtime/python/runtime.py") {
 		return "runtime/python/runtime.py"
 	}
 	if f.fileExists("../runtime/python/runtime.py") {
 		return "../runtime/python/runtime.py"
 	}
-
 	for _, s := range specs {
 		if s.Source == "" {
 			continue
@@ -253,17 +329,232 @@ func (f *RuntimeFinder) legacyFallback(specs []*registry.Spec) string {
 			}
 		}
 	}
-
 	if exe, err := os.Executable(); err == nil {
 		if c := filepath.Join(filepath.Dir(exe), "runtime.py"); f.fileExists(c) {
 			return c
 		}
 	}
-
 	if f.fileExists("runtime.py") {
 		return "runtime.py"
 	}
 	return ""
+}
+
+func (f *RuntimeFinder) validRuntimeDir(dir string) bool {
+	return f.fileExists(filepath.Join(dir, "runtime.py")) &&
+		f.fileExists(filepath.Join(dir, "cap.py"))
+}
+
+// Julia search methods
+
+func (f *RuntimeFinder) juliaHome() string {
+	if f.homeEnv == "" {
+		return ""
+	}
+	for _, sub := range []string{"", "julia", "runtime", "runtime/julia"} {
+		dir := filepath.Join(f.homeEnv, sub)
+		if f.validJuliaRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.jl")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) juliaCurrentDir() string {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		return ""
+	}
+	for i := 0; i <= 3; i++ {
+		if f.validJuliaRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.jl")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) juliaExecutableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	for _, dir := range []string{filepath.Dir(exe), filepath.Dir(filepath.Dir(exe))} {
+		if f.validJuliaRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.jl")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) juliaSystemPaths() string {
+	var paths []string
+	if runtime.GOOS == "windows" {
+		paths = []string{
+			os.ExpandEnv(`%PROGRAMFILES%\peeper`),
+			os.ExpandEnv(`%PROGRAMFILES%\peeper\julia`),
+			os.ExpandEnv(`%LOCALAPPDATA%\peeper`),
+		}
+	} else {
+		paths = []string{
+			"/usr/local/bin", "/usr/bin",
+			"/opt/peeper", "/opt/peeper/julia",
+			"/usr/local/share/peeper", "/usr/share/peeper",
+		}
+	}
+	for _, dir := range paths {
+		if f.validJuliaRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.jl")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) juliaLegacyFallback(specs []*registry.Spec) string {
+	for _, candidate := range []string{
+		"runtime/julia/runtime.jl",
+		"../runtime/julia/runtime.jl",
+	} {
+		if f.fileExists(candidate) {
+			return candidate
+		}
+	}
+	for _, s := range specs {
+		if s.Source == "" || s.Runtime != registry.RuntimeJulia {
+			continue
+		}
+		dir := filepath.Dir(s.Source)
+		for _, c := range []string{
+			filepath.Join(dir, "runtime.jl"),
+			filepath.Join(filepath.Dir(dir), "runtime.jl"),
+		} {
+			if f.fileExists(c) {
+				return c
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		if c := filepath.Join(filepath.Dir(exe), "runtime.jl"); f.fileExists(c) {
+			return c
+		}
+	}
+	if f.fileExists("runtime.jl") {
+		return "runtime.jl"
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) validJuliaRuntimeDir(dir string) bool {
+	return f.fileExists(filepath.Join(dir, "runtime.jl")) &&
+		f.fileExists(filepath.Join(dir, "cap.jl"))
+}
+
+// Node.js search methods
+
+func (f *RuntimeFinder) nodeHome() string {
+	if f.homeEnv == "" {
+		return ""
+	}
+	for _, sub := range []string{"", "node", "runtime", "runtime/node"} {
+		dir := filepath.Join(f.homeEnv, sub)
+		if f.validNodeRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.js")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) nodeCurrentDir() string {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		return ""
+	}
+	for i := 0; i <= 3; i++ {
+		if f.validNodeRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.js")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) nodeExecutableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	for _, dir := range []string{filepath.Dir(exe), filepath.Dir(filepath.Dir(exe))} {
+		if f.validNodeRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.js")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) nodeSystemPaths() string {
+	var paths []string
+	if runtime.GOOS == "windows" {
+		paths = []string{
+			os.ExpandEnv(`%PROGRAMFILES%\peeper`),
+			os.ExpandEnv(`%LOCALAPPDATA%\peeper`),
+		}
+	} else {
+		paths = []string{
+			"/usr/local/bin", "/usr/bin",
+			"/opt/peeper", "/opt/peeper/node",
+			"/usr/local/share/peeper", "/usr/share/peeper",
+		}
+	}
+	for _, dir := range paths {
+		if f.validNodeRuntimeDir(dir) {
+			return filepath.Join(dir, "runtime.js")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) nodeLegacyFallback(specs []*registry.Spec) string {
+	for _, candidate := range []string{"runtime/node/runtime.js", "../runtime/node/runtime.js"} {
+		if f.fileExists(candidate) {
+			return candidate
+		}
+	}
+	for _, s := range specs {
+		if s.Source == "" || s.Runtime != registry.RuntimeNode {
+			continue
+		}
+		dir := filepath.Dir(s.Source)
+		for _, c := range []string{
+			filepath.Join(dir, "runtime.js"),
+			filepath.Join(filepath.Dir(dir), "runtime.js"),
+		} {
+			if f.fileExists(c) {
+				return c
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		if c := filepath.Join(filepath.Dir(exe), "runtime.js"); f.fileExists(c) {
+			return c
+		}
+	}
+	if f.fileExists("runtime.js") {
+		return "runtime.js"
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) validNodeRuntimeDir(dir string) bool {
+	return f.fileExists(filepath.Join(dir, "runtime.js")) &&
+		f.fileExists(filepath.Join(dir, "cap.js"))
 }
 
 func (f *RuntimeFinder) fileExists(path string) bool { _, err := os.Stat(path); return err == nil }

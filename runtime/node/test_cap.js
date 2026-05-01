@@ -1,4 +1,4 @@
-// test_cap.js — Unit tests for cap.js
+
 // Run with: node test_cap.js
 // Or with a test runner: npx jest test_cap.js
 "use strict";
@@ -36,9 +36,7 @@ async function testAsync(name, fn) {
   }
 }
 
-// ---------------------------------------------------------------------------
 // parseFormA
-// ---------------------------------------------------------------------------
 
 console.log("\nparseFormA");
 
@@ -92,9 +90,7 @@ const x = 1;
   assert.strictEqual(meta.version, "2.0.0");
 });
 
-// ---------------------------------------------------------------------------
 // readBlob
-// ---------------------------------------------------------------------------
 
 console.log("\nreadBlob");
 
@@ -152,9 +148,7 @@ test("asTypedArray returns Float32Array when dtype=float32", () => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // Resource registry
-// ---------------------------------------------------------------------------
 
 console.log("\nresource registry");
 
@@ -181,9 +175,7 @@ await (async () => {
   });
 })();
 
-// ---------------------------------------------------------------------------
 // Summary
-// ---------------------------------------------------------------------------
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

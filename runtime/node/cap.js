@@ -1,4 +1,4 @@
-// cap.js — Pepper Node.js capability contract helpers.
+
 //
 // Covers:
 //   - parseFormA()    Form A header parser  (spec §10.1)
@@ -6,9 +6,7 @@
 //   - Resource registry
 "use strict";
 
-// ---------------------------------------------------------------------------
 // Form A header parser
-// ---------------------------------------------------------------------------
 
 const HEADER_RE = /^\/\/\s*pepper:(\w+)\s*=\s*(.+)$/;
 
@@ -38,9 +36,7 @@ function parseFormA(source) {
   return meta;
 }
 
-// ---------------------------------------------------------------------------
 // Resource registry
-// ---------------------------------------------------------------------------
 
 const _resources = new Map();
 const _resourceFactories = new Map();
@@ -90,9 +86,7 @@ async function closeResources() {
   _resources.clear();
 }
 
-// ---------------------------------------------------------------------------
 // Blob access  (spec §12.4)
-// ---------------------------------------------------------------------------
 
 class BlobRef {
   constructor(ref) {

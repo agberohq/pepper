@@ -74,6 +74,10 @@ func (p *Pepper) logRegistered(spec *registry.Spec) {
 	switch spec.Runtime {
 	case registry.RuntimePython:
 		p.logger.Fields("name", spec.Name, "source", spec.Source).Debug("registered Python capability")
+	case registry.RuntimeJulia:
+		p.logger.Fields("name", spec.Name, "source", spec.Source).Debug("registered Julia capability")
+	case registry.RuntimeNode:
+		p.logger.Fields("name", spec.Name, "source", spec.Source).Debug("registered Node capability")
 	case registry.RuntimeGo:
 		p.logger.Fields("name", spec.Name).Debug("registered Go capability")
 	case registry.RuntimeHTTP:
@@ -85,19 +89,26 @@ func (p *Pepper) logRegistered(spec *registry.Spec) {
 
 // Script
 
-// scriptCap is a Python capability loaded from a .py file.
+// scriptCap is a script-based capability. The runtime is inferred from the
+// file extension: .py → Python, .jl → Julia. Future runtimes (e.g. .rb, .js)
+// follow the same pattern — no API change needed at the call site.
 type scriptCap struct {
 	capName string
 	source  string
 	opts    []CapOption
 }
 
-// Script creates a Python script capability.
+// Script creates a script capability. The runtime is inferred from the file
+// extension so the same constructor works for every scripted language:
 //
-//	pp.Register(pepper.Script("echo", "./caps/echo.py"))
-//	pp.Register(pepper.Script("transcribe", "./caps/transcribe.py").
-//	    Groups("gpu", "asr").
-//	    Config(map[string]any{"model_size": "small"}))
+//	  .py → Python,  .jl → Julia,  .js / .mjs → Node.js
+//
+//		pp.Register(pepper.Script("echo",      "./caps/echo.py"))   // Python
+//		pp.Register(pepper.Script("embed",     "./caps/embed.jl"))  // Julia
+//		pp.Register(pepper.Script("search",    "./caps/search.js")) // Node.js
+//		pp.Register(pepper.Script("transcribe", "./caps/transcribe.py").
+//		    Groups("gpu", "asr").
+//		    Config(map[string]any{"model_size": "small"}))
 func Script(name, path string) *scriptCap {
 	return &scriptCap{capName: name, source: path}
 }
@@ -125,9 +136,13 @@ func (s *scriptCap) Timeout(d time.Duration) *scriptCap {
 }
 
 func (s *scriptCap) buildSpecs() ([]*registry.Spec, error) {
+	runtime, err := runtimeFromExt(s.source)
+	if err != nil {
+		return nil, fmt.Errorf("Script %q: %w", s.capName, err)
+	}
 	spec := &registry.Spec{
 		Name:    s.capName,
-		Runtime: registry.RuntimePython,
+		Runtime: runtime,
 		Source:  s.source,
 		Version: defaultCapVersion,
 	}
@@ -137,19 +152,39 @@ func (s *scriptCap) buildSpecs() ([]*registry.Spec, error) {
 	return []*registry.Spec{spec}, nil
 }
 
+// runtimeFromExt maps a file extension to the appropriate registry.Runtime.
+// Adding support for a new scripted language only requires adding an entry here.
+func runtimeFromExt(path string) (registry.Runtime, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".py":
+		return registry.RuntimePython, nil
+	case ".jl":
+		return registry.RuntimeJulia, nil
+	case ".js", ".mjs":
+		return registry.RuntimeNode, nil
+	default:
+		return "", fmt.Errorf("unsupported script extension %q — supported: .py, .jl, .js, .mjs", filepath.Ext(path))
+	}
+}
+
 // Dir
 
-// dirCap registers all .py files in a directory as Python capabilities.
+// dirCap registers all script files in a directory as capabilities.
+// The runtime for each file is inferred from its extension (see runtimeFromExt).
 type dirCap struct {
 	dir  string
 	opts []CapOption
 }
 
-// Dir registers every .py file found under dir as a Python capability.
-// The capability name is derived from the file path relative to dir
-// (e.g. "audio/convert.py" → "audio.convert").
+// Dir registers every script file found under dir as a capability.
+// The runtime is inferred from each file's extension:
 //
-//	pp.Register(pepper.Dir("./caps"))
+//	.py / .jl / .js / .mjs → Python / Julia / Node.js
+//
+// The capability name is derived from the file path relative to dir
+// (e.g. "audio/convert.py" → "audio.convert", "nlp/embed.jl" → "nlp.embed").
+//
+//	pp.Register(pepper.Dir("./caps"))           // mixed Python + Julia + Node caps
 //	pp.Register(pepper.Dir("./caps").Groups("default"))
 func Dir(dir string) *dirCap {
 	return &dirCap{dir: dir}
@@ -170,9 +205,14 @@ func (d *dirCap) Config(cfg map[string]any) *dirCap {
 func (d *dirCap) buildSpecs() ([]*registry.Spec, error) {
 	var specs []*registry.Spec
 	err := d.walkDir(d.dir, func(path string) error {
+		rt, err := runtimeFromExt(path)
+		if err != nil {
+			// Unknown extension — skip silently (e.g. README.md, .gitignore)
+			return nil
+		}
 		spec := &registry.Spec{
 			Name:    registry.DirNameToCap(path),
-			Runtime: registry.RuntimePython,
+			Runtime: rt,
 			Source:  path,
 			Version: defaultCapVersion,
 		}
@@ -192,7 +232,7 @@ func (d *dirCap) walkDir(dir string, fn func(string) error) error {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, ".") || name == "__pycache__" {
+		if strings.HasPrefix(name, ".") || name == "__pycache__" || name == "node_modules" {
 			continue
 		}
 		fullPath := filepath.Join(dir, name)
@@ -202,13 +242,34 @@ func (d *dirCap) walkDir(dir string, fn func(string) error) error {
 			}
 			continue
 		}
-		if strings.HasSuffix(name, ".py") && name != "runtime.py" {
+		if isScriptFile(name) {
 			if err := fn(fullPath); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// isScriptFile reports whether a filename is a registerable capability script.
+// Infrastructure files (runtime.py, runtime.jl, cap.py, cap.jl, transport.jl)
+// are excluded; only user capability files are registered.
+func isScriptFile(name string) bool {
+	skip := map[string]bool{
+		"runtime.py":   true,
+		"runtime.jl":   true,
+		"runtime.js":   true,
+		"cap.py":       true,
+		"cap.jl":       true,
+		"cap.js":       true,
+		"transport.jl": true,
+		"transport.js": true,
+	}
+	if skip[name] {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".py" || ext == ".jl" || ext == ".js" || ext == ".mjs"
 }
 
 // Func

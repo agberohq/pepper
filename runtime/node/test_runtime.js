@@ -1,4 +1,4 @@
-// test_runtime.js — Integration tests for runtime.js using a mock TCP router.
+
 // Run with: node test_runtime.js
 "use strict";
 
@@ -9,9 +9,7 @@ const os   = require("os");
 
 const RUNTIME_DIR = __dirname;
 
-// ---------------------------------------------------------------------------
 // Codec (JSON for tests — no msgpack dependency required)
-// ---------------------------------------------------------------------------
 
 function encode(env) {
   const topic = replyTopic(env);
@@ -29,9 +27,7 @@ function replyTopic(env) {
   return "pepper.control";
 }
 
-// ---------------------------------------------------------------------------
 // MockRouter — TCP echo server that captures frames and can inject envelopes
-// ---------------------------------------------------------------------------
 
 class MockRouter {
   constructor() {
@@ -99,9 +95,7 @@ class MockRouter {
   }
 }
 
-// ---------------------------------------------------------------------------
 // Test harness
-// ---------------------------------------------------------------------------
 
 let passed = 0;
 let failed = 0;
@@ -148,9 +142,7 @@ function timeout(ms, promise, label) {
   ]);
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 console.log("\nruntime.js integration tests");
 

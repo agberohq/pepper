@@ -17,6 +17,26 @@ func pythonSpec(name string, groups ...string) *Spec {
 	}
 }
 
+func juliaSpec(name string, groups ...string) *Spec {
+	return &Spec{
+		Name:    name,
+		Runtime: RuntimeJulia,
+		Source:  "./caps/" + name + ".jl",
+		Version: "1.0.0",
+		Groups:  groups,
+	}
+}
+
+func nodeSpec(name string, groups ...string) *Spec {
+	return &Spec{
+		Name:    name,
+		Runtime: RuntimeNode,
+		Source:  "./caps/" + name + ".js",
+		Version: "1.0.0",
+		Groups:  groups,
+	}
+}
+
 func httpSpec(name string, groups ...string) *Spec {
 	return &Spec{
 		Name:    name,
@@ -35,6 +55,8 @@ func TestRuntimeValues(t *testing.T) {
 		want string
 	}{
 		{RuntimePython, "python"},
+		{RuntimeJulia, "julia"},
+		{RuntimeNode, "node"},
 		{RuntimeGo, "go"},
 		{RuntimeHTTP, "http"},
 		{RuntimeCLI, "cli"},
@@ -93,10 +115,11 @@ func TestAllEmpty(t *testing.T) {
 func TestAllReturnsAllSpecs(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("cap-a", "default"))
-	r.Add(pythonSpec("cap-b", "gpu"))
+	r.Add(juliaSpec("cap-b", "gpu"))
+	r.Add(nodeSpec("cap-c", "default"))
 	r.Add(httpSpec("llm.generate", "gpu"))
-	if len(r.All()) != 3 {
-		t.Errorf("All returned %d specs, want 3", len(r.All()))
+	if len(r.All()) != 4 {
+		t.Errorf("All returned %d specs, want 4", len(r.All()))
 	}
 }
 
@@ -105,12 +128,13 @@ func TestAllReturnsAllSpecs(t *testing.T) {
 func TestForGroup(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("cap-gpu-1", "gpu"))
-	r.Add(pythonSpec("cap-gpu-2", "gpu", "asr"))
+	r.Add(juliaSpec("cap-gpu-2", "gpu", "asr"))
+	r.Add(nodeSpec("cap-gpu-3", "gpu"))
 	r.Add(pythonSpec("cap-cpu", "cpu"))
 	r.Add(httpSpec("llm", "gpu"))
 
-	if n := len(r.ForGroup("gpu")); n != 3 {
-		t.Errorf("ForGroup(gpu) = %d, want 3", n)
+	if n := len(r.ForGroup("gpu")); n != 4 {
+		t.Errorf("ForGroup(gpu) = %d, want 4", n)
 	}
 	if n := len(r.ForGroup("cpu")); n != 1 {
 		t.Errorf("ForGroup(cpu) = %d, want 1", n)
@@ -122,7 +146,7 @@ func TestForGroup(t *testing.T) {
 
 func TestForGroupEmpty(t *testing.T) {
 	r := New()
-	r.Add(pythonSpec("cap", "gpu"))
+	r.Add(juliaSpec("cap", "gpu"))
 	if caps := r.ForGroup("nonexistent"); len(caps) != 0 {
 		t.Errorf("ForGroup(nonexistent) = %v, want empty", caps)
 	}
@@ -134,10 +158,18 @@ func TestForRuntime(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("py-1", "default"))
 	r.Add(pythonSpec("py-2", "gpu"))
+	r.Add(juliaSpec("jl-1", "gpu"))
+	r.Add(nodeSpec("js-1", "default"))
 	r.Add(httpSpec("http-1", "gpu"))
 
 	if n := len(r.ForRuntime(RuntimePython)); n != 2 {
 		t.Errorf("ForRuntime(python) = %d, want 2", n)
+	}
+	if n := len(r.ForRuntime(RuntimeJulia)); n != 1 {
+		t.Errorf("ForRuntime(julia) = %d, want 1", n)
+	}
+	if n := len(r.ForRuntime(RuntimeNode)); n != 1 {
+		t.Errorf("ForRuntime(node) = %d, want 1", n)
 	}
 	if n := len(r.ForRuntime(RuntimeHTTP)); n != 1 {
 		t.Errorf("ForRuntime(http) = %d, want 1", n)
@@ -192,10 +224,11 @@ func TestSchemaNotFound(t *testing.T) {
 func TestSchemasNoFilters(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("a", "default"))
-	r.Add(pythonSpec("b", "gpu"))
-	r.Add(httpSpec("c", "gpu"))
-	if n := len(r.Schemas()); n != 3 {
-		t.Errorf("Schemas() = %d, want 3", n)
+	r.Add(juliaSpec("b", "gpu"))
+	r.Add(nodeSpec("c", "default"))
+	r.Add(httpSpec("d", "gpu"))
+	if n := len(r.Schemas()); n != 4 {
+		t.Errorf("Schemas() = %d, want 4", n)
 	}
 }
 
@@ -204,19 +237,21 @@ func TestSchemasNoFilters(t *testing.T) {
 func TestFilterByGroup(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("gpu-cap", "gpu"))
+	r.Add(juliaSpec("gpu-jl", "gpu"))
+	r.Add(nodeSpec("gpu-js", "gpu"))
 	r.Add(pythonSpec("cpu-cap", "cpu"))
 	r.Add(pythonSpec("multi-cap", "gpu", "asr"))
 
-	if n := len(r.Schemas(FilterByGroup("gpu"))); n != 2 {
-		t.Errorf("FilterByGroup(gpu) = %d, want 2", n)
+	if n := len(r.Schemas(FilterByGroup("gpu"))); n != 4 {
+		t.Errorf("FilterByGroup(gpu) = %d, want 4", n)
 	}
 }
 
 func TestFilterByGroupMultiple(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("gpu-cap", "gpu"))
-	r.Add(pythonSpec("cpu-cap", "cpu"))
-	r.Add(httpSpec("http-cap", "tools"))
+	r.Add(juliaSpec("cpu-jl", "cpu"))
+	r.Add(nodeSpec("tools-js", "tools"))
 
 	if n := len(r.Schemas(FilterByGroup("gpu", "tools"))); n != 2 {
 		t.Errorf("FilterByGroup(gpu,tools) = %d, want 2", n)
@@ -228,6 +263,8 @@ func TestFilterByGroupMultiple(t *testing.T) {
 func TestFilterByRuntime(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("py-cap", "default"))
+	r.Add(juliaSpec("jl-cap", "default"))
+	r.Add(nodeSpec("js-cap", "default"))
 	r.Add(httpSpec("http-cap", "default"))
 
 	schemas := r.Schemas(FilterByRuntime(RuntimeHTTP))
@@ -237,6 +274,16 @@ func TestFilterByRuntime(t *testing.T) {
 	if schemas[0].Runtime != "http" {
 		t.Errorf("Runtime = %q, want http", schemas[0].Runtime)
 	}
+
+	jlSchemas := r.Schemas(FilterByRuntime(RuntimeJulia))
+	if len(jlSchemas) != 1 {
+		t.Errorf("FilterByRuntime(julia) = %d, want 1", len(jlSchemas))
+	}
+
+	jsSchemas := r.Schemas(FilterByRuntime(RuntimeNode))
+	if len(jsSchemas) != 1 {
+		t.Errorf("FilterByRuntime(node) = %d, want 1", len(jsSchemas))
+	}
 }
 
 // Compound filters (AND)
@@ -244,6 +291,8 @@ func TestFilterByRuntime(t *testing.T) {
 func TestMultipleFiltersAreANDed(t *testing.T) {
 	r := New()
 	r.Add(pythonSpec("py-gpu", "gpu"))
+	r.Add(juliaSpec("jl-gpu", "gpu"))
+	r.Add(nodeSpec("js-gpu", "gpu"))
 	r.Add(httpSpec("http-gpu", "gpu"))
 	r.Add(pythonSpec("py-cpu", "cpu"))
 
@@ -254,14 +303,21 @@ func TestMultipleFiltersAreANDed(t *testing.T) {
 	if schemas[0].Name != "py-gpu" {
 		t.Errorf("Name = %q, want py-gpu", schemas[0].Name)
 	}
+
+	juliaGPU := r.Schemas(FilterByGroup("gpu"), FilterByRuntime(RuntimeJulia))
+	if len(juliaGPU) != 1 || juliaGPU[0].Name != "jl-gpu" {
+		t.Errorf("Julia+GPU filter: got %v", juliaGPU)
+	}
+
+	nodeGPU := r.Schemas(FilterByGroup("gpu"), FilterByRuntime(RuntimeNode))
+	if len(nodeGPU) != 1 || nodeGPU[0].Name != "js-gpu" {
+		t.Errorf("Node+GPU filter: got %v", nodeGPU)
+	}
 }
 
 // DirNameToCap
 
 func TestDirNameToCap(t *testing.T) {
-	// Expected outputs derived from the actual implementation:
-	// - strips ".", "..", "caps", and empty components
-	// - joins remaining directory parts + filename with "."
 	cases := []struct {
 		path string
 		want string
@@ -272,7 +328,11 @@ func TestDirNameToCap(t *testing.T) {
 		{"caps/audio/denoise.py", "audio.denoise"},
 		{"caps/echo.py", "echo"},
 		{"./recognize.py", "recognize"},
-		// Absolute path: leading empty + non-"caps" components are kept
+		// Julia and Node extensions
+		{"./caps/nlp/embed.jl", "nlp.embed"},
+		{"./caps/tools/search.js", "tools.search"},
+		{"caps/vision/classify.jl", "vision.classify"},
+		// Absolute path
 		{"/abs/path/caps/doc/parse.py", "abs.path.doc.parse"},
 		// Nested under a non-caps dir
 		{"./runtime/python/caps/echo.py", "runtime.python.echo"},

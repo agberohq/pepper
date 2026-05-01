@@ -47,49 +47,49 @@ class FaceEmbedder:
 package main
 
 import (
-    "context"
-    "log"
+	"context"
+	"log"
 
-    "github.com/agberohq/pepper"
+	"github.com/agberohq/pepper"
 )
 
 func main() {
-    pp, err := pepper.New(
-        pepper.WithWorkers(pepper.NewWorker("gpu-node").Groups("gpu")),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer pp.Stop()
+	pp, err := pepper.New(
+		pepper.WithWorkers(pepper.NewWorker("gpu-node").Groups("gpu")),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pp.Stop()
 
-    if err := pp.Register(pepper.Script("face.embed", "./caps/vision.py")); err != nil {
-        log.Fatal(err)
-    }
+	if err := pp.Register(pepper.Script("face.embed", "./caps/vision.py")); err != nil {
+		log.Fatal(err)
+	}
 
-    ctx := context.Background()
-    if err := pp.Start(ctx); err != nil {
-        log.Fatal(err)
-    }
+	ctx := context.Background()
+	if err := pp.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
 
-    blob, err := pp.NewBlobFromFile("/path/to/image.jpg")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer blob.Close()
+	blob, err := pp.NewBlobFromFile("/path/to/image.jpg")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer blob.Close()
 
-    type EmbedOut struct {
-        Embedding []float32 `json:"embedding"`
-    }
+	type EmbedOut struct {
+		Embedding []float32 `json:"embedding"`
+	}
 
-    result, err := pepper.Call[EmbedOut]{
-        Cap:   "face.embed",
-        Input: pepper.In{"image": blob.Ref()},
-    }.Bind(pp).Do(ctx)
-    if err != nil {
-        log.Fatal(err)
-    }
+	result, err := pepper.Call[EmbedOut]{
+		Cap:   "face.embed",
+		Input: pepper.In{"image": blob.Ref()},
+	}.Bind(pp).Do(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-    log.Printf("embedding: %v", result.Embedding)
+	log.Printf("embedding: %v", result.Embedding)
 }
 ```
 
@@ -328,8 +328,8 @@ Maintain state across multiple capability calls:
 sess := pp.NewSession()
 
 result, err := pepper.Call[ReplyOut]{
-    Cap:   "chat.reply",
-    Input: pepper.In{"message": "Hello"},
+Cap:   "chat.reply",
+Input: pepper.In{"message": "Hello"},
 }.Session(sess).Do(ctx)
 
 // Later, with the same session:
@@ -338,15 +338,47 @@ sess2 := pp.Session(sess.ID()) // resume from cookie, JWT, etc.
 
 ---
 
-## Transports
+## Cluster Transports
 
-| Transport | Default | Notes |
-|-----------|---------|-------|
-| `mula://` | Yes | Zero-dependency custom TCP framing |
-| `nats://` | No | Coming soon — NATS JetStream |
-| `redis://` | No | Coming soon — Redis Pub/Sub |
+Pepper supports three coordination backends for multi-node deployments. Select a backend by passing its URL to `pepper.WithTransportURL`.
 
-Override with `pepper.WithTransport(pepper.TransportTCPLoopback)` or `pepper.WithTransportURL("tcp://0.0.0.0:7731")`.
+| Transport | URL scheme | Notes |
+|-----------|------------|-------|
+| Mula | `tcp://host:port` | Built-in, zero external dependencies. Uses custom TCP framing for Go↔Python IPC and HashiCorp memberlist for peer discovery and cluster coordination. Default for single-node. |
+| NATS | `nats://host:4222` | Requires a running NATS server with JetStream enabled (`nats-server -js`). Recommended for production multi-node deployments. |
+| Redis | `redis://host:6379` | Requires a running Redis server. Good fit if Redis is already in your stack. |
+
+Single-node (default — no external server needed):
+
+```go
+pp, err := pepper.New(
+pepper.WithWorkers(pepper.NewWorker("w-1")),
+)
+```
+
+Multi-node with NATS:
+
+```go
+// node A — owns the workers
+ppA, err := pepper.New(
+pepper.WithWorkers(pepper.NewWorker("w-1").Groups("default")),
+pepper.WithTransportURL("nats://127.0.0.1:4222"),
+)
+
+// node B — pure orchestrator, routes calls to node A's workers
+ppB, err := pepper.New(
+pepper.WithTransportURL("nats://127.0.0.1:4222"),
+)
+```
+
+Multi-node with Redis:
+
+```go
+ppA, err := pepper.New(
+pepper.WithWorkers(pepper.NewWorker("w-1").Groups("default")),
+pepper.WithTransportURL("redis://127.0.0.1:6379"),
+)
+```
 
 ---
 

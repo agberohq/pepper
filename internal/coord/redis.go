@@ -75,8 +75,8 @@ func (s *redisStore) Publish(ctx context.Context, channel string, payload []byte
 }
 
 func (s *redisStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan Event, error) {
-	ch := make(chan Event, 64)
-
+	// A large channel buffer ensures bursts of cluster throughput don't block the go-redis reader.
+	ch := make(chan Event, 1024)
 	pattern := channelPrefix + "*"
 	pubsub := s.client.PSubscribe(ctx, pattern)
 
@@ -84,14 +84,11 @@ func (s *redisStore) Subscribe(ctx context.Context, channelPrefix string) (<-cha
 		defer close(ch)
 		defer pubsub.Close()
 
-		msgCh := pubsub.Channel()
+		// WithChannelSize expands the internal go-redis buffer (default 100).
+		msgCh := pubsub.Channel(redis.WithChannelSize(1024))
 		for {
 			select {
 			case <-ctx.Done():
-				// Caller cancelled — this subscription's work is done.
-				// Do NOT select on s.stopCh here: the store may be shared
-				// across multiple Pepper nodes (e.g. in cluster tests), and
-				// closing one node must not kill another node's subscriptions.
 				return
 			case msg, ok := <-msgCh:
 				if !ok {

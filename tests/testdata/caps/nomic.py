@@ -19,6 +19,7 @@ from runtime import pepper
 
 
 def setup(config: dict) -> None:
+    config = config or {}
     from nomic import embed
     import time
     import sys
@@ -56,7 +57,7 @@ def run(inputs: dict) -> dict:
     if not text:
         return {"error": "no text provided"}
 
-    model_name = pepper.config().get("model", "nomic-embed-text-v1.5")
+    model_name = (pepper.config() or {}).get("model", "nomic-embed-text-v1.5")
 
     # embed.text() reuses the module-level model cache primed in setup().
     # inference_mode="local" is required so it doesn't attempt a remote API call.

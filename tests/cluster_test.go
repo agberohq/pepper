@@ -27,6 +27,7 @@
 //
 //	PEPPER_REAL_TESTS=1 go test -v -run TestRealClusterRedis -timeout 120s .
 //	PEPPER_REAL_TESTS=1 go test -v -run TestRealClusterNATS  -timeout 120s .
+//	PEPPER_REAL_TESTS=1 go test -v -run TestRealClusterMula  -timeout 240s .
 
 package tests
 
@@ -35,6 +36,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -124,28 +126,37 @@ func (c *clusterSetup) waitReady(t *testing.T, cap string, timeout time.Duration
 //
 // Each node gets its own coord.Store so that Stop() on one node does not
 // close the shared stopCh and kill the other node's subscription goroutines.
+//
+// For Redis and NATS backends, coordURL doubles as the worker transport URL
+// (Python workers connect to the same server). For Mula, the coord store
+// exposes a per-node TCP listener; MulaAddr() returns that address and it is
+// used as the transport URL instead of the gossip seed in coordURL.
 func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Store, error)) *clusterSetup {
 	t.Helper()
 
-	// Separate flush connection: used only for pre-test queue cleanup.
-	// This avoids any lifecycle entanglement with the node connections.
-	flush, err := newCoord(coordURL)
-	if err != nil {
-		t.Fatalf("coord connect (flush) %s: %v", coordURL, err)
-	}
-
-	// Flush any stale queue items left by previous test runs.
-	// Without this, failed subtests leave items in pepper.push.* that get
-	// picked up by workers in the next subtest, causing "cap not found" errors.
-	ctx := context.Background()
-	if keys, err := flush.List(ctx, "pepper.push."); err == nil {
-		for _, k := range keys {
-			_ = flush.Delete(ctx, k)
+	// For Redis and NATS the flush store is needed: those backends persist
+	// across subtests and stale queue items cause "cap not found" errors.
+	// For Mula, coordURL has no scheme (bare "host:port"), queues are ephemeral
+	// (random ports per subtest), so no flush is needed and we skip it to avoid
+	// adding a third member to the 2-node consistent-hash ring.
+	isMula := !strings.Contains(coordURL, "://")
+	var flush coord.Store
+	if !isMula {
+		var err error
+		flush, err = newCoord(coordURL)
+		if err != nil {
+			t.Fatalf("coord connect (flush) %s: %v", coordURL, err)
 		}
-	}
-	if keys, err := flush.List(ctx, "pepper:cap:"); err == nil {
-		for _, k := range keys {
-			_ = flush.Delete(ctx, k)
+		ctx := context.Background()
+		if keys, err := flush.List(ctx, "pepper.push."); err == nil {
+			for _, k := range keys {
+				_ = flush.Delete(ctx, k)
+			}
+		}
+		if keys, err := flush.List(ctx, "pepper:cap:"); err == nil {
+			for _, k := range keys {
+				_ = flush.Delete(ctx, k)
+			}
 		}
 	}
 
@@ -153,15 +164,33 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 	// its coord store does not cancel nodeB's subscription goroutines.
 	coordA, err := newCoord(coordURL)
 	if err != nil {
-		flush.Close()
+		if flush != nil {
+			flush.Close()
+		}
 		t.Fatalf("coord connect (nodeA) %s: %v", coordURL, err)
 	}
 
 	coordB, err := newCoord(coordURL)
 	if err != nil {
-		flush.Close()
+		if flush != nil {
+			flush.Close()
+		}
 		coordA.Close()
 		t.Fatalf("coord connect (nodeB) %s: %v", coordURL, err)
+	}
+
+	// For Mula, each coord store creates its own TCP listener for Go↔Python
+	// worker IPC. MulaAddr() returns that listener's address (tcp://host:port),
+	// which must be used as WithTransportURL so Python workers connect to their
+	// own node's bus — not to the gossip seed passed in coordURL.
+	// For Redis/NATS, MulaAddr() returns "" and we fall back to coordURL.
+	transportA := coordURL
+	if addr := coord.MulaAddr(coordA); addr != "" {
+		transportA = addr
+	}
+	transportB := coordURL
+	if addr := coord.MulaAddr(coordB); addr != "" {
+		transportB = addr
 	}
 
 	// nodeA — has the workers, registered capabilities execute here
@@ -171,12 +200,14 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 			pepper.NewWorker("cluster-worker-a2").Groups("default"),
 		),
 		pepper.WithCoord(coordA),
-		pepper.WithTransportURL(coordURL),
+		pepper.WithTransportURL(transportA),
 		pepper.WithShutdownTimeout(10*time.Second),
 		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
-		flush.Close()
+		if flush != nil {
+			flush.Close()
+		}
 		coordA.Close()
 		coordB.Close()
 		t.Fatalf("nodeA New: %v", err)
@@ -185,13 +216,15 @@ func newCluster(t *testing.T, coordURL string, newCoord func(string) (coord.Stor
 	// nodeB — orchestrator only, routes Do() calls via coord queue
 	nodeB, err := pepper.New(
 		pepper.WithCoord(coordB),
-		pepper.WithTransportURL(coordURL),
+		pepper.WithTransportURL(transportB),
 		pepper.WithShutdownTimeout(10*time.Second),
 		pepper.WithLogger(testLogger),
 	)
 	if err != nil {
 		nodeA.Stop()
-		flush.Close()
+		if flush != nil {
+			flush.Close()
+		}
 		coordB.Close()
 		t.Fatalf("nodeB New: %v", err)
 	}
@@ -258,6 +291,116 @@ func TestRealClusterNATS(t *testing.T) {
 	url := requireNATSCluster(t)
 	t.Logf("Cluster backend: NATS (%s)", url)
 	runClusterSuite(t, url, func(u string) (coord.Store, error) { return coord.NewNATS(u) })
+}
+
+// TestRealClusterMula runs all cluster scenarios against the built-in Mula
+// backend (in-process TCP + HashiCorp memberlist for peer discovery).
+//
+// Unlike Redis and NATS, Mula has no external server. The bootstrap sequence
+// is designed so the ephemeral seed node is NOT in the ring when the suite runs:
+//
+// Start an ephemeral seed to get a stable gossip port.
+// The suite factory creates stores in pairs per subtest: primary (no seeds)
+//
+//	then secondary (joins the primary). This gives a clean 2-node ring.
+//
+// This avoids the 3-node ring problem: if the seed stayed alive, consistent
+// hashing would assign ~1/3 of push queues to it, and those items would never
+// be drained because no Python workers are connected to the seed.
+func TestRealClusterMula(t *testing.T) {
+	realTestsEnabled(t)
+	requireBinary(t, "python3")
+	requirePythonPackage(t, "msgpack")
+
+	// Ephemeral seed — only used so the factory can log a meaningful address.
+	seed, err := coord.NewMulaCluster("127.0.0.1", 0, 0, nil)
+	if err != nil {
+		t.Fatalf("NewMulaCluster seed: %v", err)
+	}
+	gossipPort := coord.MulaGossipPort(seed)
+	seedAddr := fmt.Sprintf("127.0.0.1:%d", gossipPort)
+	// Close immediately — the factory below creates self-contained 2-node rings
+	// per subtest without involving the seed at all.
+	seed.Close()
+
+	t.Logf("Cluster backend: Mula (seed ref=%s, 2-node ring per subtest)", seedAddr)
+
+	// Per-subtest state: the factory is called exactly twice by newCluster()
+	// (once for coordA, once for coordB). We track which call is first so we
+	// can wire the two stores to each other rather than to any external seed.
+	var (
+		mu sync.Mutex
+		// Per-subtest: gossip port of the live standalone primary.
+		// All subsequent calls (probe, coordA, coordB) join it.
+		primaryStore      coord.Store
+		primaryGossipPort int
+	)
+
+	newMulaRing := func(_ string) (coord.Store, error) {
+		mu.Lock()
+		primary := primaryStore
+		port := primaryGossipPort
+		mu.Unlock()
+
+		if primary == nil {
+			// First call for this subtest: create the standalone seed.
+			s, err := coord.NewMulaCluster("127.0.0.1", 0, 0, nil)
+			if err != nil {
+				return nil, err
+			}
+			mu.Lock()
+			primaryStore = s
+			primaryGossipPort = coord.MulaGossipPort(s)
+			mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+			return s, nil
+		}
+
+		// Subsequent calls (coordB): join the primary — clean 2-node ring.
+		// isMula=true in newCluster suppresses the flush-store creation, so
+		// the factory is called exactly twice per subtest (coordA then coordB).
+		joinAddr := fmt.Sprintf("127.0.0.1:%d", port)
+		s, err := coord.NewMulaCluster("127.0.0.1", 0, 0, []string{joinAddr})
+		if err != nil {
+			return nil, err
+		}
+		time.Sleep(300 * time.Millisecond)
+		return s, nil
+	}
+
+	for _, tc := range []struct{ name string }{
+		{"CrossNodeDispatch"},
+		{"SessionSharing"},
+		{"WorkerLocalKV"},
+		{"ConcurrentThroughput"},
+		{"ExactlyOnceDelivery"},
+		{"NodeBCanOrchestrate"},
+	} {
+		tc := tc
+		// Reset per-subtest primary so the factory creates a fresh standalone seed.
+		mu.Lock()
+		primaryStore = nil
+		primaryGossipPort = 0
+		mu.Unlock()
+		factory := newMulaRing
+
+		t.Run(tc.name, func(t *testing.T) {
+			switch tc.name {
+			case "CrossNodeDispatch":
+				testCrossNodeDispatch(t, seedAddr, factory)
+			case "SessionSharing":
+				testSessionSharing(t, seedAddr, factory)
+			case "WorkerLocalKV":
+				testWorkerLocalKV(t, seedAddr, factory)
+			case "ConcurrentThroughput":
+				testConcurrentThroughput(t, seedAddr, factory)
+			case "ExactlyOnceDelivery":
+				testExactlyOnceDelivery(t, seedAddr, factory)
+			case "NodeBCanOrchestrate":
+				testNodeBOrchestrates(t, seedAddr, factory)
+			}
+		})
+	}
 }
 
 // runClusterSuite runs every cluster scenario for a given coord backend.

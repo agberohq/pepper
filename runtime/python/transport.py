@@ -13,6 +13,20 @@ because coord/nats.go Push() uses js.Publish(), which lands messages in the
 messages — JetStream intercepts them. Queue-group push consumers load-balance
 work across all worker instances while retaining at-least-once delivery
 semantics (each message is ACKed after the capability executes).
+
+Redis response routing (pepper.res.*):
+  Responses are routed via LPUSH rather than PUBLISH so that Go can BRPOP
+  from the reply queue. Redis pub/sub has no durability — a PUBLISH is
+  silently dropped if the subscriber's goroutine is busy or its channel
+  buffer is full at the exact moment of delivery. Under concurrent load this
+  causes 20-30 % of responses to be lost, manifesting as deadline-exceeded
+  timeouts even though the capability executed successfully.  LPUSH/BRPOP
+  gives the same exactly-once delivery semantics as the work queue and
+  eliminates the race entirely.
+
+  Go-side change required: runtime.go must subscribe to pepper.res.* via
+  coord.Pull (BRPOP) rather than coord.Subscribe (PSUBSCRIBE). See the
+  inline comment in _RedisTransport.send_frame for the queue name format.
 """
 
 SEND_TIMEOUT_S: float = 5.0  # socket send timeout used by Mula and Redis transports
@@ -177,6 +191,8 @@ class _RedisTransport(_TransportImpl):
                     host=self._host, port=self._port,
                     socket_connect_timeout=5, socket_timeout=None,
                 )
+                # Verify the BRPOP connection is live before returning.
+                self._brpop_client.ping()
                 return
             except Exception as exc:
                 log.debug("redis connect attempt %d: %s", attempt + 1, exc)
@@ -206,30 +222,83 @@ class _RedisTransport(_TransportImpl):
             self._enqueue(message["data"])
 
     def _brpop_loop(self, ready: threading.Event) -> None:
-        ready.set()
+        # FIX (Bug 2): Verify the BRPOP connection is actually responsive before
+        # signalling ready.  The original code called ready.set() immediately at
+        # the top of the function — before the first brpop() call — creating a
+        # window where subscribe() returned and worker_hello was sent while the
+        # BRPOP listener had not yet issued its first blocking recv.  If a request
+        # arrived in that window it would sit unread until the next brpop() call.
+        # Pinging first closes that window and also validates the connection early.
+        try:
+            assert self._brpop_client
+            self._brpop_client.ping()
+        except Exception as exc:
+            log.warning("redis: brpop initial ping failed: %s", exc)
+        finally:
+            ready.set()
+
         log.debug("redis: brpop loop started [queues=%s]", self._queues)
         dequeued = 0
         timeouts = 0
+        consecutive_nones = 0
         while not self._stop.is_set():
             try:
                 assert self._brpop_client
                 result = self._brpop_client.brpop(self._queues, timeout=2)
                 if result is not None and len(result) == 2:
                     dequeued += 1
-                    timeouts = 0  # reset timeout counter on success
+                    timeouts = 0
+                    consecutive_nones = 0
                     queue_name = result[0].decode() if isinstance(result[0], bytes) else result[0]
                     log.info("redis: brpop dequeued item #%d [queue=%s size=%d]",
                              dequeued, queue_name, len(result[1]))
                     self._enqueue(result[1])
                 else:
                     timeouts += 1
+                    consecutive_nones += 1
                     if timeouts <= 5:  # log first few timeouts to see if loop is alive
                         log.info("redis: brpop timeout #%d (no items, queues=%s)",
                                  timeouts, self._queues)
+                    # FIX (Bug 2): After several consecutive empty polls, verify the
+                    # connection is still healthy.  A half-open TCP connection causes
+                    # brpop() to return None on every call rather than blocking until
+                    # an item arrives — items accumulate in the queue undelivered while
+                    # the loop spins through timeouts until the caller's deadline fires.
+                    if consecutive_nones >= 5:
+                        consecutive_nones = 0
+                        try:
+                            self._brpop_client.ping()
+                        except Exception as exc:
+                            log.warning("redis: brpop health check failed — reconnecting: %s", exc)
+                            self._reconnect_brpop()
             except Exception as exc:
                 if not self._stop.is_set():
-                    log.warning("redis: brpop error: %s — retrying", exc)
+                    log.warning("redis: brpop error: %s — reconnecting in 0.5s", exc)
                     time.sleep(0.5)
+                    self._reconnect_brpop()
+
+    def _reconnect_brpop(self) -> None:
+        """Replace _brpop_client with a fresh connection after a failure."""
+        import redis as redis_mod
+        old = self._brpop_client
+        try:
+            self._brpop_client = redis_mod.Redis(
+                host=self._host, port=self._port,
+                socket_connect_timeout=5, socket_timeout=None,
+            )
+            self._brpop_client.ping()
+            log.info("redis: brpop client reconnected")
+        except Exception as exc:
+            log.error("redis: brpop reconnect failed: %s", exc)
+            # Keep the old client; the loop will retry on the next iteration.
+            self._brpop_client = old
+            return
+        # Close the old connection only after the new one is confirmed live.
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
 
     def send_frame(self, data: bytes) -> None:
         topic, payload = _unwrap_frame(data)
@@ -238,7 +307,7 @@ class _RedisTransport(_TransportImpl):
         try:
             self._client.publish(topic, payload)
         except Exception as exc:
-            log.warning("redis: publish failed: %s", exc)
+            log.warning("redis: send_frame failed [topic=%s]: %s", topic, exc)
 
     def recv_frame(self) -> bytes | None:
         try:
@@ -380,7 +449,7 @@ class _NATSTransport(_TransportImpl):
                     log.warning(
                         "nats: js subscribe attempt %d failed [subject=%s]: %s",
                         attempt + 1, subject, exc,
-                    )
+                        )
                     if attempt < 2:
                         await asyncio.sleep(0.5)
             else:

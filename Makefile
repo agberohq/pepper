@@ -192,6 +192,12 @@ go-real-cluster-nats:
 		-run TestRealClusterNATS \
 		-timeout 240s ./tests/...
 
+go-real-cluster-mula:
+	@echo "Cluster backend : NATS ($(PEPPER_TEST_NATS_HOST):$(PEPPER_TEST_NATS_PORT))"
+	PATH=$(VENV_PYTHON_DIR):$$PATH PEPPER_REAL_TESTS=1 go test -v -count=1 \
+		-run TestRealClusterMula \
+		-timeout 240s ./tests/...
+
 go-real-cluster: go-real-cluster-redis go-real-cluster-nats
 
 

@@ -355,9 +355,23 @@ func (m *mulaStore) Push(ctx context.Context, queue string, payload []byte) erro
 	if m.closed.Load() {
 		return fmt.Errorf("coord/mula: closed")
 	}
-	// Multi-node: route to queue owner.
-	if owner := m.queueOwner(queue); owner != nil {
-		return m.rpcPush(ctx, owner, queue, payload)
+	// In cluster mode, push queues are worker-transport channels: Python workers
+	// subscribe to their personal queue (pepper.push.<workerID>) and to the group
+	// queue (pepper.push.<group>) via a long-lived TCP connection to whichever
+	// node they started on. Consistent-hash routing sends ~50% of items to the
+	// wrong node (the one without the subscribing worker), causing items to sit
+	// unread until the request deadline. Instead, broadcast the item to every
+	// node in the cluster so it lands in the local queue of the node that has a
+	// drainPushToSub goroutine (i.e. a subscribed worker) for this topic.
+	//
+	// Exactly-once semantics are preserved because drainPushToSub uses a channel
+	// receive (one goroutine wins) and only one node will have a remote subscriber
+	// for a given worker-specific queue. For group queues, workers on different
+	// nodes compete and the first to receive wins — identical to Redis BRPOP.
+	if m.ml != nil {
+		for _, peer := range m.peers() {
+			go m.rpcPush(ctx, &peer, queue, payload) //nolint:errcheck
+		}
 	}
 	q := m.getOrCreateQueue(queue)
 	cp := make([]byte, len(payload))
@@ -371,11 +385,8 @@ func (m *mulaStore) Push(ctx context.Context, queue string, payload []byte) erro
 }
 
 func (m *mulaStore) Pull(ctx context.Context, queue string) ([]byte, error) {
-	// In multi-node mode, route to the queue owner if it's a different node.
-	if owner := m.queueOwner(queue); owner != nil {
-		return m.rpcPullFrom(ctx, *owner, queue)
-	}
-	// This node is the owner — drain from the local queue.
+	// Push broadcasts to all peers, so every node has the item locally.
+	// Pull always reads from the local queue — no cross-node routing needed.
 	q := m.getOrCreateQueue(queue)
 	select {
 	case <-ctx.Done():
@@ -497,7 +508,14 @@ func (m *mulaStore) handleConn(conn net.Conn) {
 			break
 		}
 		topic, payload := mulaUnmarshal(data)
-		m.localPublish(topic, payload)
+		// Use Publish (not localPublish) so that in multi-node mode the message
+		// is broadcast to all peer stores via rpcPublish. This is essential for
+		// cross-node visibility: when a Python worker on nodeA sends worker_hello
+		// or a heartbeat, coordA must fan it out to coordB so that nodeB's router
+		// can discover the worker and populate its cap-affinity table.
+		// serveRPC's rpcOpPublish handler correctly calls localPublish at the
+		// destination, so there is no re-broadcast loop.
+		_ = m.Publish(context.Background(), topic, payload)
 	}
 
 	sub.closed.Store(true)

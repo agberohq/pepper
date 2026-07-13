@@ -252,9 +252,12 @@ func (d *dirCap) walkDir(dir string, fn func(string) error) error {
 }
 
 // isScriptFile reports whether a filename is a registerable capability script.
-// Infrastructure files (runtime.py, runtime.jl, cap.py, cap.jl, transport.jl)
-// are excluded; only user capability files are registered.
+// Hidden files (starting with "."), infrastructure files (runtime.py, runtime.jl,
+// cap.py, cap.jl, transport.jl), and unsupported extensions are excluded.
 func isScriptFile(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
 	skip := map[string]bool{
 		"runtime.py":   true,
 		"runtime.jl":   true,

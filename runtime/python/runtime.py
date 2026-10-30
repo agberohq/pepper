@@ -502,6 +502,9 @@ class _StreamState:
     def __init__(self):
         self.queue: queue.Queue = queue.Queue()
         self.closed = threading.Event()
+        self.paused = threading.Event()
+        self.credits = 0
+        self.max_credits = 16  # default credit window
 
     def feed(self, payload: bytes) -> None:
         self.queue.put(payload)
@@ -517,6 +520,27 @@ class _StreamState:
             if item is None:
                 return
             yield item
+
+    def grant_credits(self, n: int) -> None:
+        """Consumer grants N credits; wake up if paused."""
+        self.credits += n
+        if self.credits > 0:
+            self.paused.clear()
+
+    def consume_credit(self) -> bool:
+        """Try to consume one credit. Returns False if no credits available."""
+        if self.credits > 0:
+            self.credits -= 1
+            return True
+        return False
+
+    def wait_for_credits(self, timeout: float = 5.0) -> bool:
+        """Wait for credits to become available. Returns False on timeout."""
+        if self.credits > 0:
+            return True
+        # Wait until unpaused or credits granted
+        self.paused.wait(timeout=timeout)
+        return self.credits > 0
 
 class _StreamRegistry:
     _streams: Dict[str, _StreamState] = {}
@@ -547,6 +571,27 @@ class _StreamRegistry:
     def remove(cls, stream_id: str) -> None:
         with cls._lock:
             cls._streams.pop(stream_id, None)
+
+    @classmethod
+    def grant_credits(cls, stream_id: str, n: int) -> None:
+        with cls._lock:
+            state = cls._streams.get(stream_id)
+        if state:
+            state.grant_credits(n)
+
+    @classmethod
+    def pause(cls, stream_id: str) -> None:
+        with cls._lock:
+            state = cls._streams.get(stream_id)
+        if state:
+            state.paused.set()
+
+    @classmethod
+    def resume(cls, stream_id: str) -> None:
+        with cls._lock:
+            state = cls._streams.get(stream_id)
+        if state:
+            state.paused.clear()
 
 import queue  # noqa: E402 — placed here to keep top imports clean
 
@@ -673,6 +718,22 @@ class Worker:
                 stream_id = env.get("stream_id", "")
                 if stream_id:
                     _StreamRegistry.close(stream_id)
+            elif msg_type == "auth_challenge":
+                # Router sent an auth challenge; sign it and respond
+                self._handle_auth_challenge(env)
+            elif msg_type == "stream_credit":
+                stream_id = env.get("stream_id", "")
+                credits = env.get("credits", 0)
+                if stream_id and credits:
+                    _StreamRegistry.grant_credits(stream_id, int(credits))
+            elif msg_type == "stream_pause":
+                stream_id = env.get("stream_id", "")
+                if stream_id:
+                    _StreamRegistry.pause(stream_id)
+            elif msg_type == "stream_resume":
+                stream_id = env.get("stream_id", "")
+                if stream_id:
+                    _StreamRegistry.resume(stream_id)
 
         self.executor.shutdown(wait=True)
         for cap in self.caps.values():
@@ -761,9 +822,17 @@ class Worker:
                 result = loaded.run(inputs)
 
             if inspect.isgenerator(result):
+                # Grant initial credits so the Go side knows we're ready
+                stream_state.grant_credits(stream_state.max_credits)
                 for chunk in result:
                     with _cancelled_lock:
                         if origin_id in _cancelled_ids:
+                            break
+                    # Credit-based flow control: wait for credits before sending
+                    if not stream_state.consume_credit():
+                        # No credits available — wait for the consumer to grant more
+                        if not stream_state.wait_for_credits(timeout=10.0):
+                            log.warning("stream credits timeout [stream=%s]", stream_id)
                             break
                     if isinstance(chunk, dict):
                         _send_chunk(chunk)
@@ -920,13 +989,59 @@ class Worker:
         return self._transport.recv_frame()
 
     def _make_hello(self) -> dict:
+        public_key = _load_auth_public_key()
         return {
             "proto_ver": 1, "msg_type": "worker_hello", "worker_id": self.worker_id,
             "runtime": "python", "pid": os.getpid(), "codec": _codec.name,
             "groups": self.groups, "caps": list(self.caps.keys()),
             "pipe_subs": [], "pipe_pubs": [],
             "cb_supported": True, "stream_supported": True,
+            "public_key": public_key,
         }
+
+    def _handle_auth_challenge(self, env: dict):
+        """Handle auth_challenge: sign the challenge and send auth_response."""
+        challenge = env.get("challenge", b"")
+        private_key_hex = os.environ.get("PEPPER_AUTH_KEY", "")
+        if not private_key_hex or not challenge:
+            log.warning("auth_challenge received but no PEPPER_AUTH_KEY set")
+            return
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            priv_bytes = bytes.fromhex(private_key_hex)
+            private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+            signature = private_key.sign(challenge)
+            public_key = private_key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw
+            )
+            self._send_envelope({
+                "proto_ver": 1, "msg_type": "auth_response",
+                "worker_id": self.worker_id,
+                "public_key": public_key,
+                "signature": signature,
+            })
+            log.info("auth_response sent [worker=%s]", self.worker_id)
+        except Exception as exc:
+            log.error("auth_response failed [worker=%s error=%s]", self.worker_id, exc)
+
+
+def _load_auth_public_key() -> bytes | None:
+    """Load the Ed25519 public key from PEPPER_AUTH_KEY env var (hex-encoded private key)."""
+    private_key_hex = os.environ.get("PEPPER_AUTH_KEY", "")
+    if not private_key_hex:
+        return None
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        priv_bytes = bytes.fromhex(private_key_hex)
+        private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        return private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+    except Exception as exc:
+        log.warning("failed to load auth public key: %s", exc)
+        return None
 
     def _err(self, env: dict, code: str, message: str) -> dict:
         return {
@@ -959,6 +1074,8 @@ def _reply_topic(env: dict) -> str:
         return f"pepper.hb.{env.get('worker_id', '')}"
     if msg_type == "pipe":
         return env.get("topic", "pepper.pipe.unknown")
+    if msg_type == "auth_response":
+        return "pepper.control"
     return "pepper.control"
 
 if __name__ == "__main__":

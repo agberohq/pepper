@@ -27,6 +27,7 @@ import (
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/envelope"
+	"github.com/agberohq/pepper/internal/registry"
 	"github.com/agberohq/pepper/runtime/adapter"
 	"github.com/olekukonko/ll"
 )
@@ -396,16 +397,8 @@ func (r *GoWorkerRuntime) heartbeatLoop(ctx context.Context) {
 }
 
 func (r *GoWorkerRuntime) sendHeartbeat() {
-	ping := map[string]any{
-		"proto_ver":       envelope.ProtoVer,
-		"msg_type":        string(envelope.MsgHbPing),
-		"worker_id":       r.id,
-		"runtime":         "go",
-		"load":            uint8(r.load.Load()),
-		"groups":          r.groups,
-		"requests_served": r.requestsServed.Load(),
-		"uptime_ms":       time.Since(r.startedAt).Milliseconds(),
-	}
+	ping := envelope.HbPingMap(r.id, string(registry.RuntimeGo), uint8(r.load.Load()),
+		r.groups, r.requestsServed.Load(), time.Since(r.startedAt).Milliseconds())
 	data, err := r.codec.Marshal(ping)
 	if err != nil {
 		return

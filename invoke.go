@@ -45,6 +45,10 @@ func (b callBase) baseOpts() []CallOption {
 //	    Input:   TextInput{Text: "hello world"},
 //	    Timeout: 30 * time.Second,
 //	}.Bind(pp).Do(ctx)
+//
+// Tag Out with msgpack tags ("msgpack:\"field\""): the default codec is msgpack,
+// and fields without a msgpack tag fall back to the Go field name, so a
+// json-only struct decoded from a script worker silently yields zero values.
 type Call[Out any] struct {
 	Cap      string
 	Input    any

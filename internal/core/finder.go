@@ -10,11 +10,12 @@ import (
 	"github.com/agberohq/pepper/internal/registry"
 )
 
-// RuntimeFinder handles discovery of Python, Julia, and Node.js runtime files.
+// RuntimeFinder handles discovery of Python, Julia, Node.js and Rust runtime files.
 type RuntimeFinder struct {
 	cache      atomic.Value // stores string — path to runtime.py
 	juliaCache atomic.Value // stores string — path to runtime.jl
 	nodeCache  atomic.Value // stores string — path to runtime.js
+	rustCache  atomic.Value // stores string — path to the pepper-runtime Cargo.toml
 	homeEnv    string
 	pathEnv    string
 }
@@ -170,6 +171,7 @@ func (f *RuntimeFinder) ClearCache() {
 	f.cache.Store((*string)(nil))
 	f.juliaCache.Store((*string)(nil))
 	f.nodeCache.Store((*string)(nil))
+	f.rustCache.Store((*string)(nil))
 }
 
 // Node locates the Node.js interpreter.
@@ -558,3 +560,141 @@ func (f *RuntimeFinder) validNodeRuntimeDir(dir string) bool {
 }
 
 func (f *RuntimeFinder) fileExists(path string) bool { _, err := os.Stat(path); return err == nil }
+
+// Rust
+
+// Cargo locates the cargo build tool.
+func (f *RuntimeFinder) Cargo() string {
+	if p, err := exec.LookPath("cargo"); err == nil {
+		return p
+	}
+	return "cargo"
+}
+
+// HasCargo reports whether cargo can be executed.
+func (f *RuntimeFinder) HasCargo() bool {
+	return exec.Command(f.Cargo(), "--version").Run() == nil
+}
+
+// RustRuntime locates the pepper-runtime crate by returning the path to its
+// Cargo.toml. The crate is the path dependency every compiled Rust capability
+// links against.
+func (f *RuntimeFinder) RustRuntime(specs []*registry.Spec) string {
+	if cached := f.rustCache.Load(); cached != nil {
+		if path := cached.(string); path != "" && f.fileExists(path) {
+			return path
+		}
+		f.rustCache.Store((*string)(nil))
+	}
+	searchers := []func() string{
+		f.rustHome,
+		f.rustCurrentDir,
+		f.rustExecutableDir,
+		f.rustSystemPaths,
+		func() string { return f.rustLegacyFallback(specs) },
+	}
+	for _, search := range searchers {
+		if path := search(); path != "" {
+			f.rustCache.Store(path)
+			return path
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) rustHome() string {
+	if f.homeEnv == "" {
+		return ""
+	}
+	for _, sub := range []string{"", "rust", "runtime", "runtime/rust"} {
+		dir := filepath.Join(f.homeEnv, sub)
+		if f.validRustRuntimeDir(dir) {
+			return filepath.Join(dir, "Cargo.toml")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) rustCurrentDir() string {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		return ""
+	}
+	for i := 0; i <= 3; i++ {
+		if f.validRustRuntimeDir(dir) {
+			return filepath.Join(dir, "Cargo.toml")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) rustExecutableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	for _, dir := range []string{filepath.Dir(exe), filepath.Dir(filepath.Dir(exe))} {
+		if f.validRustRuntimeDir(dir) {
+			return filepath.Join(dir, "Cargo.toml")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) rustSystemPaths() string {
+	var paths []string
+	if runtime.GOOS == "windows" {
+		paths = []string{
+			os.ExpandEnv(`%PROGRAMFILES%\peeper`),
+			os.ExpandEnv(`%PROGRAMFILES%\peeper\rust`),
+			os.ExpandEnv(`%LOCALAPPDATA%\peeper`),
+		}
+	} else {
+		paths = []string{
+			"/usr/local/bin", "/usr/bin",
+			"/opt/peeper", "/opt/peeper/rust",
+			"/usr/local/share/peeper", "/usr/share/peeper",
+		}
+	}
+	for _, dir := range paths {
+		if f.validRustRuntimeDir(dir) {
+			return filepath.Join(dir, "Cargo.toml")
+		}
+	}
+	return ""
+}
+
+func (f *RuntimeFinder) rustLegacyFallback(specs []*registry.Spec) string {
+	for _, candidate := range []string{"runtime/rust", "../runtime/rust"} {
+		if f.validRustRuntimeDir(candidate) {
+			return filepath.Join(candidate, "Cargo.toml")
+		}
+	}
+	for _, s := range specs {
+		if s.Source == "" || s.Runtime != registry.RuntimeRust {
+			continue
+		}
+		dir := filepath.Dir(s.Source)
+		for _, c := range []string{
+			filepath.Join(dir, "rust"),
+			filepath.Join(filepath.Dir(dir), "rust"),
+		} {
+			if f.validRustRuntimeDir(c) {
+				return filepath.Join(c, "Cargo.toml")
+			}
+		}
+	}
+	return ""
+}
+
+// validRustRuntimeDir reports whether dir looks like the pepper-runtime crate.
+func (f *RuntimeFinder) validRustRuntimeDir(dir string) bool {
+	return f.fileExists(filepath.Join(dir, "Cargo.toml")) &&
+		f.fileExists(filepath.Join(dir, "src", "lib.rs")) &&
+		f.fileExists(filepath.Join(dir, "src", "worker.rs"))
+}

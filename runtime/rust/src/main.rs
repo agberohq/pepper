@@ -116,7 +116,12 @@ fn run(cap_args: &[String], prepare_only: bool) -> Result<(), String> {
     let digest = format!("{:016x}", cache::hash(&key));
     let pkg = format!("pepper_cap_{digest}");
     let crate_dir = build_root.join(&digest);
-    let binary = target_dir.join("release").join(&pkg);
+    // Cargo appends the platform executable suffix: `pepper_cap_<digest>.exe`
+    // on Windows. Reuse the same constant so the cache-hit check and `exec`
+    // both point at the file cargo actually produced.
+    let binary = target_dir
+        .join("release")
+        .join(format!("{pkg}{}", std::env::consts::EXE_SUFFIX));
 
     if !binary.exists() {
         build(&crate_dir, &target_dir, &pkg, &sources, &runtime_dir)?;
@@ -143,7 +148,8 @@ mod cache {
     }
 
     /// Cache root: `$PEPPER_CACHE_DIR`, else `$XDG_CACHE_HOME/pepper`, else
-    /// `~/.cache/pepper`.
+    /// `~/.cache/pepper` (`%LOCALAPPDATA%\pepper` on Windows, which has no
+    /// `HOME` and no `XDG_CACHE_HOME`).
     pub fn root() -> PathBuf {
         if let Ok(dir) = std::env::var("PEPPER_CACHE_DIR") {
             if !dir.is_empty() {
@@ -154,6 +160,18 @@ mod cache {
             if !dir.is_empty() {
                 return PathBuf::from(dir).join("pepper");
             }
+        }
+        if cfg!(windows) {
+            // `HOME` is a POSIX convention; the Windows equivalents are tried in
+            // the order that matches how the platform resolves a per-user cache.
+            for var in ["LOCALAPPDATA", "APPDATA", "USERPROFILE"] {
+                if let Ok(dir) = std::env::var(var) {
+                    if !dir.is_empty() {
+                        return PathBuf::from(dir).join("pepper");
+                    }
+                }
+            }
+            return std::env::temp_dir().join("pepper");
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home).join(".cache").join("pepper")
@@ -405,12 +423,9 @@ impl BuildLock {
 
         #[cfg(not(unix))]
         {
-            // Fallback: use the file existence check approach on non-Unix
-            let started = std::time::Instant::now();
-            loop {
-                // On non-Unix we just proceed — the lock file is a no-op sentinel
-                return Ok(Self { _file: file });
-            }
+            // No advisory-lock primitive here: cargo takes its own lock on the
+            // shared `CARGO_TARGET_DIR`, so hold the file open and proceed.
+            Ok(Self { _file: file })
         }
     }
 }

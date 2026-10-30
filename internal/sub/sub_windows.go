@@ -12,11 +12,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type process struct {
-	Pid    int
-	Handle uintptr
-}
-
 type windowsManager struct {
 	exitGroup windows.Handle
 	mu        sync.Mutex
@@ -49,12 +44,24 @@ func (m *windowsManager) ConfigureCommand(cmd *exec.Cmd) error { return nil }
 func (m *windowsManager) AddChildProcess(p *os.Process) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed.Load() {
+	if m.closed.Load() || p == nil {
 		return nil
 	}
-	return windows.AssignProcessToJobObject(
-		m.exitGroup,
-		windows.Handle((*process)(unsafe.Pointer(p)).Handle))
+	// `os.Process` no longer exposes its handle as a raw uintptr (since Go 1.25
+	// it holds a pointer to an OS-specific struct), so re-open the child by PID
+	// instead of casting the struct layout. The requested rights are the minimum
+	// AssignProcessToJobObject needs.
+	h, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		false,
+		uint32(p.Pid),
+	)
+	if err != nil {
+		return err
+	}
+	assignErr := windows.AssignProcessToJobObject(m.exitGroup, h)
+	_ = windows.CloseHandle(h)
+	return assignErr
 }
 
 // Dispose closes the Job Object handle. Safe to call multiple times —

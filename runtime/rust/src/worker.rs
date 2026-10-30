@@ -10,11 +10,12 @@
 //! hosting several `.py` files.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
@@ -647,6 +648,21 @@ fn json_array(items: &[String]) -> String {
 /// The parent pipes fd 3 into its own logger, so capability output stays
 /// interleaved with the rest of the process tree.
 fn log(level: &str, message: &str, extra: &str) {
+    // fd 3 only exists on Unix (`cmd.ExtraFiles`), so Windows logs on stderr.
+    #[cfg(unix)]
+    if write_log_fd(level, message, extra) {
+        return;
+    }
+    eprintln!("[pepper/rust] {level}: {message} {extra}");
+}
+
+/// Write one structured log line to fd 3, the pipe the Go runtime reads.
+/// Returns false when the descriptor is unusable, so the caller logs to stderr.
+#[cfg(unix)]
+fn write_log_fd(level: &str, message: &str, extra: &str) -> bool {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -655,17 +671,10 @@ fn log(level: &str, message: &str, extra: &str) {
         "{{\"ts\":{ts_ms},\"level\":\"{level}\",\"logger\":\"pepper.rust\",\"msg\":\"{}\",\"extra\":{extra}}}",
         message.replace('"', "'")
     );
-    #[cfg(unix)]
-    {
-        use std::os::fd::FromRawFd;
-        // SAFETY: fd 3 is either open (dup'ed by the parent for logs) or closed;
-        // writing to a closed fd returns EBADF, which we ignore.
-        let mut f = unsafe { std::fs::File::from_raw_fd(3) };
-        if writeln!(f, "{line}").is_ok() {
-            std::mem::forget(f);
-            return;
-        }
-        std::mem::forget(f);
-    }
-    eprintln!("[pepper/rust] {level}: {message} {extra}");
+    // SAFETY: fd 3 is either open (dup'ed by the parent for logs) or closed;
+    // writing to a closed fd returns EBADF, which we ignore.
+    let mut f = unsafe { std::fs::File::from_raw_fd(3) };
+    let written = writeln!(f, "{line}").is_ok();
+    std::mem::forget(f);
+    written
 }

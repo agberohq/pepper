@@ -178,6 +178,13 @@ pointing at a nonexistent binary, a warm cache still starts and serves.
   file is `include!`d into a module.
 - **`pepper.call()` callbacks** are not implemented yet; `worker_hello` reports
   `cb_supported: false` so the router never waits for messages we do not send.
+- **Windows**: cargo appends `.exe`, so the runtime binary is
+  `target/release/pepper-worker.exe` and cached capability binaries are
+  `pepper_cap_<hash>.exe`. The Go side looks up the suffixed name and the worker
+  resolves the cache with `EXE_SUFFIX`, so both platforms behave the same.
+  Desktop Windows has no `HOME`, so the cache defaults to `%LOCALAPPDATA%\pepper`
+  (`PEPPER_CACHE_DIR` still wins). Logs go to stderr instead of the fd-3 pipe,
+  and `exec()` becomes spawn-and-wait because Windows has no `execve`.
 - **Transport**: `tcp://` (Mula) only. Redis/NATS worker connections live in the
   Python runtime; extend `src/transport.rs` if you need them (the `// pepper:deps`
   header now makes adding an SDK crate a one-line change).

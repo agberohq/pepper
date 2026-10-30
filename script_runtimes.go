@@ -340,13 +340,23 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// rustWorkerExeName is the file name cargo emits for the pepper-worker binary.
+// Cargo appends the platform executable suffix, so the lookup must too:
+// `pepper-worker.exe` on Windows, plain `pepper-worker` everywhere else.
+func rustWorkerExeName(goos string) string {
+	if goos == "windows" {
+		return "pepper-worker.exe"
+	}
+	return "pepper-worker"
+}
+
 // rustWorkerBinary returns the pepper-worker executable, building the runtime
 // crate once if neither an override nor a prebuilt binary is available.
 func (p *Pepper) rustWorkerBinary(ctx context.Context, runtimeDir string) (string, error) {
 	if bin := os.Getenv(wire.EnvRustWorkerBin); bin != "" {
 		return bin, nil
 	}
-	bin := filepath.Join(runtimeDir, "target", "release", "pepper-worker")
+	bin := filepath.Join(runtimeDir, "target", "release", rustWorkerExeName(stdruntime.GOOS))
 	if _, err := os.Stat(bin); err == nil {
 		return bin, nil
 	}

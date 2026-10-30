@@ -17,16 +17,18 @@ import (
 )
 
 type WorkerState struct {
-	ID             string
-	Runtime        string
-	Groups         []string
-	Caps           []string
-	Load           atomic.Uint32
-	RequestsServed atomic.Uint64
-	UptimeMs       atomic.Int64
-	State          atomic.Value // WorkerHealthState
-	LastPing       atomic.Int64
-	inflight       sync.Map // corrID → *inflightMeta
+	ID                  string
+	Runtime             string
+	Groups              []string
+	Caps                []string
+	Load                atomic.Uint32
+	RequestsServed      atomic.Uint64
+	UptimeMs            atomic.Int64
+	State               atomic.Value // WorkerHealthState
+	LastPing            atomic.Int64
+	inflight            sync.Map // corrID → *inflightMeta
+	consecutiveFailures atomic.Int32
+	lastFailureTime     atomic.Int64 // unix nanos
 }
 
 type inflightMeta struct {
@@ -68,6 +70,9 @@ type Router struct {
 	// allowing WaitCapReady to block without polling.
 	capReadyMu sync.Mutex
 	capReadyCh chan struct{}
+	// Circuit breaker settings
+	circuitBreakerThreshold int
+	circuitBreakerTimeout   time.Duration
 }
 
 type Config struct {
@@ -81,14 +86,22 @@ type Config struct {
 	// directly to the group queue on the bus without requiring a locally
 	// registered worker — remote workers on other nodes pull from the shared queue.
 	Distributed bool
+	// CircuitBreakerThreshold opens the circuit after this many consecutive
+	// failures on a single worker. Set to 0 to disable (default: 5).
+	CircuitBreakerThreshold int
+	// CircuitBreakerTimeout is how long a worker stays open-circuited before
+	// allowing a test request (half-open state). Default: 30 seconds.
+	CircuitBreakerTimeout time.Duration
 }
 
 func DefaultConfig() Config {
 	return Config{
-		MaxRetries:       2,
-		PoisonThreshold:  2,
-		PoisonPillTTL:    time.Hour,
-		HeartbeatTimeout: 15 * time.Second,
+		MaxRetries:              2,
+		PoisonThreshold:         2,
+		PoisonPillTTL:           time.Hour,
+		HeartbeatTimeout:        15 * time.Second,
+		CircuitBreakerThreshold: 5,
+		CircuitBreakerTimeout:   30 * time.Second,
 	}
 }
 
@@ -98,21 +111,23 @@ func New(b bus.Bus, p *pending.Map, reaper *jack.Reaper, cfg Config, logger *ll.
 		hbTimeout = 15 * time.Second
 	}
 	return &Router{
-		workers:          make(map[string]*WorkerState),
-		groups:           make(map[string][]string),
-		capAffinity:      make(map[string][]string),
-		poisonPillTTL:    cfg.PoisonPillTTL,
-		poisonThreshold:  cfg.PoisonThreshold,
-		maxRetries:       cfg.MaxRetries,
-		heartbeatTimeout: hbTimeout,
-		dlq:              cfg.DLQ,
-		bus:              b,
-		pending:          p,
-		reaper:           reaper,
-		codec:            cfg.Codec,
-		logger:           logger.Namespace("router"),
-		distributed:      cfg.Distributed,
-		capReadyCh:       make(chan struct{}),
+		workers:                 make(map[string]*WorkerState),
+		groups:                  make(map[string][]string),
+		capAffinity:             make(map[string][]string),
+		poisonPillTTL:           cfg.PoisonPillTTL,
+		poisonThreshold:         cfg.PoisonThreshold,
+		maxRetries:              cfg.MaxRetries,
+		heartbeatTimeout:        hbTimeout,
+		dlq:                     cfg.DLQ,
+		bus:                     b,
+		pending:                 p,
+		reaper:                  reaper,
+		codec:                   cfg.Codec,
+		logger:                  logger.Namespace("router"),
+		distributed:             cfg.Distributed,
+		capReadyCh:              make(chan struct{}),
+		circuitBreakerThreshold: cfg.CircuitBreakerThreshold,
+		circuitBreakerTimeout:   cfg.CircuitBreakerTimeout,
 	}
 }
 
@@ -376,7 +391,9 @@ func (r *Router) BroadcastCancel(originID string) {
 		r.logger.Fields("origin_id", originID, "error", err).Error("cancel: marshal failed")
 		return
 	}
-	_ = r.bus.Publish(bus.TopicBroadcast, data)
+	if err := r.bus.Publish(bus.TopicBroadcast, data); err != nil {
+		r.logger.Fields("origin_id", originID, "error", err).Warn("cancel: broadcast failed")
+	}
 	r.logger.Fields("origin_id", originID).Debug("cancel broadcast sent")
 }
 
@@ -452,6 +469,9 @@ func (r *Router) leastBusy(candidates []string, group string) string {
 		}
 		if state := ws.State.Load().(WorkerHealthState); state != WorkerStateReady {
 			continue
+		}
+		if r.isCircuitOpen(ws) {
+			continue // Skip workers with open circuit breaker
 		}
 		if group != "" && !containsGroup(ws.Groups, group) {
 			continue
@@ -577,6 +597,36 @@ func (r *Router) removeFromGroup(group, workerID string) {
 			return
 		}
 	}
+}
+
+// isCircuitOpen returns true if the worker's circuit breaker is open,
+// meaning it should be skipped for routing. After the timeout expires,
+// the circuit enters half-open state, allowing one test request.
+func (r *Router) isCircuitOpen(ws *WorkerState) bool {
+	if r.circuitBreakerThreshold <= 0 {
+		return false // disabled
+	}
+	failures := ws.consecutiveFailures.Load()
+	if failures < int32(r.circuitBreakerThreshold) {
+		return false
+	}
+	// Circuit is open — check if timeout has passed (half-open state)
+	lastFailure := ws.lastFailureTime.Load()
+	if lastFailure == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, lastFailure)) < r.circuitBreakerTimeout
+}
+
+// recordWorkerFailure increments the consecutive failure count for circuit breaking.
+func (r *Router) recordWorkerFailure(ws *WorkerState) {
+	ws.consecutiveFailures.Add(1)
+	ws.lastFailureTime.Store(time.Now().UnixNano())
+}
+
+// recordWorkerSuccess resets the consecutive failure count on a successful request.
+func (r *Router) recordWorkerSuccess(ws *WorkerState) {
+	ws.consecutiveFailures.Store(0)
 }
 
 func containsGroup(groups []string, target string) bool {

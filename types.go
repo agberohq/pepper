@@ -18,18 +18,19 @@ import (
 type Vars = map[string]any
 
 type runtimeState struct {
-	bus          bus.Bus
-	readyWorkers atomic.Int32
-	workerStates sync.Map
-	loopers      sync.Map
-	bgCtx        context.Context
-	bgCancel     context.CancelFunc
-	router       *router.Router
-	blob         *blob.Manager
-	reqReaper    *jack.Reaper
-	blobReaper   *jack.Reaper
-	doctor       *jack.Doctor
-	subManager   sub.Manager
+	bus              bus.Bus
+	readyWorkers     atomic.Int32
+	firstWorkerReady chan struct{}
+	workerStates     sync.Map
+	loopers          sync.Map
+	bgCtx            context.Context
+	bgCancel         context.CancelFunc
+	router           *router.Router
+	blob             *blob.Manager
+	reqReaper        *jack.Reaper
+	blobReaper       *jack.Reaper
+	doctor           *jack.Doctor
+	subManager       sub.Manager
 }
 
 type workerEntry struct {

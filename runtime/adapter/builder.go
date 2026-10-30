@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/agberohq/pepper/internal/registry"
+	"github.com/agberohq/pepper/internal/wire"
 )
 
 // BuildSpec implements pepper.AdapterBuilder for HTTPBuilder.
@@ -16,7 +17,7 @@ import (
 func (b *HTTPBuilder) BuildSpec(name string) *registry.Spec {
 	groups := b.groups
 	if len(groups) == 0 {
-		groups = []string{"default"}
+		groups = []string{wire.GroupDefault}
 	}
 	timeout := b.timeout
 	if timeout == 0 {
@@ -36,7 +37,7 @@ func (b *HTTPBuilder) BuildSpec(name string) *registry.Spec {
 func (b *MCPBuilder) BuildSpec(name string) *registry.Spec {
 	groups := b.groups
 	if len(groups) == 0 {
-		groups = []string{"default"}
+		groups = []string{wire.GroupDefault}
 	}
 	return &registry.Spec{
 		Name:        name,

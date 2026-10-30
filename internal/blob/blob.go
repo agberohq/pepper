@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/agberohq/pepper/internal/wire"
 )
 
 const (
@@ -24,16 +26,16 @@ type Ref struct {
 }
 
 // Scheme returns the URL scheme of Path.
-// Returns "file" for bare filesystem paths (no "://" present).
+// Returns wire.SchemeFile for bare filesystem paths (no scheme separator present).
 func (r Ref) Scheme() string {
-	if i := strings.Index(r.Path, "://"); i > 0 {
+	if i := strings.Index(r.Path, wire.SchemeSep); i > 0 {
 		return r.Path[:i]
 	}
-	return "file"
+	return wire.SchemeFile
 }
 
 // IsLocal reports whether the blob lives on the local filesystem.
-func (r Ref) IsLocal() bool { return r.Scheme() == "file" }
+func (r Ref) IsLocal() bool { return r.Scheme() == wire.SchemeFile }
 
 // IsRemote reports whether the blob lives on a remote object store (e.g. s3://).
 func (r Ref) IsRemote() bool { return !r.IsLocal() }

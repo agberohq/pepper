@@ -1,6 +1,9 @@
 package cli
 
-import "github.com/agberohq/pepper/internal/registry"
+import (
+	"github.com/agberohq/pepper/internal/registry"
+	"github.com/agberohq/pepper/internal/wire"
+)
 
 // BuildSpec implements pepper.CMDBuilder for *Builder.
 // It stores the completed CMDSpec in spec.CLISpec so the CLI runner can
@@ -9,7 +12,7 @@ func (b *Builder) BuildSpec(name string) *registry.Spec {
 	spec := b.Build()
 	groups := spec.Groups
 	if len(groups) == 0 {
-		groups = []string{"default"}
+		groups = []string{wire.GroupDefault}
 	}
 	return &registry.Spec{
 		Name:    name,

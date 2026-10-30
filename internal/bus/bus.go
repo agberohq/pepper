@@ -21,19 +21,36 @@ import (
 	"strings"
 
 	"github.com/agberohq/pepper/internal/envelope"
+	"github.com/agberohq/pepper/internal/wire"
 )
 
-// Topic name helpers.
-func TopicPush(group string) string       { return "pepper.push." + group }
-func TopicPub(group string) string        { return "pepper.pub." + group }
-func TopicRes(originID string) string     { return "pepper.res." + originID }
-func TopicPipe(topic string) string       { return "pepper.pipe." + topic }
-func TopicStream(corrID string) string    { return "pepper.stream." + corrID }
-func TopicCb(corrID string) string        { return "pepper.cb." + corrID }
-func TopicHB(workerID string) string      { return "pepper.hb." + workerID }
-func TopicControl(workerID string) string { return "pepper.control." + workerID }
+// Topic name helpers. Every prefix lives in internal/wire; nothing outside this
+// block should concatenate a topic by hand.
+func TopicPush(group string) string       { return wire.TopicPushPrefix + group }
+func TopicPub(group string) string        { return wire.TopicPubPrefix + group }
+func TopicRes(originID string) string     { return wire.TopicResPrefix + originID }
+func TopicPipe(topic string) string       { return wire.TopicPipePrefix + topic }
+func TopicStream(corrID string) string    { return wire.TopicStreamPrefix + corrID }
+func TopicCb(corrID string) string        { return wire.TopicCbPrefix + corrID }
+func TopicHB(workerID string) string      { return wire.TopicHBPrefix + workerID }
+func TopicControl(workerID string) string { return wire.TopicControlPrefix + workerID }
 
-const TopicBroadcast = "pepper.broadcast"
+// Subscribe helpers. Use these instead of literal prefixes when subscribing.
+func TopicResPrefix() string     { return wire.TopicResPrefix }
+func TopicHBPrefix() string      { return wire.TopicHBPrefix }
+func TopicControlPrefix() string { return wire.TopicControlPrefix }
+
+// TopicPipePrefix returns the subscription prefix covering every stage topic of
+// a pipeline run, including its final topic.
+func TopicPipePrefix(pipeline string) string { return wire.TopicPipePrefix + pipeline + "." }
+
+// TopicPipeFinal returns the topic a pipeline's last worker stage forwards to.
+func TopicPipeFinal(pipeline string) string {
+	return wire.TopicPipePrefix + pipeline + "." + wire.PipeFinalSuffix
+}
+
+// TopicBroadcast reaches every worker on the bus.
+const TopicBroadcast = wire.TopicBroadcast
 
 // Message is a raw message received from the bus.
 type Message struct {
@@ -72,31 +89,41 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{URL: "tcp://127.0.0.1:0", SendBuf: 128, RecvBuf: 128}
+	return Config{URL: wire.SchemeURL(wire.SchemeTCP, "127.0.0.1:0"), SendBuf: 128, RecvBuf: 128}
 }
 
 // IsBroadcastTopic reports whether topic is a PUB/SUB broadcast topic.
 func IsBroadcastTopic(topic string) bool {
-	return strings.HasPrefix(topic, "pepper.pub.") || topic == TopicBroadcast
+	return strings.HasPrefix(topic, wire.TopicPubPrefix) || topic == TopicBroadcast
 }
 
 // IsPushTopic reports whether topic uses PUSH/PULL delivery.
-func IsPushTopic(topic string) bool { return strings.HasPrefix(topic, "pepper.push.") }
+func IsPushTopic(topic string) bool { return strings.HasPrefix(topic, wire.TopicPushPrefix) }
 
-func GroupFromPushTopic(topic string) string { return strings.TrimPrefix(topic, "pepper.push.") }
-func GroupFromPubTopic(topic string) string  { return strings.TrimPrefix(topic, "pepper.pub.") }
+func GroupFromPushTopic(topic string) string { return strings.TrimPrefix(topic, wire.TopicPushPrefix) }
+func GroupFromPubTopic(topic string) string  { return strings.TrimPrefix(topic, wire.TopicPubPrefix) }
+
+// GroupFromResTopic returns the origin id a response topic belongs to.
+func GroupFromResTopic(topic string) string { return strings.TrimPrefix(topic, wire.TopicResPrefix) }
 
 // WorkerEnvVars returns environment variables injected into worker subprocesses.
+// The variable names live in internal/wire and are read by every bundled runtime.
 func WorkerEnvVars(workerID, busAddr, codec string, groups []string, heartbeatMs, maxConcurrent int, blobDir string) []string {
 	return []string{
-		"PEPPER_WORKER_ID=" + workerID,
-		"PEPPER_BUS_URL=" + busAddr,
-		"PEPPER_CODEC=" + codec,
-		"PEPPER_GROUPS=" + strings.Join(groups, ","),
-		"PEPPER_HEARTBEAT_MS=" + itoa(heartbeatMs),
-		"PEPPER_MAX_CONCURRENT=" + itoa(maxConcurrent),
-		"PEPPER_BLOB_DIR=" + blobDir,
+		wire.EnvWorkerID + "=" + workerID,
+		wire.EnvBusURL + "=" + busAddr,
+		wire.EnvCodec + "=" + codec,
+		wire.EnvGroups + "=" + strings.Join(groups, ","),
+		wire.EnvHeartbeatMS + "=" + itoa(heartbeatMs),
+		wire.EnvMaxConcurrent + "=" + itoa(maxConcurrent),
+		wire.EnvBlobDir + "=" + blobDir,
 	}
+}
+
+// WorkerResourcesVar returns the PEPPER_RESOURCES assignment for a marshalled
+// resource config blob.
+func WorkerResourcesVar(marshalled []byte) string {
+	return wire.EnvResources + "=" + string(marshalled)
 }
 
 func itoa(n int) string { return fmt.Sprintf("%d", n) }

@@ -2,12 +2,14 @@ package bus_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/coord"
+	"github.com/agberohq/pepper/internal/wire"
 )
 
 // newTestBus creates a Mula-backed Bus for external (_test) package tests.
@@ -67,6 +69,73 @@ func TestTopicHelpers(t *testing.T) {
 				t.Errorf("%s(%q) = %q, want %q", tt.name, tt.topic, got, tt.expected)
 			}
 		})
+	}
+}
+
+// TestTopicPrefixHelpers pins the subscription prefixes and the pipeline final
+// topic, which the runtime builds without ever touching a literal.
+func TestTopicPrefixHelpers(t *testing.T) {
+	if got, want := bus.TopicResPrefix(), "pepper.res."; got != want {
+		t.Errorf("TopicResPrefix = %q, want %q", got, want)
+	}
+	if got, want := bus.TopicControlPrefix(), "pepper.control."; got != want {
+		t.Errorf("TopicControlPrefix = %q, want %q", got, want)
+	}
+	if got, want := bus.TopicHBPrefix(), "pepper.hb."; got != want {
+		t.Errorf("TopicHBPrefix = %q, want %q", got, want)
+	}
+	if got, want := bus.TopicPipePrefix("audio.pipeline"), "pepper.pipe.audio.pipeline."; got != want {
+		t.Errorf("TopicPipePrefix = %q, want %q", got, want)
+	}
+	if got, want := bus.TopicPipeFinal("audio.pipeline"), "pepper.pipe.audio.pipeline.final"; got != want {
+		t.Errorf("TopicPipeFinal = %q, want %q", got, want)
+	}
+	if got, want := bus.TopicBroadcast, "pepper.broadcast"; got != want {
+		t.Errorf("TopicBroadcast = %q, want %q", got, want)
+	}
+
+	// A final topic must be covered by its own prefix subscription.
+	if !strings.HasPrefix(bus.TopicPipeFinal("p"), bus.TopicPipePrefix("p")) {
+		t.Error("pipe final topic is outside its prefix subscription")
+	}
+}
+
+// TestTopicRoundTrip verifies the group/origin parsers invert the builders.
+func TestTopicRoundTrip(t *testing.T) {
+	if got := bus.GroupFromPushTopic(bus.TopicPush("gpu")); got != "gpu" {
+		t.Errorf("GroupFromPushTopic = %q, want gpu", got)
+	}
+	if got := bus.GroupFromPubTopic(bus.TopicPub("asr")); got != "asr" {
+		t.Errorf("GroupFromPubTopic = %q, want asr", got)
+	}
+	if got := bus.GroupFromResTopic(bus.TopicRes("origin-1")); got != "origin-1" {
+		t.Errorf("GroupFromResTopic = %q, want origin-1", got)
+	}
+}
+
+// TestWorkerEnvVarsUsesWireNames guards the PEPPER_* names the bundled runtimes
+// read. Changing one here without changing internal/wire breaks every worker.
+func TestWorkerEnvVarsUsesWireNames(t *testing.T) {
+	vars := bus.WorkerEnvVars("w-1", "tcp://127.0.0.1:7731", "msgpack",
+		[]string{"gpu", "asr"}, 5000, 8, "/tmp/blobs")
+
+	joined := strings.Join(vars, "\n")
+	for _, want := range []string{
+		wire.EnvWorkerID + "=w-1",
+		wire.EnvBusURL + "=tcp://127.0.0.1:7731",
+		wire.EnvCodec + "=msgpack",
+		wire.EnvGroups + "=gpu,asr",
+		wire.EnvHeartbeatMS + "=5000",
+		wire.EnvMaxConcurrent + "=8",
+		wire.EnvBlobDir + "=/tmp/blobs",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("WorkerEnvVars missing %q\n got: %s", want, joined)
+		}
+	}
+
+	if got, want := bus.WorkerResourcesVar([]byte(`{"db":1}`)), wire.EnvResources+`={"db":1}`; got != want {
+		t.Errorf("WorkerResourcesVar = %q, want %q", got, want)
 	}
 }
 

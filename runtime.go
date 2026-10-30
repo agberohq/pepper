@@ -180,6 +180,21 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	// Boot workers
 	allSpecs := p.reg.All()
 	if len(allSpecs) > 0 {
+		bootTimeout := p.cfg.BootTimeout
+		if bootTimeout <= 0 {
+			bootTimeout = p.cfg.DefaultTimeout
+		}
+		if bootTimeout <= 0 {
+			bootTimeout = DefaultShutdownTimeout
+		}
+		bootCtx, bootCancel := context.WithTimeout(bgCtx, bootTimeout)
+		defer bootCancel()
+		// Wait for the first worker to become ready via channel notification
+		// instead of polling every 30ms. The channel is created before booting
+		// so that Go/HTTP/CLI workers can signal it during bootGoWorkers etc.
+		// Python workers signal it when cap_ready arrives via the control loop.
+		rt.firstWorkerReady = make(chan struct{})
+
 		if err := p.bootGoWorkers(bgCtx, allSpecs); err != nil {
 			bgCancel()
 			return fmt.Errorf("pepper: go workers: %w", err)
@@ -203,29 +218,15 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 			}
 		}
 
-		bootTimeout := p.cfg.BootTimeout
-		if bootTimeout <= 0 {
-			bootTimeout = p.cfg.DefaultTimeout
-		}
-		if bootTimeout <= 0 {
-			bootTimeout = DefaultShutdownTimeout
-		}
-		bootCtx, bootCancel := context.WithTimeout(bgCtx, bootTimeout)
-		defer bootCancel()
-		for {
-			if rt.readyWorkers.Load() > 0 {
-				break
-			}
-			select {
-			case <-bootCtx.Done():
-				goto doneWaiting
-			case <-time.After(30 * time.Millisecond):
-			}
-		}
-	doneWaiting:
 		if rt.readyWorkers.Load() == 0 {
-			bgCancel()
-			return fmt.Errorf("pepper: boot: timed out waiting for a worker to become ready")
+			select {
+			case <-rt.firstWorkerReady:
+			case <-bootCtx.Done():
+				if rt.readyWorkers.Load() == 0 {
+					bgCancel()
+					return fmt.Errorf("pepper: boot: timed out waiting for a worker to become ready")
+				}
+			}
 		}
 	}
 
@@ -251,7 +252,9 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	})
 	p.shutdown.RegisterWithContext("workers.bye", func(_ context.Context) error {
 		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye})
-		_ = rt.bus.Publish(bus.TopicBroadcast, bye)
+		if err := rt.bus.Publish(bus.TopicBroadcast, bye); err != nil {
+			p.logger.Fields("error", err).Warn("shutdown: worker bye broadcast failed")
+		}
 		time.Sleep(200 * time.Millisecond)
 		return nil
 	})
@@ -386,7 +389,9 @@ func (p *Pepper) routeResponse(data []byte) {
 				cbRes.Payload = res.AsBytes()
 			}
 			resData, _ := p.codec.Marshal(cbRes)
-			_ = p.rt.bus.Publish(bus.TopicRes(env.OriginID()), resData)
+			if err := p.rt.bus.Publish(bus.TopicRes(env.OriginID()), resData); err != nil {
+				p.logger.Fields("origin_id", env.OriginID(), "error", err).Warn("callback: response publish failed")
+			}
 		}()
 	}
 }
@@ -457,13 +462,16 @@ func (p *Pepper) handleControl(data []byte) {
 			for _, spec := range p.reg.All() {
 				if spec.Runtime == registry.RuntimePython && (len(env.Groups()) == 0 || len(spec.Groups) == 0 || p.groupsOverlap(spec.Groups, env.Groups())) {
 					payload, _ := p.codec.Marshal(p.buildCapLoad(spec))
-					_ = p.rt.bus.Publish(bus.TopicControl(wid), payload)
+					if err := p.rt.bus.Publish(bus.TopicControl(wid), payload); err != nil {
+						p.logger.Fields("worker_id", wid, "cap", spec.Name, "error", err).Warn("control: cap_load publish failed")
+					}
 				}
 			}
 		}
 
 	case "cap_ready":
 		// ALWAYS unblock pp.Start() even if the capability failed to load
+		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 
 		if errStr, _ := env["error"].(string); errStr == "" {
@@ -761,7 +769,9 @@ func (p *Pepper) startRespawnLooper(workerID string, wc WorkerConfig, allSpecs [
 func (p *Pepper) checkRecycle(workerID string, wc WorkerConfig, served uint64, uptimeMs int64) {
 	if (wc.MaxRequests > 0 && served >= wc.MaxRequests) || (wc.MaxUptime > 0 && time.Duration(uptimeMs)*time.Millisecond >= wc.MaxUptime) {
 		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye, WorkerID: workerID})
-		_ = p.rt.bus.Publish(bus.TopicBroadcast, bye)
+		if err := p.rt.bus.Publish(bus.TopicBroadcast, bye); err != nil {
+			p.logger.Fields("worker_id", workerID, "error", err).Warn("recycle: worker bye broadcast failed")
+		}
 	}
 }
 
@@ -897,6 +907,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 			Caps:     []string{spec.Name},
 		})
 		p.rt.router.MarkCapReady(wid, spec.Name)
+		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
 		p.shutdown.RegisterWithContext("goworker."+wid, func(_ context.Context) error { rt.Stop(); return nil })
@@ -947,6 +958,7 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		}
 		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Runtime: "http", Groups: groups, Caps: []string{spec.Name}})
 		p.rt.router.MarkCapReady(wid, spec.Name)
+		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
 		p.shutdown.RegisterWithContext("http."+wid, func(_ context.Context) error { wrt.Stop(); return nil })
@@ -975,6 +987,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 		}
 		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Runtime: "cli", Groups: groups, Caps: []string{spec.Name}})
 		p.rt.router.MarkCapReady(wid, spec.Name)
+		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
 		p.shutdown.RegisterWithContext("cli."+wid, func(_ context.Context) error { wrt.Stop(); return nil })

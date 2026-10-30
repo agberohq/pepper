@@ -13,7 +13,7 @@ use pepper_runtime::prelude::*;
 struct Echo;
 
 impl Capability for Echo {
-    fn run(&mut self, ctx: &Context, input: Input) -> Result<Value> {
+    fn run(&self, ctx: &Context, input: Input) -> Result<Value> {
         let msg = input.str_or("msg", "");
         Ok(json!({
             "msg": msg,

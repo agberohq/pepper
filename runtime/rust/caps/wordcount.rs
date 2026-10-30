@@ -12,7 +12,7 @@ use pepper_runtime::prelude::*;
 struct WordCount;
 
 impl Capability for WordCount {
-    fn run(&mut self, _ctx: &Context, input: Input) -> Result<Value> {
+    fn run(&self, _ctx: &Context, input: Input) -> Result<Value> {
         let text = input.str_or("text", "");
         let words = text.split_whitespace().count();
         let longest = text.split_whitespace().max_by_key(|w| w.len()).unwrap_or("");

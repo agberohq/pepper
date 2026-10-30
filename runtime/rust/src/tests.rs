@@ -5,7 +5,76 @@
 
 use crate::cap::{new_tensor, BlobRef};
 use crate::envelope::{self, msg, unframe, Envelope};
+use crate::stream::{Semaphore, StreamState};
 use serde_json::json;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[test]
+fn stream_state_delivers_chunks_in_order_then_eof() {
+    let state = StreamState::new();
+    let producer = Arc::clone(&state);
+    let handle = std::thread::spawn(move || {
+        for i in 0..3 {
+            producer.push(json!(i));
+        }
+        producer.close();
+    });
+
+    let mut seen = Vec::new();
+    while let Some(chunk) = state.next(Some(Duration::from_secs(5))) {
+        seen.push(chunk.as_i64().unwrap_or(-1));
+    }
+    handle.join().unwrap();
+    assert_eq!(seen, vec![0, 1, 2], "chunks must arrive in order, then EOF");
+}
+
+#[test]
+fn stream_state_returns_none_after_close_when_empty() {
+    let state = StreamState::new();
+    state.close();
+    assert!(state.next(Some(Duration::from_millis(50))).is_none());
+}
+
+#[test]
+fn semaphore_bounds_concurrent_holders() {
+    let sem = Semaphore::new(2);
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let sem = Arc::clone(&sem);
+        let active = Arc::clone(&active);
+        let peak = Arc::clone(&peak);
+        handles.push(std::thread::spawn(move || {
+            let _permit = sem.acquire();
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert!(
+        peak.load(std::sync::atomic::Ordering::SeqCst) <= 2,
+        "semaphore allowed more than 2 concurrent holders"
+    );
+}
+
+#[test]
+fn semaphore_does_not_delay_when_free() {
+    let sem = Semaphore::new(4);
+    let started = Instant::now();
+    {
+        let _a = sem.acquire();
+        let _b = sem.acquire();
+    }
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
 
 #[test]
 fn envelope_round_trip_uses_named_fields() {

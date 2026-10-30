@@ -67,6 +67,7 @@ pub struct Context {
     session: RefCell<Map<String, Value>>,
     updates: RefCell<Map<String, Value>>,
     cancelled: Arc<Mutex<HashSet<String>>>,
+    stream: Option<Arc<crate::stream::StreamState>>,
 }
 
 impl Context {
@@ -89,7 +90,31 @@ impl Context {
             session: RefCell::new(session),
             updates: RefCell::new(Map::new()),
             cancelled,
+            stream: None,
         }
+    }
+
+    /// Attach the input side of a stream (set by the runtime for `stream_open`).
+    pub(crate) fn with_stream(mut self, stream: Arc<crate::stream::StreamState>) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// Next input chunk of this stream, blocking until one arrives.
+    /// Returns `None` once the caller closed the stream. Always `None` for
+    /// non-streaming requests.
+    pub fn next_chunk(&self) -> Option<Value> {
+        self.stream.as_ref().and_then(|s| s.next(None))
+    }
+
+    /// Like [`Context::next_chunk`] but gives up after `timeout`.
+    pub fn next_chunk_timeout(&self, timeout: std::time::Duration) -> Option<Value> {
+        self.stream.as_ref().and_then(|s| s.next(Some(timeout)))
+    }
+
+    /// True when the handler was invoked for a stream (input chunks available).
+    pub fn is_stream(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// Envelope meta (trace ids, blob ids, cost, …).
@@ -329,12 +354,35 @@ fn blob_id() -> String {
 }
 
 /// One capability: `setup` once per worker, `run` once per request.
-pub trait Capability: Send {
+/// One capability: `setup` once per worker, `run` once per request.
+///
+/// `run` takes `&self` on purpose: you get real parallelism (several requests
+/// executing at once) with a **single** handler instance, so a model is loaded
+/// once. Put mutable state behind `Mutex`/`RwLock`/atomics inside your struct —
+/// the same trade-off you would make in any async Rust service.
+pub trait Capability: Send + Sync {
     fn setup(&mut self, _config: &Config) -> Result<()> {
         Ok(())
     }
-    fn run(&mut self, ctx: &Context, input: Input) -> Result<Value>;
-    fn teardown(&mut self) {}
+
+    fn run(&self, ctx: &Context, input: Input) -> Result<Value>;
+
+    /// Streaming variant used for `stream_open`. The default emits the single
+    /// value from [`run`] as one chunk; override it to emit incrementally (LLM
+    /// tokens, progressive transcription, …). Input chunks sent by the caller are
+    /// available through [`Context::next_chunk`].
+    fn run_stream(
+        &self,
+        ctx: &Context,
+        input: Input,
+        emit: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        emit(self.run(ctx, input)?)
+    }
+
+    /// Called once when the worker shuts down. `&self`, like [`Capability::run`],
+    /// so a handler that other requests still hold cannot deadlock shutdown.
+    fn teardown(&self) {}
 }
 
 /// Everything the runtime needs in order to serve one capability.
@@ -394,7 +442,7 @@ impl CapabilitySpec {
 struct NoopCapability;
 
 impl Capability for NoopCapability {
-    fn run(&mut self, _ctx: &Context, _input: Input) -> Result<Value> {
+    fn run(&self, _ctx: &Context, _input: Input) -> Result<Value> {
         Err(crate::envelope::Error::Config(
             "no handler installed for this capability".to_string(),
         ))

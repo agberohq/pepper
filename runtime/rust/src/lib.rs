@@ -48,3 +48,5 @@ pub mod prelude {
 
 #[cfg(test)]
 mod tests;
+
+pub mod stream;

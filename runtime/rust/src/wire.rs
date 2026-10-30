@@ -14,6 +14,8 @@ pub const TOPIC_RES: &str = "pepper.res.";
 pub const TOPIC_PIPE: &str = "pepper.pipe.";
 pub const TOPIC_HB: &str = "pepper.hb.";
 pub const TOPIC_CONTROL: &str = "pepper.control";
+/// Per-worker control topics: `pepper.control.<worker_id>`.
+pub const TOPIC_CONTROL_PREFIX: &str = "pepper.control.";
 pub const TOPIC_BROADCAST: &str = "pepper.broadcast";
 
 /// Response topic for one request.
@@ -28,7 +30,7 @@ pub fn topic_hb(worker_id: &str) -> String {
 
 /// Per-worker control topic, used by the router to deliver `cap_load`.
 pub fn topic_control_worker(worker_id: &str) -> String {
-    format!("{TOPIC_CONTROL}.{worker_id}")
+    format!("{TOPIC_CONTROL_PREFIX}{worker_id}")
 }
 
 /// Environment variables injected by `internal/bus.WorkerEnvVars`.

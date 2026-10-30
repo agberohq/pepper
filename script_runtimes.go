@@ -186,8 +186,8 @@ func (p *Pepper) startScriptWorker(
 
 	if err := cmd.Start(); err != nil {
 		if logW != nil {
-			logR.Close()
-			logW.Close()
+			_ = logR.Close()
+			_ = logW.Close()
 		}
 		return err
 	}
@@ -195,7 +195,7 @@ func (p *Pepper) startScriptWorker(
 		p.logger.Fields("worker", workerID, "error", err).Warn("sub.Track failed")
 	}
 	if logW != nil {
-		logW.Close()
+		_ = logW.Close()
 		go p.pipeWorkerLogs(logR, workerID, runtimeKind)
 	}
 

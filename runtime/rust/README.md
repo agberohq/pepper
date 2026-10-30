@@ -107,22 +107,80 @@ Declaring a crate the runtime already depends on (`serde_json` above) is fine: y
 version wins instead of producing a duplicate-key manifest. Malformed entries are
 reported on stderr and skipped rather than breaking the build.
 
+## Concurrency and streaming
+
+`run` takes `&self`, so **one handler instance serves many requests in parallel** —
+you pay for one model load, not one per thread. Mutable state goes behind
+`Mutex`/`RwLock`/atomics inside your struct, which is the same trade-off any Rust
+service makes. `PEPPER_MAX_CONCURRENT` is a real limit here: requests queue on a
+semaphore before entering the handler.
+
+```rust
+// go side, 4 x 250ms: measured 251ms, not 1s (tests/rust_parity_test.go)
+pepper.All[Out](ctx, pp, call, call, call, call)
+```
+
+Server streaming is supported via `run_stream`. Each emitted value becomes a
+`res_chunk` envelope, and the runtime closes with `res_end`:
+
+```rust
+impl Capability for Tokens {
+    fn run(&self, _ctx: &Context, input: Input) -> Result<Value> {
+        Ok(json!({ "text": input.str_or("prompt", "") }))
+    }
+
+    fn run_stream(
+        &self,
+        _ctx: &Context,
+        input: Input,
+        emit: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        for (i, word) in input.str_or("prompt", "").split_whitespace().enumerate() {
+            emit(json!({ "index": i, "token": word }))?;
+        }
+        Ok(())
+    }
+}
+```
+
+For bidirectional streams the input side is available inside the handler:
+`ctx.next_chunk()` blocks until the caller sends a chunk, returning `None` once
+they close the stream (`ctx.is_stream()` tells you which mode you are in).
+
+## Deployment without a toolchain
+
+Compilation happens once. After that the cached binary is executed directly, so a
+multi-stage Docker build (or an air-gapped host) needs no Rust at runtime:
+
+```dockerfile
+FROM rust:1 AS build
+WORKDIR /src
+COPY runtime/rust ./runtime/rust
+RUN cargo build --release --manifest-path runtime/rust/Cargo.toml
+RUN runtime/rust/target/release/pepper-worker --prepare       --cap caps/rerank.rs --cap caps/embed.rs      # fills $PEPPER_CACHE_DIR
+
+FROM gcr.io/distroless/cc
+COPY --from=build /src/runtime/rust/target/release/pepper-worker /usr/local/bin/
+COPY --from=build /src/pepper-cache /var/cache/pepper
+COPY caps /caps
+ENV PEPPER_RUST_WORKER_BIN=/usr/local/bin/pepper-worker     PEPPER_CACHE_DIR=/var/cache/pepper
+```
+
+`TestRustPrebuiltCacheRunsWithoutCargo` asserts the contract: with `CARGO`
+pointing at a nonexistent binary, a warm cache still starts and serves.
+
 ## Notes and limits
 
 - **One capability per file** — inherent to Rust: a file is a compilation unit, and
   `capability!` declares one entry point. A worker serves as many files as you
   register for its groups.
-- **`run` is serialized per worker.** Each request gets its own thread, but the
-  handler sits behind a mutex so a single model instance is never entered twice.
-  Scale with `pepper.NewWorker(...)` instances or `max_concurrent` groups rather
-  than expecting intra-process parallelism.
 - **`//!` doc comments** at the top of a cap file are rewritten to `//` because the
   file is `include!`d into a module.
-- **Streaming** (`stream_open`/`res_chunk`) and **`pepper.call()` callbacks** are not
-  implemented in this runtime yet; `worker_hello` reports `stream_supported: false`
-  and `cb_supported: false` so the router never waits for messages we do not send.
+- **`pepper.call()` callbacks** are not implemented yet; `worker_hello` reports
+  `cb_supported: false` so the router never waits for messages we do not send.
 - **Transport**: `tcp://` (Mula) only. Redis/NATS worker connections live in the
-  Python runtime; extend `src/transport.rs` if you need them.
+  Python runtime; extend `src/transport.rs` if you need them (the `// pepper:deps`
+  header now makes adding an SDK crate a one-line change).
 - **Blobs**: `input.blob("tensor")` gives you the file; `.map()` memory-maps it and
   `.as_f32()` derefs to `&[f32]` for zero-copy tensors.
   `new_tensor(bytes, "float32", &shape)` returns a reference for the reply.

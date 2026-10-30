@@ -18,12 +18,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
+use ed25519_dalek::{Signer, SigningKey};
+
 use crate::cap::{Capability, CapabilitySpec, Config, Context, Input};
+use crate::stream::{Semaphore, StreamState};
 use crate::envelope::{self, err_code, msg, Envelope, Error, Result};
 use crate::transport::Transport;
 use crate::wire;
 
-type Handler = Arc<Mutex<Box<dyn Capability>>>;
+/// A loaded capability. `Arc`, not `Mutex`: `run` takes `&self`, so requests
+/// execute in parallel against one handler instance.
+type Handler = Arc<dyn Capability>;
 
 /// Configuration read from the environment the Go runtime injects.
 #[derive(Debug, Clone)]
@@ -111,6 +116,11 @@ pub fn serve(specs: Vec<CapabilitySpec>) -> Result<()> {
     let handlers: Arc<Mutex<HashMap<String, Handler>>> = Arc::new(Mutex::new(HashMap::new()));
     // name -> cap_ver, for heartbeats and response envelopes.
     let loaded: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Bounds how many requests execute at once (PEPPER_MAX_CONCURRENT).
+    let permits = Semaphore::new(cfg.max_concurrent);
+    // Open streams, keyed by stream id.
+    let streams: Arc<Mutex<HashMap<String, Arc<StreamState>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     send(&transport, hello(&cfg, declared.keys().cloned().collect()))?;
     log(
@@ -181,7 +191,7 @@ pub fn serve(specs: Vec<CapabilitySpec>) -> Result<()> {
                     Ok(h) => {
                         let setup_ms = started.elapsed().as_millis() as i64;
                         if let Ok(mut map) = handlers.lock() {
-                            map.insert(name.clone(), Arc::new(Mutex::new(h)));
+                            map.insert(name.clone(), Arc::from(h));
                         }
                         if let Ok(mut map) = loaded.lock() {
                             map.insert(name.clone(), env.cap_ver.clone());
@@ -220,14 +230,16 @@ pub fn serve(specs: Vec<CapabilitySpec>) -> Result<()> {
                     .unwrap_or_default();
 
                 // One thread per request keeps the read loop free to answer
-                // heartbeats and cancels. The handler itself is serialized by
-                // its mutex, so a single model instance is never run twice at
-                // once; scale with more workers instead.
+                // heartbeats and cancels. `permits` bounds how many of them run
+                // at once, and the handler is shared: `run(&self)` means real
+                // parallelism against a single model instance.
                 let t = Arc::clone(&transport);
                 let c = Arc::clone(&cancelled);
                 let s = Arc::clone(&served);
                 let wid = cfg.worker_id.clone();
+                let perms = Arc::clone(&permits);
                 thread::spawn(move || {
+                    let _permit = perms.acquire();
                     if let Some(reply) = handle_request(handler, &c, &wid, &cap, &cap_ver, &env) {
                         if let Err(e) = send(&t, reply) {
                             log("error", "send response failed", &format!("{{\"cap\":\"{cap}\",\"error\":\"{e}\"}}"));
@@ -235,6 +247,92 @@ pub fn serve(specs: Vec<CapabilitySpec>) -> Result<()> {
                     }
                     s.fetch_add(1, Ordering::Relaxed);
                 });
+            }
+            msg::STREAM_OPEN => {
+                let cap = env.cap.clone();
+                let handler = handlers.lock().ok().and_then(|m| m.get(&cap).cloned());
+                let stream_id = env.stream_id.clone();
+                let state = StreamState::new();
+                if let Ok(mut map) = streams.lock() {
+                    map.insert(stream_id.clone(), Arc::clone(&state));
+                }
+
+                let t = Arc::clone(&transport);
+                let c = Arc::clone(&cancelled);
+                let s = Arc::clone(&served);
+                let wid = cfg.worker_id.clone();
+                let perms = Arc::clone(&permits);
+                let registry = Arc::clone(&streams);
+                thread::spawn(move || {
+                    let _permit = perms.acquire();
+                    let result = (|| -> Result<()> {
+                        let handler = handler.ok_or_else(|| {
+                            Error::Capability(format!("capability {cap:?} is not loaded on this worker"))
+                        })?;
+                        let input = Input::from_value(decode_payload(env.payload_bytes())?);
+                        let ctx =
+                            Context::new(&env, Arc::clone(&c)).with_stream(Arc::clone(&state));
+
+                        let mut emit = |value: Value| -> Result<()> {
+                            let chunk = Envelope {
+                                proto_ver: envelope::PROTO_VER,
+                                msg_type: msg::RES_CHUNK.to_string(),
+                                corr_id: env.corr_id.clone(),
+                                origin_id: env.origin_id.clone(),
+                                worker_id: wid.clone(),
+                                cap: cap.clone(),
+                                stream_id: stream_id.clone(),
+                                payload: Some(serde_bytes::ByteBuf::from(encode_payload(&value)?)),
+                                ..Default::default()
+                            };
+                            send(&t, chunk)
+                        };
+                        handler.run_stream(&ctx, input, &mut emit)?;
+                        send(
+                            &t,
+                            Envelope {
+                                proto_ver: envelope::PROTO_VER,
+                                msg_type: msg::RES_END.to_string(),
+                                corr_id: env.corr_id.clone(),
+                                origin_id: env.origin_id.clone(),
+                                worker_id: wid.clone(),
+                                cap: cap.clone(),
+                                stream_id: stream_id.clone(),
+                                ..Default::default()
+                            },
+                        )
+                    })();
+                    if let Err(e) = result {
+                        let _ = send(
+                            &t,
+                            error_envelope(&env, &wid, err_code::EXEC_ERROR, &e.to_string()),
+                        );
+                    }
+                    if let Ok(mut map) = registry.lock() {
+                        map.remove(&stream_id);
+                    }
+                    s.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            msg::STREAM_CHUNK => {
+                let id = env.stream_id.clone();
+                let state = streams.lock().ok().and_then(|m| m.get(&id).cloned());
+                if let Some(state) = state {
+                    match decode_payload(env.payload_bytes()) {
+                        Ok(value) => state.push(value),
+                        Err(e) => log(
+                            "warn",
+                            "stream chunk decode failed",
+                            &format!("{{\"stream_id\":\"{id}\",\"error\":\"{e}\"}}"),
+                        ),
+                    }
+                }
+            }
+            msg::STREAM_CLOSE => {
+                let id = env.stream_id.clone();
+                if let Some(state) = streams.lock().ok().and_then(|m| m.get(&id).cloned()) {
+                    state.close();
+                }
             }
             msg::CANCEL => {
                 let origin = env.origin_id.clone();
@@ -245,8 +343,18 @@ pub fn serve(specs: Vec<CapabilitySpec>) -> Result<()> {
                 }
             }
             msg::WORKER_BYE => {
-                log("info", "worker bye — shutting down", "{}");
-                break;
+                // Targeted bye (recycle) carries a worker_id; a global shutdown
+                // carries none. Anything else is somebody else's business.
+                let target = env.worker_id.clone();
+                if target.is_empty() || target == cfg.worker_id {
+                    log("info", "worker bye — shutting down", "{}");
+                    break;
+                }
+                log(
+                    "debug",
+                    "ignoring worker_bye for another worker",
+                    &format!("{{\"target\":\"{target}\"}}"),
+                );
             }
             msg::AUTH_CHALLENGE => {
                 if let Err(e) = handle_auth_challenge(&cfg, &transport, &env) {
@@ -262,10 +370,8 @@ pub fn serve(specs: Vec<CapabilitySpec>) -> Result<()> {
     }
 
     if let Ok(map) = handlers.lock() {
-        for (_, h) in map.iter() {
-            if let Ok(mut h) = h.lock() {
-                h.teardown();
-            }
+        for h in map.values() {
+            h.teardown();
         }
     }
     Ok(())
@@ -323,10 +429,7 @@ fn handle_request(
         }
     };
 
-    let outcome = match handler.lock() {
-        Ok(mut h) => h.run(&ctx, input),
-        Err(_) => Err(Error::Capability("handler panicked while locked".into())),
-    };
+    let outcome = handler.run(&ctx, input);
 
     match outcome {
         Ok(value) => {
@@ -386,10 +489,10 @@ fn hello(cfg: &WorkerConfig, declared: Vec<String>) -> Envelope {
         codec: "msgpack".to_string(),
         groups: cfg.groups.clone(),
         caps: declared,
-        // Callbacks and streaming are not implemented in this runtime yet;
-        // advertising them would make the router wait for messages we never send.
+        // Streaming (output chunks) is implemented; `pepper.call()` callbacks are not,
+        // and advertising them would make the router wait for messages we never send.
         cb_supported: false,
-        stream_supported: false,
+        stream_supported: true,
         public_key,
         ..Default::default()
     }
@@ -406,16 +509,7 @@ fn handle_auth_challenge(
         log("warn", "auth_challenge received but no PEPPER_AUTH_KEY set", "{}");
         return Ok(());
     }
-    let priv_bytes = hex::decode(&private_key_hex)
-        .map_err(|e| Error::Capability(format!("decode auth key: {e}")))?;
-    if priv_bytes.len() != 64 {
-        return Err(Error::Capability(
-            "PEPPER_AUTH_KEY must be 64 bytes (128 hex chars)".to_string(),
-        ));
-    }
-    let secret = ed25519_dalek::SecretKey::from_slice(&priv_bytes[..32])
-        .map_err(|e| Error::Capability(format!("invalid Ed25519 secret key: {e}")))?;
-    let signing_key = ed25519_dalek::SigningKey::from(secret);
+    let signing_key = signing_key_from_hex(&private_key_hex)?;
     let challenge = env.meta.get("challenge").and_then(|v| {
         if let Value::Array(arr) = v {
             Some(arr.iter().filter_map(|b| b.as_u64()).map(|b| b as u8).collect::<Vec<u8>>())
@@ -428,7 +522,7 @@ fn handle_auth_challenge(
         return Err(Error::Capability("empty challenge".to_string()));
     }
     let signature = signing_key.sign(&challenge);
-    let public_key = *signing_key.verifying_key().as_bytes();
+    let public_key = signing_key.verifying_key().to_bytes();
     let mut resp_meta = Map::new();
     resp_meta.insert("public_key".to_string(), Value::Array(
         public_key.iter().map(|b| Value::Number(serde_json::Number::from(*b))).collect()
@@ -448,27 +542,29 @@ fn handle_auth_challenge(
     Ok(())
 }
 
+/// Parse an Ed25519 signing key from a hex-encoded 64-byte libsodium-style key
+/// (seed ‖ public key). The first 32 bytes are the seed.
+pub(crate) fn signing_key_from_hex(private_key_hex: &str) -> Result<SigningKey> {
+    let priv_bytes = hex::decode(private_key_hex)
+        .map_err(|e| Error::Capability(format!("decode auth key: {e}")))?;
+    if priv_bytes.len() != 64 {
+        return Err(Error::Capability(
+            "PEPPER_AUTH_KEY must be 64 bytes (128 hex chars)".to_string(),
+        ));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&priv_bytes[..32]);
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 /// Load the Ed25519 public key from PEPPER_AUTH_KEY env var (hex-encoded).
 fn load_auth_public_key() -> Vec<u8> {
     let private_key_hex = match std::env::var("PEPPER_AUTH_KEY") {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let priv_bytes = match hex::decode(&private_key_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            log("warn", "failed to decode PEPPER_AUTH_KEY", &format!("{{\"error\":\"{e}\"}}"));
-            return Vec::new();
-        }
-    };
-    if priv_bytes.len() != 64 {
-        return Vec::new();
-    }
-    match ed25519_dalek::SecretKey::from_slice(&priv_bytes[..32]) {
-        Ok(secret) => {
-            let signing_key = ed25519_dalek::SigningKey::from(secret);
-            signing_key.verifying_key().to_bytes().to_vec()
-        }
+    match signing_key_from_hex(&private_key_hex) {
+        Ok(key) => key.verifying_key().to_bytes().to_vec(),
         Err(e) => {
             log("warn", "failed to load auth public key", &format!("{{\"error\":\"{e}\"}}"));
             Vec::new()

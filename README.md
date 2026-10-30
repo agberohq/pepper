@@ -33,21 +33,22 @@ implemented once in the router — not again in every wrapper.
 |---|---|
 | Python / Julia / Node.js / **Rust** / Go / CLI / HTTP / MCP capabilities | working |
 | Typed calls, `Exec`, `All`, async `Execute`/`Process[Out]` | working, covered end to end |
-| Server streaming and bidirectional streaming | working with credit-based flow control (Go + Python) |
+| Server streaming and bidirectional streaming | working with credit-based flow control (Go + Python; Rust emits server-side chunks) |
 | Pipelines: `Pipe`, `Transform`, `PipeReturn` | working |
-| Pipelines: `PipeScatter` gather, branch stages | stage types compile; the router does not gather or branch yet |
+| Pipelines: `PipeScatter` gather, branch stages | `Compose` rejects them with a clear error until the router can gather/branch |
 | Blobs on one node, or across nodes sharing a filesystem | working |
 | Blobs through S3 / an object store | `blob.S3Backend` exists; `WithBlobStore` is not wired yet |
 | Poison pill detection, DLQ, retries, deadlines, worker recycling | working |
-| Per-worker circuit breaker | working, enabled (5 consecutive failures, 30s open) |
+| Per-worker circuit breaker | working, opt-in via `WithCircuitBreaker(threshold, openFor)` (disabled by default) |
 | Worker authentication (Ed25519 challenge-response) | working, opt-in via `WithAuthKeys` |
 | Per-capability rate limiting | working, opt-in via `WithRateLimit` |
 | Health data (`Pepper.Health()`) | working, returns `HealthStatus` struct |
 | Sessions, in-memory or coord-backed | working |
-| `pepper.CodecJSON` with script workers | msgpack is the supported codec for the Python/Node/Julia/Rust runtimes |
+| `pepper.CodecJSON` with script workers | refused at `Register` with an explicit error (script runtimes speak msgpack) |
 | Redis / NATS / Mula coordination | working (NATS uses prefix-based subscriptions) |
 | Wire inspector (`pepper inspect` + `inspect` package) | CLI and library exist; the runtime does not emit events to it yet |
-| Rust runtime: streaming, callbacks, Redis/NATS worker transport | multi-capability workers, compile-on-boot, `// pepper:deps`, and auth work; streaming and callbacks are Python-only |
+| Rust runtime | multi-capability workers, compile-on-boot from `Start()`, `// pepper:deps`, server streaming, real concurrency, auth, cached/prebuilt runs without cargo |
+| Rust runtime: `pepper.call()` callbacks, Redis/NATS worker transport | Python-only today |
 | `WithInspector`, `WithTLS`, `WithTransport`, `WithStrategy`, `WithMemoryBudget`, `WithStreamCredits` | declared, not wired yet — see [configuration](#configuration) |
 
 ---
@@ -571,7 +572,7 @@ impl Capability for Rerank {
         Ok(())
     }
 
-    fn run(&mut self, ctx: &Context, input: Input) -> Result<Value> {
+    fn run(&self, ctx: &Context, input: Input) -> Result<Value> {
         let query = input.str_or("query", "");
         let docs = input.array("documents").cloned().unwrap_or_default();
         let scores = self.model.as_ref().unwrap().score(query, &docs);
@@ -611,9 +612,18 @@ Node runtimes; they are merged into the generated manifest (your version wins).
 | `PEPPER_CACHE_DIR` | where compiled capabilities live (default `~/.cache/pepper`) |
 | `cargo` in `PATH` | required unless the above override is set |
 
-**Current limits** (also tracked in the [status table](#status)): `run` is
-serialized per worker (scale with workers, not threads), `tcp://` transport only,
-and no streaming or `pepper.call()` callbacks yet. See
+**Concurrency and streaming are real.** `run` takes `&self`, so one handler instance
+serves parallel requests (four 250 ms calls on one worker finish in ~250 ms, not a
+second) and `PEPPER_MAX_CONCURRENT` bounds how many execute at once. Override
+`run_stream` to emit chunks for `pepper.Call[T]{...}.Stream(ctx)`; bidirectional
+input chunks arrive through `ctx.next_chunk()`.
+
+**Deployment needs no toolchain.** Compilation happens once into
+`$PEPPER_CACHE_DIR`; after that the cached binary runs directly (multi-stage Docker
+or air-gapped hosts just ship the cache and a prebuilt `pepper-worker`).
+
+**Still open** (tracked in the [status table](#status)): `pepper.call()` callbacks
+and Redis/NATS worker transport. See
 [`runtime/rust/README.md`](runtime/rust/README.md) for the full contract.
 
 ---

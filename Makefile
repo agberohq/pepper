@@ -201,6 +201,12 @@ go-real-cluster-mula:
 go-real-cluster: go-real-cluster-redis go-real-cluster-nats
 
 
+# ─── Rust runtime tests ──────────────────────────────────────────────────────
+# Protocol, framing, nullable-decode and blob tests for runtime/rust.
+# The Go-side end-to-end test (tests/rust_runtime_test.go) also needs cargo.
+rust-test:
+	cd runtime/rust && cargo test
+
 # ─── Python tests ─────────────────────────────────────────────────────────────
 python-test: python-setup
 	$(PYTEST) $(PYTHON_DIR) -v

@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go: ["1.22", "1.23"]
+        go: ["1.25"]
 
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +38,12 @@ jobs:
 
       - name: Install Python deps
         run: pip install msgpack
+
+      - name: Install Rust (Linux)
+        # The Rust capability test self-skips without cargo; install it on the
+        # Linux job so the runtime is covered end to end.
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build
         run: go build ./...
@@ -63,7 +69,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
           cache: true
 
       - uses: golangci/golangci-lint-action@v6

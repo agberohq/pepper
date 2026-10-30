@@ -4,7 +4,7 @@ package pepper
 //
 //	pp.Compose("audio.pipeline",
 //	    pepper.Pipe("audio.denoise").WithGroup("gpu"),
-//	    pepper.PipeTransform(func(in map[string]any) (map[string]any, error) {
+//	    pepper.Transform(func(in map[string]any) (map[string]any, error) {
 //	        return map[string]any{"text": in["transcript"]}, nil
 //	    }),
 //	    pepper.Pipe("llm.analyze"),
@@ -16,7 +16,7 @@ import (
 )
 
 // Stage is a single step in a pipeline.
-// Obtain via Pipe, Transform, PipeReturn, PipeScatter, or PipeBranch.
+// Obtain via Pipe, Transform, PipeReturn, or PipeScatter.
 type Stage = compose.Stage
 
 // Pipe creates a worker-dispatched pipeline stage.
@@ -31,7 +31,7 @@ func Pipe(cap string) *compose.PipeStage {
 // The function runs in the Go process (no worker dispatch) and can reshape
 // the payload between stages.
 //
-//	pepper.PipeTransform(func(in map[string]any) (map[string]any, error) {
+//	pepper.Transform(func(in map[string]any) (map[string]any, error) {
 //	    transcript, _ := in["text"].(string)
 //	    return map[string]any{"prompt": "Analyse: " + transcript}, nil
 //	})

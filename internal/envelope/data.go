@@ -1,20 +1,32 @@
 package envelope
 
 const (
-	KeyMsgType    = "msg_type"
-	KeyCorrID     = "corr_id"
-	KeyOriginID   = "origin_id"
-	KeyPayload    = "payload"
-	KeyWorkerID   = "worker_id"
-	KeyCap        = "cap"
-	KeyCapVer     = "cap_ver"
-	KeyHop        = "hop"
-	KeyCode       = "code"
-	KeyMessage    = "message"
-	KeyMeta       = "meta"
-	KeyDeadlineMs = "deadline_ms"
-	KeyGroups     = "groups"
-	KeyBlobs      = "_blobs"
+	KeyProtoVer       = "proto_ver"
+	KeyMsgType        = "msg_type"
+	KeyCorrID         = "corr_id"
+	KeyOriginID       = "origin_id"
+	KeyPayload        = "payload"
+	KeyWorkerID       = "worker_id"
+	KeyRuntime        = "runtime"
+	KeyCap            = "cap"
+	KeyCapVer         = "cap_ver"
+	KeyHop            = "hop"
+	KeyCode           = "code"
+	KeyMessage        = "message"
+	KeyMeta           = "meta"
+	KeyDeadlineMs     = "deadline_ms"
+	KeyGroups         = "groups"
+	KeyBlobs          = "_blobs"
+	KeyForwardTo      = "forward_to"
+	KeyGatherAt       = "gather_at"
+	KeyLoad           = "load"
+	KeyCaps           = "caps"
+	KeyRequestsServed = "requests_served"
+	KeyUptimeMs       = "uptime_ms"
+	KeyError          = "error"
+	KeyCodec          = "codec"
+	KeyCbID           = "cb_id"
+	KeySessionID      = "session_id"
 )
 
 type Data map[string]any
@@ -59,8 +71,8 @@ func (e Data) Blobs() []string {
 	}
 	return toStringSlice(m[KeyBlobs])
 }
-func (e Data) ForwardTo() string { v, _ := e["forward_to"].(string); return v }
-func (e Data) GatherAt() string  { v, _ := e["gather_at"].(string); return v }
+func (e Data) ForwardTo() string { v, _ := e[KeyForwardTo].(string); return v }
+func (e Data) GatherAt() string  { v, _ := e[KeyGatherAt].(string); return v }
 func (e Data) Int64(key string) int64 {
 	switch val := e[key].(type) {
 	case int64:

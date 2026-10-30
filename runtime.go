@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	stdruntime "runtime"
-	"strings"
 	"time"
 
 	blobpkg "github.com/agberohq/pepper/internal/blob"
@@ -24,6 +23,7 @@ import (
 	"github.com/agberohq/pepper/internal/registry"
 	"github.com/agberohq/pepper/internal/router"
 	"github.com/agberohq/pepper/internal/sub"
+	"github.com/agberohq/pepper/internal/wire"
 	"github.com/agberohq/pepper/runtime/adapter"
 	"github.com/agberohq/pepper/runtime/cli"
 	"github.com/agberohq/pepper/runtime/goruntime"
@@ -104,7 +104,7 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		// Single-node mode: Mula TCP coord store for local Go↔Python IPC.
 		mulaURL := p.cfg.TransportURL
 		if mulaURL == "" {
-			mulaURL = fmt.Sprintf("tcp://127.0.0.1:%d", p.freePort())
+			mulaURL = wire.SchemeURL(wire.SchemeTCP, fmt.Sprintf("127.0.0.1:%d", p.freePort()))
 		}
 		c, err := coord.NewMula(mulaURL)
 		if err != nil {
@@ -145,6 +145,10 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		Codec:            p.codec,
 		HeartbeatTimeout: p.cfg.HeartbeatInterval * 3,
 		Distributed:      p.cfg.Coord != nil,
+		AuthKeys:         p.cfg.AuthKeys,
+		RateLimitEnabled: p.cfg.RateLimit.Enabled,
+		RatePerCap:       p.cfg.RateLimit.RatePerCap,
+		BurstPerCap:      p.cfg.RateLimit.BurstPerCap,
 	}, p.logger)
 	rt.doctor = jack.NewDoctor(
 		jack.DoctorWithMaxConcurrent(len(p.cfg.Workers)+4),
@@ -152,22 +156,22 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	)
 
 	// Response and control subscriptions
-	resCh, err := theBus.SubscribePrefix(bgCtx, "pepper.res.")
+	resCh, err := theBus.SubscribePrefix(bgCtx, bus.TopicResPrefix())
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe res: %w", err)
 	}
-	ctrlCh, err := theBus.SubscribePrefix(bgCtx, "pepper.control.")
+	ctrlCh, err := theBus.SubscribePrefix(bgCtx, bus.TopicControlPrefix())
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe ctrl: %w", err)
 	}
-	ctrlExactCh, err := theBus.Subscribe(bgCtx, "pepper.control")
+	ctrlExactCh, err := theBus.Subscribe(bgCtx, wire.TopicControlExact)
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe ctrl exact: %w", err)
 	}
-	hbCh, err := theBus.SubscribePrefix(bgCtx, "pepper.hb.")
+	hbCh, err := theBus.SubscribePrefix(bgCtx, bus.TopicHBPrefix())
 	if err != nil {
 		bgCancel()
 		return fmt.Errorf("pepper: subscribe hb: %w", err)
@@ -179,6 +183,16 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 
 	// Boot workers
 	allSpecs := p.reg.All()
+
+	// Rust capabilities are compiled here, before the boot deadline starts. A
+	// first compile can take minutes; charging it to WithBootTimeout would turn a
+	// slow build into a "worker never became ready" error. Compilation belongs to
+	// registration, not to process startup.
+	if err := p.prepareRustCapabilities(bgCtx, allSpecs); err != nil {
+		bgCancel()
+		return err
+	}
+
 	if len(allSpecs) > 0 {
 		bootTimeout := p.cfg.BootTimeout
 		if bootTimeout <= 0 {
@@ -206,6 +220,18 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		if err := p.bootCLIWorkers(bgCtx, allSpecs); err != nil {
 			bgCancel()
 			return fmt.Errorf("pepper: cli workers: %w", err)
+		}
+		if err := p.bootJuliaWorkers(bgCtx, allSpecs); err != nil {
+			bgCancel()
+			return fmt.Errorf("pepper: julia workers: %w", err)
+		}
+		if err := p.bootNodeWorkers(bgCtx, allSpecs); err != nil {
+			bgCancel()
+			return fmt.Errorf("pepper: node workers: %w", err)
+		}
+		if err := p.bootRustWorkers(bgCtx, allSpecs); err != nil {
+			bgCancel()
+			return fmt.Errorf("pepper: rust workers: %w", err)
 		}
 		for i, wc := range p.cfg.Workers {
 			wID := wc.ID
@@ -237,20 +263,20 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	// long enough to broadcast worker_bye and flush pending responses before
 	// the connection is torn down.
 	if p.cfg.Coord != nil {
-		p.shutdown.RegisterWithContext("coord.close", func(_ context.Context) error {
+		p.shutdown.RegisterWithContext(shutdownCoordClose, func(_ context.Context) error {
 			return p.cfg.Coord.Close()
 		})
 	}
 
-	p.shutdown.RegisterWithContext("doctor.stop", func(_ context.Context) error {
+	p.shutdown.RegisterWithContext(shutdownDoctor, func(_ context.Context) error {
 		rt.doctor.StopAll(p.cfg.ShutdownTimeout)
 		return nil
 	})
-	p.shutdown.RegisterWithContext("loopers.stop", func(_ context.Context) error {
+	p.shutdown.RegisterWithContext(shutdownLoopers, func(_ context.Context) error {
 		rt.loopers.Range(func(_, v any) bool { v.(*jack.Looper).Stop(); return true })
 		return nil
 	})
-	p.shutdown.RegisterWithContext("workers.bye", func(_ context.Context) error {
+	p.shutdown.RegisterWithContext(shutdownWorkersBye, func(_ context.Context) error {
 		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye})
 		if err := rt.bus.Publish(bus.TopicBroadcast, bye); err != nil {
 			p.logger.Fields("error", err).Warn("shutdown: worker bye broadcast failed")
@@ -258,11 +284,39 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		time.Sleep(200 * time.Millisecond)
 		return nil
 	})
-	p.shutdown.RegisterWithContext("req.reaper.stop", func(_ context.Context) error { rt.reqReaper.Stop(); return nil })
-	p.shutdown.RegisterWithContext("blob.reaper.stop", func(_ context.Context) error { rt.blobReaper.Stop(); return nil })
-	p.shutdown.RegisterWithContext("bg.cancel", func(_ context.Context) error { bgCancel(); return nil })
+	p.shutdown.RegisterWithContext(shutdownReqReaper, func(_ context.Context) error { rt.reqReaper.Stop(); return nil })
+	p.shutdown.RegisterWithContext(shutdownBlobReaper, func(_ context.Context) error { rt.blobReaper.Stop(); return nil })
+	p.shutdown.RegisterWithContext(shutdownBGCancel, func(_ context.Context) error { bgCancel(); return nil })
 
 	return nil
+}
+
+// sendCapLoads publishes cap_load for every registered capability that belongs
+// to the connecting worker's runtime and shares at least one group with it.
+//
+// An empty runtime type means the oldest worker contract, which was Python-only.
+func (p *Pepper) sendCapLoads(wid string, env envelope.Data, runtimeType string) {
+	rt, ok := registry.Runtime(runtimeType), runtimeType != ""
+	if !ok {
+		rt = registry.RuntimePython
+	}
+	workerGroups := env.Groups()
+	for _, spec := range p.reg.All() {
+		if spec.Runtime != rt {
+			continue
+		}
+		if len(workerGroups) != 0 && len(spec.Groups) != 0 && !p.groupsOverlap(spec.Groups, workerGroups) {
+			continue
+		}
+		payload, err := p.codec.Marshal(p.buildCapLoad(spec))
+		if err != nil {
+			p.logger.Fields("worker_id", wid, "cap", spec.Name, "error", err).Warn("control: cap_load marshal failed")
+			continue
+		}
+		if err := p.rt.bus.Publish(bus.TopicControl(wid), payload); err != nil {
+			p.logger.Fields("worker_id", wid, "cap", spec.Name, "error", err).Warn("control: cap_load publish failed")
+		}
+	}
 }
 
 func (p *Pepper) responseLoop(ctx context.Context, ch <-chan bus.Message) {
@@ -315,7 +369,7 @@ func (p *Pepper) routeResponse(data []byte) {
 	// Persist session mutations written by Python pepper.session().set().
 	// Workers attach _session_updates to env.Meta(); we merge them into the
 	// store here so state survives across requests.
-	sessionID, _ := raw["session_id"].(string)
+	sessionID, _ := raw[envelope.KeySessionID].(string)
 	if sessionID != "" {
 		if meta := env.Meta(); meta != nil {
 			if updates := extractMap(meta["_session_updates"]); len(updates) > 0 {
@@ -334,27 +388,37 @@ func (p *Pepper) routeResponse(data []byte) {
 		}
 	}
 
-	switch env.MsgType() {
-	case "res":
+	switch envelope.Type(env.MsgType()) {
+	case envelope.MsgRes:
 		p.rt.router.ResolveInflight(corrID, env.OriginID(), env.WorkerID())
 		p.rt.reqReaper.Remove(corrID)
 		p.pending.Resolve(corrID, pending.Response{Payload: env.Payload(), WorkerID: env.WorkerID(), Cap: env.Cap(), CapVer: env.CapVer(), Hop: env.Hop(), Meta: env.Meta()})
-	case "err":
+	case envelope.MsgErr:
 		p.rt.router.ResolveInflight(corrID, env.OriginID(), env.WorkerID())
 		p.rt.reqReaper.Remove(corrID)
 		p.pending.Fail(corrID, &WorkerError{Code: env.Code(), Message: env.Message()})
-	case "res_chunk":
+	case envelope.MsgResChunk:
 		p.pending.Chunk(corrID, pending.Response{Payload: env.Payload(), WorkerID: env.WorkerID()})
-	case "res_end":
+	case envelope.MsgResEnd:
 		p.rt.reqReaper.Remove(corrID)
 		p.pending.EndStream(corrID)
-	case "cb_req":
+	case envelope.MsgAuthResponse:
+		// Worker responded to an auth challenge
+		var resp envelope.AuthResponse
+		if err := p.codec.Unmarshal(data, &resp); err != nil {
+			p.logger.Fields("error", err).Error("auth response: unmarshal failed")
+			return
+		}
+		if err := p.rt.router.HandleAuthResponse(resp); err != nil {
+			p.logger.Fields("worker_id", resp.WorkerID, "error", err).Error("auth response: verification failed")
+		}
+	case envelope.MsgCbReq:
 		// A Python worker called pepper.call(). Execute the nested capability
 		// and send a cb_res back to the originating worker on its res topic.
 		go func() {
 			cbStart := time.Now()
-			cbID, _ := raw["cb_id"].(string)
-			capName, _ := raw["cap"].(string)
+			cbID, _ := raw[envelope.KeyCbID].(string)
+			capName, _ := raw[envelope.KeyCap].(string)
 
 			if p.cfg.Metrics != nil {
 				p.cfg.Metrics.Counter(metrics.MetricCallbacksTotal, 1, map[string]string{"cap": capName})
@@ -416,13 +480,13 @@ func (p *Pepper) handleControl(data []byte) {
 		return
 	}
 	env := envelope.Data(raw)
-	switch env.MsgType() {
-	case "worker_hello":
+	switch envelope.Type(env.MsgType()) {
+	case envelope.MsgWorkerHello:
 		wid := env.WorkerID()
 		if wid == "" {
 			return
 		}
-		if cn, _ := env["codec"].(string); cn != "" && cn != string(p.cfg.Codec) {
+		if cn, _ := env[envelope.KeyCodec].(string); cn != "" && cn != string(p.cfg.Codec) {
 			p.cfg.logger.Fields("worker", wid, "codec", cn).Error("CODEC_MISMATCH")
 			return
 		}
@@ -450,31 +514,22 @@ func (p *Pepper) handleControl(data []byte) {
 
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: env.Groups()})
 		p.registerWorkerPatient(wid)
-		p.logger.Fields("worker", wid, "groups", env.Groups(), "runtime", env["runtime"]).Info("worker connected")
+		p.logger.Fields("worker", wid, "groups", env.Groups(), "runtime", env[envelope.KeyRuntime]).Info("worker connected")
 
 		if p.cfg.Metrics != nil {
 			p.cfg.Metrics.Gauge(metrics.MetricWorkersCount, 1, map[string]string{"worker": wid})
 		}
 
-		// Send cap_load to the newly connected python worker
-		runtimeType, _ := raw["runtime"].(string)
-		if runtimeType == "python" || runtimeType == "" {
-			for _, spec := range p.reg.All() {
-				if spec.Runtime == registry.RuntimePython && (len(env.Groups()) == 0 || len(spec.Groups) == 0 || p.groupsOverlap(spec.Groups, env.Groups())) {
-					payload, _ := p.codec.Marshal(p.buildCapLoad(spec))
-					if err := p.rt.bus.Publish(bus.TopicControl(wid), payload); err != nil {
-						p.logger.Fields("worker_id", wid, "cap", spec.Name, "error", err).Warn("control: cap_load publish failed")
-					}
-				}
-			}
-		}
+		// Send cap_load for the capabilities this worker's runtime owns.
+		runtimeType, _ := raw[envelope.KeyRuntime].(string)
+		p.sendCapLoads(wid, env, runtimeType)
 
-	case "cap_ready":
+	case envelope.MsgCapReady:
 		// ALWAYS unblock pp.Start() even if the capability failed to load
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 
-		if errStr, _ := env["error"].(string); errStr == "" {
+		if errStr, _ := env[envelope.KeyError].(string); errStr == "" {
 			p.rt.router.MarkCapReady(env.WorkerID(), env.Cap())
 			if v, ok := p.rt.workerStates.Load(env.WorkerID()); ok {
 				e := v.(*workerEntry)
@@ -486,10 +541,10 @@ func (p *Pepper) handleControl(data []byte) {
 			p.logger.Fields("worker", env.WorkerID(), "cap", env.Cap(), "error", errStr).Error("capability failed to load")
 		}
 
-	case "hb_ping":
+	case envelope.MsgHbPing:
 		wid := env.WorkerID()
-		rtStr, _ := raw["runtime"].(string)
-		hbCaps := decodeStringSlice(raw["caps"])
+		rtStr, _ := raw[envelope.KeyRuntime].(string)
+		hbCaps := decodeStringSlice(raw[envelope.KeyCaps])
 		p.rt.router.UpdateHeartbeat(envelope.HbPing{
 			WorkerID:       wid,
 			Runtime:        rtStr,
@@ -516,7 +571,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 	}
 
 	originID := ulid.Make().String()
-	stageCh, err := p.rt.bus.SubscribePrefix(ctx, "pepper.pipe."+p.sanitizeName(name)+".")
+	stageCh, err := p.rt.bus.SubscribePrefix(ctx, bus.TopicPipePrefix(p.sanitizeName(name)))
 	if err != nil {
 		return Result{}, err
 	}
@@ -550,7 +605,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 				// listen on. Force a final pipe topic so the result still
 				// arrives on stageCh.
 				if env.ForwardTo == "" {
-					env.ForwardTo = "pepper.pipe." + p.sanitizeName(name) + ".final"
+					env.ForwardTo = bus.TopicPipeFinal(p.sanitizeName(name))
 				}
 				// Record stage dispatch in tracker.
 				if p.tracker != nil && processID != "" {
@@ -652,7 +707,7 @@ func (p *Pepper) dispatchPipeline(ctx context.Context, spec *registry.Spec, name
 				p.rt.blobReaper.TouchAt(bid, time.UnixMilli(env.DeadlineMs))
 			}
 
-			if r.MsgType() == "err" {
+			if envelope.Type(r.MsgType()) == envelope.MsgErr {
 				p.logger.Fields("pipeline", name, "origin_id", originID, "cap", r.Cap(), "code", r.Code(), "error", r.Message()).Error("pipeline stage failed")
 				if p.tracker != nil && processID != "" {
 					p.tracker.RecordStageDone(processID, r.Cap(), r.WorkerID(), true, r.Message())
@@ -787,7 +842,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	}
 	groups := wc.Groups
 	if len(groups) == 0 {
-		groups = []string{"default"}
+		groups = []string{wire.GroupDefault}
 	}
 	blobDir := p.cfg.BlobDir
 	if blobDir == "" {
@@ -797,7 +852,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	envVars := bus.WorkerEnvVars(workerID, busAddr, string(p.cfg.Codec), groups, int(p.cfg.HeartbeatInterval.Milliseconds()), p.cfg.MaxConcurrent, blobDir)
 	if len(p.cfg.Resources) > 0 {
 		if enc, err := p.codec.Marshal(p.cfg.Resources); err == nil {
-			envVars = append(envVars, "PEPPER_RESOURCES="+string(enc))
+			envVars = append(envVars, bus.WorkerResourcesVar(enc))
 		}
 	}
 
@@ -854,7 +909,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 	}
 	if logW != nil {
 		logW.Close() // parent closes write end; child holds the only reference
-		go p.pipeWorkerLogs(logR, workerID)
+		go p.pipeWorkerLogs(logR, workerID, string(registry.RuntimePython))
 	}
 	p.rt.workerStates.Store(workerID, &workerEntry{id: workerID, groups: groups, wc: wc, busAddr: busAddr})
 	p.startRespawnLooper(workerID, wc, allSpecs)
@@ -889,7 +944,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 		}
 		groups := spec.Groups
 		if len(groups) == 0 {
-			groups = []string{"default"}
+			groups = []string{wire.GroupDefault}
 		}
 		wid := "go-" + p.sanitizeName(spec.Name)
 		rt := goruntime.New(wid, bridge, groups, p.rt.bus, p.codec, p.logger)
@@ -902,7 +957,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 		}
 		p.rt.router.RegisterWorker(envelope.Hello{
 			WorkerID: wid,
-			Runtime:  "go",
+			Runtime:  string(registry.RuntimeGo),
 			Groups:   groups,
 			Caps:     []string{spec.Name},
 		})
@@ -910,7 +965,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
-		p.shutdown.RegisterWithContext("goworker."+wid, func(_ context.Context) error { rt.Stop(); return nil })
+		p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeGo), wid), func(_ context.Context) error { rt.Stop(); return nil })
 	}
 	return nil
 }
@@ -923,7 +978,7 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		}
 		groups := spec.Groups
 		if len(groups) == 0 {
-			groups = []string{"default"}
+			groups = []string{wire.GroupDefault}
 		}
 		wid := "http-" + p.sanitizeName(spec.Name)
 
@@ -956,17 +1011,17 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		if err := wrt.Start(ctx); err != nil {
 			p.logger.Fields("worker", wid, "error", err).Warn("adapter worker start warning")
 		}
-		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Runtime: "http", Groups: groups, Caps: []string{spec.Name}})
+		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Runtime: string(registry.RuntimeHTTP), Groups: groups, Caps: []string{spec.Name}})
 		p.rt.router.MarkCapReady(wid, spec.Name)
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
-		p.shutdown.RegisterWithContext("http."+wid, func(_ context.Context) error { wrt.Stop(); return nil })
+		p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeHTTP), wid), func(_ context.Context) error { wrt.Stop(); return nil })
 	}
 	return nil
 }
 
-// bootCLIWorkers starts all CLI tool workers registered via pp.Prepare().
+// bootCLIWorkers starts all CLI tool workers registered via pepper.CLI().
 func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) error {
 	for _, spec := range allSpecs {
 		if spec.Runtime != registry.RuntimeCLI || spec.CLISpec == nil {
@@ -978,19 +1033,19 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 		}
 		groups := spec.Groups
 		if len(groups) == 0 {
-			groups = []string{"default"}
+			groups = []string{wire.GroupDefault}
 		}
 		wid := "cli-" + p.sanitizeName(spec.Name)
 		wrt := cli.NewBusWorker(wid, spec.Name, *cmdSpec, groups, p.rt.bus, p.codec, p.rt.blob, p.cfg.DefaultTimeout+30*time.Second, p.logger)
 		if err := wrt.Start(ctx); err != nil {
 			return fmt.Errorf("cli worker %q start: %w", spec.Name, err)
 		}
-		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Runtime: "cli", Groups: groups, Caps: []string{spec.Name}})
+		p.rt.router.RegisterWorker(envelope.Hello{WorkerID: wid, Runtime: string(registry.RuntimeCLI), Groups: groups, Caps: []string{spec.Name}})
 		p.rt.router.MarkCapReady(wid, spec.Name)
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
-		p.shutdown.RegisterWithContext("cli."+wid, func(_ context.Context) error { wrt.Stop(); return nil })
+		p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeCLI), wid), func(_ context.Context) error { wrt.Stop(); return nil })
 	}
 	return nil
 }
@@ -1058,18 +1113,18 @@ func (p *Pepper) Run(ctx context.Context, snippet string, vars Vars, opts ...Cal
 		in = core.In{}
 	}
 	in["_snippet"] = snippet
-	return p.dispatch(ctx, "pepper.inline", in, opts...)
+	return p.dispatch(ctx, wire.CapInline, in, opts...)
 }
 
 // pipeWorkerLogs reads structured JSON log lines from Python fd 3 and
 // re-emits them through the Go logger so all worker logs share one backend.
-func (p *Pepper) pipeWorkerLogs(r *os.File, workerID string) {
+func (p *Pepper) pipeWorkerLogs(r *os.File, workerID, runtimeKind string) {
 	defer r.Close()
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		var entry map[string]any
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			p.logger.Namespace("python").Fields("worker", workerID).Debug(string(scanner.Bytes()))
+			p.logger.Namespace(runtimeKind).Fields("worker", workerID).Debug(string(scanner.Bytes()))
 			continue
 		}
 		msg, _ := entry["msg"].(string)
@@ -1081,7 +1136,7 @@ func (p *Pepper) pipeWorkerLogs(r *os.File, workerID string) {
 				kv = append(kv, k, v)
 			}
 		}
-		l := p.logger.Namespace("python").Fields(kv...)
+		l := p.logger.Namespace(runtimeKind).Fields(kv...)
 		switch level {
 		case "DEBUG":
 			l.Debug(msg)
@@ -1102,18 +1157,18 @@ func newBus(url string, cfg bus.Config) (bus.Bus, error) {
 	var c coord.Store
 	var err error
 	switch {
-	case url == "" || strings.HasPrefix(url, "tcp://"):
+	case url == "" || wire.HasScheme(url, wire.SchemeTCP):
 		// Mula: default single-node TCP transport.
 		c, err = coord.NewMula(url)
 		if err != nil {
 			return nil, fmt.Errorf("bus: mula: %w", err)
 		}
-	case strings.HasPrefix(url, "redis://"):
+	case wire.HasScheme(url, wire.SchemeRedis):
 		c, err = coord.NewRedis(url)
 		if err != nil {
 			return nil, fmt.Errorf("bus: redis: %w", err)
 		}
-	case strings.HasPrefix(url, "nats://"):
+	case wire.HasScheme(url, wire.SchemeNATS):
 		c, err = coord.NewNATS(url)
 		if err != nil {
 			return nil, fmt.Errorf("bus: nats: %w", err)

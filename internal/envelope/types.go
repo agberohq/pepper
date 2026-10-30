@@ -5,19 +5,23 @@ package envelope
 
 // Hello is the first message sent by every worker at boot.
 type Hello struct {
-	ProtoVer        uint8          `msgpack:"proto_ver"         json:"proto_ver"`
-	MsgType         Type           `msgpack:"msg_type"          json:"msg_type"`
-	WorkerID        string         `msgpack:"worker_id"         json:"worker_id"`
-	Runtime         string         `msgpack:"runtime"           json:"runtime"` // "python"|"go"|"http"|"cli"|custom
-	PID             int            `msgpack:"pid"               json:"pid"`
-	Codec           string         `msgpack:"codec"             json:"codec"`
-	Groups          []string       `msgpack:"groups"            json:"groups"`
-	Caps            []string       `msgpack:"caps"              json:"caps"`
-	PipeSubs        []string       `msgpack:"pipe_subs"         json:"pipe_subs"`
-	PipePubs        []string       `msgpack:"pipe_pubs"         json:"pipe_pubs"`
-	CbSupported     bool           `msgpack:"cb_supported"      json:"cb_supported"`
-	StreamSupported bool           `msgpack:"stream_supported"  json:"stream_supported"`
-	Meta            map[string]any `msgpack:"meta"              json:"meta"`
+	ProtoVer        uint8    `msgpack:"proto_ver"         json:"proto_ver"`
+	MsgType         Type     `msgpack:"msg_type"          json:"msg_type"`
+	WorkerID        string   `msgpack:"worker_id"         json:"worker_id"`
+	Runtime         string   `msgpack:"runtime"           json:"runtime"` // "python"|"go"|"http"|"cli"|custom
+	PID             int      `msgpack:"pid"               json:"pid"`
+	Codec           string   `msgpack:"codec"             json:"codec"`
+	Groups          []string `msgpack:"groups"            json:"groups"`
+	Caps            []string `msgpack:"caps"              json:"caps"`
+	PipeSubs        []string `msgpack:"pipe_subs"         json:"pipe_subs"`
+	PipePubs        []string `msgpack:"pipe_pubs"         json:"pipe_pubs"`
+	CbSupported     bool     `msgpack:"cb_supported"      json:"cb_supported"`
+	StreamSupported bool     `msgpack:"stream_supported"  json:"stream_supported"`
+	// PublicKey is the worker's Ed25519 public key for authentication.
+	// When auth is enabled, the router sends an AuthChallenge; the worker
+	// signs it and returns an AuthResponse.
+	PublicKey []byte         `msgpack:"public_key,omitempty"    json:"public_key,omitempty"`
+	Meta      map[string]any `msgpack:"meta"              json:"meta"`
 }
 
 // HbPing is the heartbeat sent by workers every HeartbeatInterval.
@@ -96,6 +100,50 @@ type StreamChunk struct {
 
 // StreamClose signals end-of-input on a bidi stream.
 type StreamClose struct {
+	ProtoVer uint8  `msgpack:"proto_ver" json:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"  json:"msg_type"`
+	StreamID string `msgpack:"stream_id" json:"stream_id"`
+	CorrID   string `msgpack:"corr_id"   json:"corr_id"`
+}
+
+// AuthChallenge is sent by the router to a worker when auth is enabled.
+// The worker must sign the challenge with its Ed25519 private key and
+// return an AuthResponse.
+type AuthChallenge struct {
+	ProtoVer  uint8  `msgpack:"proto_ver" json:"proto_ver"`
+	MsgType   Type   `msgpack:"msg_type"  json:"msg_type"`
+	WorkerID  string `msgpack:"worker_id" json:"worker_id"`
+	Challenge []byte `msgpack:"challenge" json:"challenge"`
+}
+
+// AuthResponse is sent by a worker to prove its identity.
+type AuthResponse struct {
+	ProtoVer  uint8  `msgpack:"proto_ver" json:"proto_ver"`
+	MsgType   Type   `msgpack:"msg_type"  json:"msg_type"`
+	WorkerID  string `msgpack:"worker_id" json:"worker_id"`
+	PublicKey []byte `msgpack:"public_key" json:"public_key"`
+	Signature []byte `msgpack:"signature" json:"signature"`
+}
+
+// StreamCredit grants the producer N more chunks to send.
+type StreamCredit struct {
+	ProtoVer uint8  `msgpack:"proto_ver" json:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"  json:"msg_type"`
+	StreamID string `msgpack:"stream_id" json:"stream_id"`
+	CorrID   string `msgpack:"corr_id"   json:"corr_id"`
+	Credits  int32  `msgpack:"credits"   json:"credits"`
+}
+
+// StreamPause tells the producer to stop sending chunks.
+type StreamPause struct {
+	ProtoVer uint8  `msgpack:"proto_ver" json:"proto_ver"`
+	MsgType  Type   `msgpack:"msg_type"  json:"msg_type"`
+	StreamID string `msgpack:"stream_id" json:"stream_id"`
+	CorrID   string `msgpack:"corr_id"   json:"corr_id"`
+}
+
+// StreamResume tells the producer to continue sending chunks.
+type StreamResume struct {
 	ProtoVer uint8  `msgpack:"proto_ver" json:"proto_ver"`
 	MsgType  Type   `msgpack:"msg_type"  json:"msg_type"`
 	StreamID string `msgpack:"stream_id" json:"stream_id"`

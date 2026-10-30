@@ -3,6 +3,8 @@ package inspect
 import (
 	"fmt"
 	"time"
+
+	"github.com/agberohq/pepper/internal/envelope"
 )
 
 // Event is a decoded wire message forwarded to inspector subscribers.
@@ -33,28 +35,28 @@ type Event struct {
 // Format formats an Event as a human-readable string (default inspector output).
 func (e Event) Format() string {
 	ts := e.Time.Format("15:04:05.000")
-	switch e.Type {
-	case "req":
+	switch envelope.Type(e.Type) {
+	case envelope.MsgReq:
 		return fmt.Sprintf("%s → req   %-26s %-20s group=%-8s dispatch=%-6s hop=%d",
 			ts, shortID(e.CorrID), e.Cap, e.Group, e.Dispatch, e.Hop)
-	case "res":
+	case envelope.MsgRes:
 		return fmt.Sprintf("%s ← res   %-26s %-20s worker=%-8s latency=%dms hop=%d",
 			ts, shortID(e.CorrID), e.Cap, e.WorkerID, e.LatencyMs, e.Hop)
-	case "err":
+	case envelope.MsgErr:
 		return fmt.Sprintf("%s ← err   %-26s %-20s %s",
 			ts, shortID(e.CorrID), e.Cap, e.ErrCode)
-	case "pipe":
+	case envelope.MsgPipe:
 		return fmt.Sprintf("%s ⇢ pipe  %-26s %-20s worker=%-8s hop=%d",
 			ts, shortID(e.CorrID), e.Cap, e.WorkerID, e.Hop)
-	case "res_chunk":
+	case envelope.MsgResChunk:
 		return fmt.Sprintf("%s ~ chunk %-26s %-20s worker=%-8s",
 			ts, shortID(e.CorrID), e.Cap, e.WorkerID)
-	case "cancel":
+	case envelope.MsgCancel:
 		return fmt.Sprintf("%s ✗ cancel %-26s (ctx cancelled)", ts, shortID(e.OriginID))
-	case "hb_ping":
+	case envelope.MsgHbPing:
 		return fmt.Sprintf("%s   hb    %-8s load=%d groups=%v runtime=%s",
 			ts, e.WorkerID, e.Load, e.Groups, e.Runtime)
-	case "cb_req":
+	case envelope.MsgCbReq:
 		return fmt.Sprintf("%s ↩ cb    %-26s %-20s worker=%-8s depth=%d",
 			ts, shortID(e.CorrID), e.Cap, e.WorkerID, e.CbDepth)
 	default:

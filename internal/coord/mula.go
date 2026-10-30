@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/agberohq/pepper/internal/wire"
 	"github.com/hashicorp/memberlist"
 )
 
@@ -96,7 +97,7 @@ func NewMulaCluster(bindAddr string, gossipPort, rpcPort int, seeds []string) (S
 // Returns "" for non-Mula backends.
 func MulaAddr(s Store) string {
 	if m, ok := s.(*mulaStore); ok {
-		return fmt.Sprintf("tcp://%s:%d", m.addr, m.port)
+		return wire.SchemeURL(wire.SchemeTCP, fmt.Sprintf("%s:%d", m.addr, m.port))
 	}
 	return ""
 }
@@ -320,7 +321,7 @@ func (m *mulaStore) subscribeExactInternal(ctx context.Context, topic string) (<
 	// in-process Go workers receive PushOne'd messages (not just Publish'd ones).
 	// Pre-create the queue channel synchronously to guarantee coord.Push and
 	// drainPushToLocalSub share the same channel regardless of scheduling order.
-	if strings.HasPrefix(topic, "pepper.push.") {
+	if strings.HasPrefix(topic, wire.TopicPushPrefix) {
 		_ = m.getOrCreateQueue(topic)
 		go m.drainPushToLocalSub(ctx, ls, topic)
 	}
@@ -497,7 +498,7 @@ func (m *mulaStore) handleConn(conn net.Conn) {
 	}()
 
 	for _, t := range topics {
-		if strings.HasPrefix(t, "pepper.push.") {
+		if strings.HasPrefix(t, wire.TopicPushPrefix) {
 			go m.drainPushToSub(sub, t)
 		}
 	}
@@ -633,8 +634,8 @@ func (m *mulaStore) peers() []string {
 		}
 		// Meta carries the RPC TCP address (bare host:port).
 		if addr := string(node.Meta); addr != "" {
-			if !strings.HasPrefix(addr, "tcp://") {
-				addr = "tcp://" + addr
+			if !strings.HasPrefix(addr, wire.TCPPrefix) {
+				addr = wire.SchemeURL(wire.SchemeTCP, addr)
 			}
 			out = append(out, addr)
 		}
@@ -644,7 +645,7 @@ func (m *mulaStore) peers() []string {
 
 // allNodes returns self + all peers as RPC addresses, sorted for consistency.
 func (m *mulaStore) allNodes() []string {
-	self := fmt.Sprintf("tcp://%s:%d", m.addr, m.port)
+	self := wire.SchemeURL(wire.SchemeTCP, fmt.Sprintf("%s:%d", m.addr, m.port))
 	nodes := []string{self}
 	nodes = append(nodes, m.peers()...)
 	sort.Strings(nodes)
@@ -662,7 +663,7 @@ func (m *mulaStore) hashNode(key string) string {
 }
 
 func (m *mulaStore) selfAddr() string {
-	return fmt.Sprintf("tcp://%s:%d", m.addr, m.port)
+	return wire.SchemeURL(wire.SchemeTCP, fmt.Sprintf("%s:%d", m.addr, m.port))
 }
 
 // keyOwner returns the RPC address of the node that owns a KV key,
@@ -695,7 +696,7 @@ const (
 )
 
 func (m *mulaStore) rpcDial(addr string) (net.Conn, error) {
-	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "tcp://"))
+	conn, err := net.Dial(wire.SchemeTCP, strings.TrimPrefix(addr, wire.TCPPrefix))
 	if err != nil {
 		return nil, err
 	}
@@ -839,7 +840,7 @@ func (m *mulaStore) rpcPublish(ctx context.Context, addr string, channel string,
 }
 
 func (m *mulaStore) rpcPullFrom(ctx context.Context, ownerAddr string, queue string) ([]byte, error) {
-	conn, err := net.Dial("tcp", strings.TrimPrefix(ownerAddr, "tcp://"))
+	conn, err := net.Dial(wire.SchemeTCP, strings.TrimPrefix(ownerAddr, wire.TCPPrefix))
 	if err != nil {
 		return nil, fmt.Errorf("coord/mula: rpcPullFrom dial %s: %w", ownerAddr, err)
 	}
@@ -982,8 +983,8 @@ func mulaUnmarshal(frame []byte) (topic string, data []byte) {
 func parseMulaURL(rawURL string) (host string, port int, err error) {
 	rawURL = strings.TrimSpace(rawURL)
 	switch {
-	case strings.HasPrefix(rawURL, "tcp://"):
-		addr := strings.TrimPrefix(rawURL, "tcp://")
+	case strings.HasPrefix(rawURL, wire.TCPPrefix):
+		addr := strings.TrimPrefix(rawURL, wire.TCPPrefix)
 		h, p, e := net.SplitHostPort(addr)
 		if e != nil {
 			return "", 0, fmt.Errorf("invalid tcp URL %q: %w", rawURL, e)

@@ -9,6 +9,7 @@ const (
 	RuntimePython   Runtime = "python"
 	RuntimeJulia    Runtime = "julia"
 	RuntimeNode     Runtime = "node"
+	RuntimeRust     Runtime = "rust"
 	RuntimeGo       Runtime = "go"
 	RuntimeHTTP     Runtime = "http"
 	RuntimeCLI      Runtime = "cli"

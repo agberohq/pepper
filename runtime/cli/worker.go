@@ -10,6 +10,7 @@ import (
 	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/envelope"
+	"github.com/agberohq/pepper/internal/registry"
 	"github.com/olekukonko/ll"
 )
 
@@ -258,16 +259,8 @@ func (w *BusWorker) heartbeatLoop(ctx context.Context) {
 			if load < 0 {
 				load = 0
 			}
-			ping := map[string]any{
-				"proto_ver":       envelope.ProtoVer,
-				"msg_type":        string(envelope.MsgHbPing),
-				"worker_id":       w.id,
-				"runtime":         "cli",
-				"load":            uint8(load),
-				"groups":          w.groups,
-				"requests_served": w.requestsServed.Load(),
-				"uptime_ms":       time.Since(w.startedAt).Milliseconds(),
-			}
+			ping := envelope.HbPingMap(w.id, string(registry.RuntimeCLI), uint8(load),
+				w.groups, w.requestsServed.Load(), time.Since(w.startedAt).Milliseconds())
 			data, err := w.codec.Marshal(ping)
 			if err != nil {
 				continue

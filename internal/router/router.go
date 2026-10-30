@@ -2,6 +2,8 @@ package router
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,6 +14,7 @@ import (
 	"github.com/agberohq/pepper/internal/dlq"
 	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/pending"
+	"github.com/agberohq/pepper/internal/wire"
 	"github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
 )
@@ -73,6 +76,16 @@ type Router struct {
 	// Circuit breaker settings
 	circuitBreakerThreshold int
 	circuitBreakerTimeout   time.Duration
+	// Auth settings
+	authEnabled    bool
+	authKeys       map[string]bool   // hex(public key) → valid
+	authChallenges map[string][]byte // workerID → pending challenge bytes
+	authenticated  map[string]bool   // workerID → authenticated
+	// Rate limiting
+	rateLimitEnabled bool
+	rateLimiters     sync.Map // capName → *jack.RateLimiter
+	ratePerCap       float64
+	burstPerCap      int
 }
 
 type Config struct {
@@ -92,6 +105,15 @@ type Config struct {
 	// CircuitBreakerTimeout is how long a worker stays open-circuited before
 	// allowing a test request (half-open state). Default: 30 seconds.
 	CircuitBreakerTimeout time.Duration
+	// AuthKeys is the set of authorized worker Ed25519 public keys.
+	// When non-empty, workers must authenticate via challenge-response.
+	AuthKeys []ed25519.PublicKey
+	// RateLimitEnabled enables per-capability rate limiting.
+	RateLimitEnabled bool
+	// RatePerCap is the sustained requests per second per capability.
+	RatePerCap float64
+	// BurstPerCap is the max burst size per capability.
+	BurstPerCap int
 }
 
 func DefaultConfig() Config {
@@ -109,6 +131,10 @@ func New(b bus.Bus, p *pending.Map, reaper *jack.Reaper, cfg Config, logger *ll.
 	hbTimeout := cfg.HeartbeatTimeout
 	if hbTimeout == 0 {
 		hbTimeout = 15 * time.Second
+	}
+	authKeys := make(map[string]bool)
+	for _, k := range cfg.AuthKeys {
+		authKeys[string(k)] = true
 	}
 	return &Router{
 		workers:                 make(map[string]*WorkerState),
@@ -128,6 +154,13 @@ func New(b bus.Bus, p *pending.Map, reaper *jack.Reaper, cfg Config, logger *ll.
 		capReadyCh:              make(chan struct{}),
 		circuitBreakerThreshold: cfg.CircuitBreakerThreshold,
 		circuitBreakerTimeout:   cfg.CircuitBreakerTimeout,
+		authEnabled:             len(cfg.AuthKeys) > 0,
+		authKeys:                authKeys,
+		authChallenges:          make(map[string][]byte),
+		authenticated:           make(map[string]bool),
+		rateLimitEnabled:        cfg.RateLimitEnabled,
+		ratePerCap:              cfg.RatePerCap,
+		burstPerCap:             cfg.BurstPerCap,
 	}
 }
 
@@ -147,6 +180,58 @@ func (r *Router) RegisterWorker(hello envelope.Hello) {
 		r.addToGroup(g, hello.WorkerID)
 	}
 	r.logger.Fields("worker_id", hello.WorkerID, "runtime", hello.Runtime, "groups", hello.Groups).Info("worker registered")
+
+	// If auth is enabled and the worker sent a public key, issue a challenge
+	if r.authEnabled && len(hello.PublicKey) > 0 {
+		if !r.authKeys[string(hello.PublicKey)] {
+			r.logger.Fields("worker_id", hello.WorkerID).Warn("worker public key not authorized")
+			return
+		}
+		challenge := make([]byte, 32)
+		_, _ = rand.Read(challenge)
+		r.authChallenges[hello.WorkerID] = challenge
+		r.authenticated[hello.WorkerID] = false
+		msg := envelope.AuthChallenge{
+			ProtoVer:  envelope.ProtoVer,
+			MsgType:   envelope.MsgAuthChallenge,
+			WorkerID:  hello.WorkerID,
+			Challenge: challenge,
+		}
+		data, _ := r.codec.Marshal(msg)
+		_ = r.bus.Publish(bus.TopicControl(hello.WorkerID), data)
+		r.logger.Fields("worker_id", hello.WorkerID).Info("auth challenge sent")
+	} else if r.authEnabled {
+		// Auth is enabled but worker didn't send a public key
+		r.logger.Fields("worker_id", hello.WorkerID).Warn("auth required but no public key sent")
+	}
+}
+
+// HandleAuthResponse verifies a worker's auth response and marks it authenticated.
+func (r *Router) HandleAuthResponse(resp envelope.AuthResponse) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	challenge, ok := r.authChallenges[resp.WorkerID]
+	if !ok {
+		return fmt.Errorf("no pending auth challenge for worker %s", resp.WorkerID)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(resp.PublicKey), challenge, resp.Signature) {
+		return fmt.Errorf("auth signature verification failed for worker %s", resp.WorkerID)
+	}
+	r.authenticated[resp.WorkerID] = true
+	delete(r.authChallenges, resp.WorkerID)
+	r.logger.Fields("worker_id", resp.WorkerID).Info("worker authenticated")
+	return nil
+}
+
+// IsAuthenticated returns true if the worker has passed auth (or auth is disabled).
+func (r *Router) IsAuthenticated(workerID string) bool {
+	if !r.authEnabled {
+		return true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.authenticated[workerID]
 }
 
 func (r *Router) MarkCapReady(workerID, cap string) {
@@ -245,7 +330,7 @@ func (r *Router) UpdateHeartbeat(ping envelope.HbPing) {
 		// and the caps list (populated only after cap_load completes).
 		groups := ping.Groups
 		if len(groups) == 0 {
-			groups = []string{"default"}
+			groups = []string{wire.GroupDefault}
 		}
 		ws = &WorkerState{
 			ID:      ping.WorkerID,
@@ -303,16 +388,24 @@ func (r *Router) Dispatch(ctx context.Context, env envelope.Envelope) error {
 	default:
 	}
 
+	// Rate limiting check per capability
+	if r.rateLimitEnabled && env.Cap != "" {
+		limiter := r.getOrCreateLimiter(env.Cap)
+		if !limiter.Allow(jack.PriorityHigh) {
+			return fmt.Errorf("%w: cap=%s", ErrRateLimited, env.Cap)
+		}
+	}
+
 	// Normalize: empty group means "default" — workers register in "default" group
 	// and Python subscribes to pepper.push.default, so an empty group produces a
 	// topic mismatch that silently drops the message.
 	if env.Group == "" {
-		env.Group = "default"
+		env.Group = wire.GroupDefault
 	}
 
 	env.MsgType = envelope.MsgReq
 	if env.ReplyTo == "" {
-		env.ReplyTo = "pepper.res." + env.OriginID
+		env.ReplyTo = bus.TopicRes(env.OriginID)
 	}
 
 	if env.WorkerID != "" {
@@ -535,6 +628,22 @@ func (r *Router) ResolveInflight(corrID, originID, workerID string) {
 	}
 }
 
+// Workers returns a snapshot of all registered workers.
+func (r *Router) Workers() []*WorkerState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*WorkerState, 0, len(r.workers))
+	for _, ws := range r.workers {
+		out = append(out, ws)
+	}
+	return out
+}
+
+// IsCircuitOpen is the exported version of isCircuitOpen for health checks.
+func (r *Router) IsCircuitOpen(ws *WorkerState) bool {
+	return r.isCircuitOpen(ws)
+}
+
 func (r *Router) WorkersInGroup(group string) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -639,7 +748,27 @@ func containsGroup(groups []string, target string) bool {
 }
 
 var (
-	ErrWorkerDead = fmt.Errorf("worker dead")
-	ErrNoWorkers  = fmt.Errorf("no workers")
-	ErrPoisonPill = fmt.Errorf("poison pill")
+	ErrWorkerDead  = fmt.Errorf("worker dead")
+	ErrNoWorkers   = fmt.Errorf("no workers")
+	ErrPoisonPill  = fmt.Errorf("poison pill")
+	ErrRateLimited = fmt.Errorf("rate limited")
 )
+
+// getOrCreateLimiter returns the rate limiter for a capability, creating it lazily.
+func (r *Router) getOrCreateLimiter(capName string) *jack.RateLimiter {
+	if limiter, ok := r.rateLimiters.Load(capName); ok {
+		return limiter.(*jack.RateLimiter)
+	}
+	// Lazy creation with sync.Map LoadOrStore for thread safety
+	burst := r.burstPerCap
+	if burst <= 0 {
+		burst = 10
+	}
+	rate := r.ratePerCap
+	if rate <= 0 {
+		rate = 100
+	}
+	limiter := jack.NewRateLimiter(rate, burst)
+	actual, _ := r.rateLimiters.LoadOrStore(capName, limiter)
+	return actual.(*jack.RateLimiter)
+}

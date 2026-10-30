@@ -6,12 +6,14 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/agberohq/pepper/internal/bus"
 	"github.com/agberohq/pepper/internal/codec"
 	"github.com/agberohq/pepper/internal/core"
 	"github.com/agberohq/pepper/internal/envelope"
 	"github.com/agberohq/pepper/internal/hooks"
 	"github.com/agberohq/pepper/internal/pending"
 	"github.com/agberohq/pepper/internal/registry"
+	"github.com/agberohq/pepper/internal/wire"
 	"github.com/goccy/go-json"
 )
 
@@ -60,7 +62,7 @@ func (p *Pepper) buildEnvelope(corrID, originID, cap string, in core.In, o callO
 	env.Cap = cap
 	env.Group = o.group
 	if env.Group == "" {
-		env.Group = "default"
+		env.Group = wire.GroupDefault
 	}
 	env.Dispatch = envelope.Dispatch(o.dispatch)
 	env.Quorum = o.quorum
@@ -69,7 +71,7 @@ func (p *Pepper) buildEnvelope(corrID, originID, cap string, in core.In, o callO
 	env.SessionID = o.sessionID
 	env.MaxHops = o.maxHops
 	env.MaxCbDepth = o.maxCbDepth
-	env.ReplyTo = "pepper.res." + originID
+	env.ReplyTo = bus.TopicRes(originID)
 	deadlineMs := o.deadlineMs
 	if deadlineMs == 0 {
 		deadlineMs = time.Now().Add(p.cfg.DefaultTimeout).UnixMilli()

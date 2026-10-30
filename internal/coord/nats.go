@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agberohq/pepper/internal/wire"
 	"github.com/nats-io/nats.go"
 )
 
@@ -49,7 +50,7 @@ func NewNATS(url string) (Store, error) {
 	_ = js.DeleteStream(natsWorkStream)
 	if _, err = js.AddStream(&nats.StreamConfig{
 		Name:      natsWorkStream,
-		Subjects:  []string{"pepper.push.>"},
+		Subjects:  []string{wire.TopicPushPrefix + ">"},
 		Retention: nats.WorkQueuePolicy,
 		Storage:   nats.FileStorage,
 	}); err != nil {

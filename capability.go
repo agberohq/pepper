@@ -62,12 +62,30 @@ func (p *Pepper) Register(cap Capability, opts ...CapOption) error {
 		for _, o := range opts {
 			o(spec)
 		}
+		// Fail here, not on the first request: the script runtimes decode
+		// envelopes as msgpack, so a JSON codec would leave every worker deaf.
+		if isScriptRuntime(spec.Runtime) && p.codec.Name() != string(CodecMsgPack) {
+			return fmt.Errorf("pepper: capability %q: the %s runtime speaks msgpack only, "+
+				"but the runtime codec is %q — start pepper with pepper.WithCodec(pepper.CodecMsgPack)",
+				spec.Name, spec.Runtime, p.codec.Name())
+		}
 		if err := p.reg.Add(spec); err != nil {
 			return fmt.Errorf("pepper: use %q: %w", spec.Name, err)
 		}
 		p.logRegistered(spec)
 	}
 	return nil
+}
+
+// isScriptRuntime reports whether rt is served by a bundled subprocess runtime,
+// all of which speak msgpack envelopes.
+func isScriptRuntime(rt registry.Runtime) bool {
+	switch rt {
+	case registry.RuntimePython, registry.RuntimeJulia, registry.RuntimeNode, registry.RuntimeRust:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Pepper) logRegistered(spec *registry.Spec) {

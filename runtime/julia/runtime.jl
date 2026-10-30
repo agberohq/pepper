@@ -657,8 +657,12 @@ function _message_loop(w::Worker)
             end
 
         elseif msg_type == "worker_bye"
-            w.running[] = false
-            break
+            # Targeted bye (recycle) carries a worker_id; global shutdown carries none.
+            target = get(env, "worker_id", "")
+            if isempty(target) || target == w.worker_id
+                w.running[] = false
+                break
+            end
 
         elseif msg_type == "cancel"
             oid = get(env, "origin_id", "")

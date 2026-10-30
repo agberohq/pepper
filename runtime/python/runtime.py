@@ -686,8 +686,12 @@ class Worker:
                         log.error("executor task crashed [cap=%s corr_id=%s]: %s", cap, cid, exc, exc_info=exc)
                 fut.add_done_callback(_log_exc)
             elif msg_type == "worker_bye":
-                self._running = False
-                break
+                # Targeted bye (recycle) carries a worker_id; a global shutdown
+                # carries none. Anything else is somebody else's business.
+                target = env.get("worker_id", "")
+                if not target or target == self.worker_id:
+                    self._running = False
+                    break
             elif msg_type == "cancel":
                 origin_id = env.get("origin_id", "")
                 if origin_id:

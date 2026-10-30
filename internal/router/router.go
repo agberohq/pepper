@@ -67,8 +67,6 @@ type Router struct {
 	logger           *ll.Logger
 	distributed      bool // when true, dispatch skips local worker lookup
 	onDispatch       func(env envelope.Envelope, workerID string)
-	onResponse       func(env envelope.Envelope, workerID string, latency time.Duration)
-	onError          func(env envelope.Envelope, code envelope.Code)
 	// capReadyCh is closed-and-replaced whenever a new cap becomes ready,
 	// allowing WaitCapReady to block without polling.
 	capReadyMu sync.Mutex
@@ -502,13 +500,18 @@ func (r *Router) recordCrash(originID, workerID, capName string) {
 		r.logger.Fields("origin_id", originID, "crashes", count).Error("poison pill declared")
 		r.pending.Fail(originID, fmt.Errorf("%w: %s", ErrPoisonPill, originID))
 		if r.dlq != nil {
-			r.dlq.Write(dlq.Entry{
+			entry := dlq.Entry{
 				OriginID:     originID,
 				Cap:          capName,
 				CrashCount:   int(count),
 				LastWorkerID: workerID,
 				DeclaredAt:   time.Now(),
-			})
+			}
+			// A DLQ that cannot persist is worth a loud log: the poison pill is
+			// otherwise unrecoverable the moment the worker restarts.
+			if err := r.dlq.Write(entry); err != nil {
+				r.logger.Fields("origin_id", originID, "error", err).Error("dlq: write poison pill failed")
+			}
 		}
 	}
 }
@@ -736,6 +739,33 @@ func (r *Router) recordWorkerFailure(ws *WorkerState) {
 // recordWorkerSuccess resets the consecutive failure count on a successful request.
 func (r *Router) recordWorkerSuccess(ws *WorkerState) {
 	ws.consecutiveFailures.Store(0)
+}
+
+// RecordFailure marks a failed request against a worker, feeding the circuit
+// breaker. Called by the runtime when an error envelope arrives.
+func (r *Router) RecordFailure(workerID string) {
+	if r.circuitBreakerThreshold <= 0 || workerID == "" {
+		return
+	}
+	r.mu.RLock()
+	ws, ok := r.workers[workerID]
+	r.mu.RUnlock()
+	if ok {
+		r.recordWorkerFailure(ws)
+	}
+}
+
+// RecordSuccess clears a worker's failure streak.
+func (r *Router) RecordSuccess(workerID string) {
+	if workerID == "" {
+		return
+	}
+	r.mu.RLock()
+	ws, ok := r.workers[workerID]
+	r.mu.RUnlock()
+	if ok {
+		r.recordWorkerSuccess(ws)
+	}
 }
 
 func containsGroup(groups []string, target string) bool {

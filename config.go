@@ -70,6 +70,12 @@ type Config struct {
 	// RateLimit configures per-capability rate limiting.
 	// When enabled, each capability gets its own token bucket limiter.
 	RateLimit RateLimitConfig
+	// CircuitBreakerThreshold opens a worker's circuit after this many
+	// consecutive failures, so traffic moves to healthy workers. 0 disables it.
+	CircuitBreakerThreshold int
+	// CircuitBreakerTimeout is how long a worker stays open-circuited before a
+	// single half-open test request is allowed through.
+	CircuitBreakerTimeout time.Duration
 
 	// Debug & observability
 	Debug         DebugLevel
@@ -151,6 +157,21 @@ func WithTLS(c *tls.Config) Option       { return func(cfg *Config) { cfg.TLS = 
 //	pepper.New(pepper.WithAuthKeys(pub))
 func WithAuthKeys(keys ...ed25519.PublicKey) Option {
 	return func(cfg *Config) { cfg.AuthKeys = keys }
+}
+
+// WithCircuitBreaker opens a worker's circuit after `threshold` consecutive
+// failures, keeping traffic on healthy workers until `openFor` elapses (then a
+// single half-open test request decides whether to close it again).
+//
+// Disabled by default: enable it when a failed worker should be taken out of
+// rotation faster than heartbeats would.
+//
+//	pepper.New(pepper.WithCircuitBreaker(5, 30*time.Second))
+func WithCircuitBreaker(threshold int, openFor time.Duration) Option {
+	return func(cfg *Config) {
+		cfg.CircuitBreakerThreshold = threshold
+		cfg.CircuitBreakerTimeout = openFor
+	}
 }
 
 // RateLimitConfig controls per-capability rate limiting.

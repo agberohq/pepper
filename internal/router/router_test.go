@@ -486,3 +486,56 @@ func TestContainsGroup(t *testing.T) {
 		t.Error("nil slice should not contain anything")
 	}
 }
+
+// TestCircuitBreakerOpensAfterFailures pins the wiring: RecordFailure feeds the
+// breaker, RecordSuccess clears it. Before this, nothing ever incremented the
+// failure counter, so WithCircuitBreaker was a no-op.
+func TestCircuitBreakerOpensAfterFailures(t *testing.T) {
+	b := bus.NewMock()
+	p := pending.New()
+	reaper := jack.NewReaper(0,
+		jack.ReaperWithShards(4),
+		jack.ReaperWithHandler(func(_ context.Context, id string) {}),
+	)
+	t.Cleanup(reaper.Stop)
+
+	cfg := DefaultConfig()
+	cfg.Codec = codec.MsgPack
+	cfg.CircuitBreakerThreshold = 3
+	cfg.CircuitBreakerTimeout = time.Minute
+	r := New(b, p, reaper, cfg, ll.New("test"))
+	r.RegisterWorker(helloMsg("w-1", []string{"default"}, []string{"echo"}))
+
+	open := func() bool {
+		for _, ws := range r.Workers() {
+			if ws.ID == "w-1" {
+				return r.IsCircuitOpen(ws)
+			}
+		}
+		t.Fatal("worker w-1 not registered")
+		return false
+	}
+
+	if open() {
+		t.Fatal("circuit open before any failure")
+	}
+
+	// Below the threshold: still closed.
+	r.RecordFailure("w-1")
+	r.RecordFailure("w-1")
+	if open() {
+		t.Error("circuit opened before reaching the threshold")
+	}
+
+	// Threshold reached: open, so dispatch skips this worker.
+	r.RecordFailure("w-1")
+	if !open() {
+		t.Error("circuit should be open after reaching the threshold")
+	}
+
+	// A success resets the streak.
+	r.RecordSuccess("w-1")
+	if open() {
+		t.Error("circuit should close after a successful request")
+	}
+}

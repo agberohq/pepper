@@ -113,7 +113,7 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		}
 		theBus = bus.NewCoordBus(c, mulaURL)
 		busAddr = coord.MulaAddr(c)
-		p.shutdown.Register(c)
+		_ = p.shutdown.Register(c)
 	}
 	rt.bus = theBus
 
@@ -138,17 +138,19 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 
 	// Router
 	rt.router = router.New(theBus, p.pending, rt.reqReaper, router.Config{
-		MaxRetries:       p.cfg.MaxRetries,
-		PoisonThreshold:  p.cfg.PoisonPillThreshold,
-		PoisonPillTTL:    p.cfg.PoisonPillTTL,
-		DLQ:              p.cfg.DLQ,
-		Codec:            p.codec,
-		HeartbeatTimeout: p.cfg.HeartbeatInterval * 3,
-		Distributed:      p.cfg.Coord != nil,
-		AuthKeys:         p.cfg.AuthKeys,
-		RateLimitEnabled: p.cfg.RateLimit.Enabled,
-		RatePerCap:       p.cfg.RateLimit.RatePerCap,
-		BurstPerCap:      p.cfg.RateLimit.BurstPerCap,
+		MaxRetries:              p.cfg.MaxRetries,
+		PoisonThreshold:         p.cfg.PoisonPillThreshold,
+		PoisonPillTTL:           p.cfg.PoisonPillTTL,
+		DLQ:                     p.cfg.DLQ,
+		Codec:                   p.codec,
+		HeartbeatTimeout:        p.cfg.HeartbeatInterval * 3,
+		Distributed:             p.cfg.Coord != nil,
+		AuthKeys:                p.cfg.AuthKeys,
+		RateLimitEnabled:        p.cfg.RateLimit.Enabled,
+		RatePerCap:              p.cfg.RateLimit.RatePerCap,
+		BurstPerCap:             p.cfg.RateLimit.BurstPerCap,
+		CircuitBreakerThreshold: p.cfg.CircuitBreakerThreshold,
+		CircuitBreakerTimeout:   p.cfg.CircuitBreakerTimeout,
 	}, p.logger)
 	rt.doctor = jack.NewDoctor(
 		jack.DoctorWithMaxConcurrent(len(p.cfg.Workers)+4),
@@ -263,20 +265,20 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 	// long enough to broadcast worker_bye and flush pending responses before
 	// the connection is torn down.
 	if p.cfg.Coord != nil {
-		p.shutdown.RegisterWithContext(shutdownCoordClose, func(_ context.Context) error {
+		_ = p.shutdown.RegisterWithContext(shutdownCoordClose, func(_ context.Context) error {
 			return p.cfg.Coord.Close()
 		})
 	}
 
-	p.shutdown.RegisterWithContext(shutdownDoctor, func(_ context.Context) error {
+	_ = p.shutdown.RegisterWithContext(shutdownDoctor, func(_ context.Context) error {
 		rt.doctor.StopAll(p.cfg.ShutdownTimeout)
 		return nil
 	})
-	p.shutdown.RegisterWithContext(shutdownLoopers, func(_ context.Context) error {
+	_ = p.shutdown.RegisterWithContext(shutdownLoopers, func(_ context.Context) error {
 		rt.loopers.Range(func(_, v any) bool { v.(*jack.Looper).Stop(); return true })
 		return nil
 	})
-	p.shutdown.RegisterWithContext(shutdownWorkersBye, func(_ context.Context) error {
+	_ = p.shutdown.RegisterWithContext(shutdownWorkersBye, func(_ context.Context) error {
 		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye})
 		if err := rt.bus.Publish(bus.TopicBroadcast, bye); err != nil {
 			p.logger.Fields("error", err).Warn("shutdown: worker bye broadcast failed")
@@ -284,9 +286,9 @@ func (p *Pepper) bootRuntime(ctx context.Context) error {
 		time.Sleep(200 * time.Millisecond)
 		return nil
 	})
-	p.shutdown.RegisterWithContext(shutdownReqReaper, func(_ context.Context) error { rt.reqReaper.Stop(); return nil })
-	p.shutdown.RegisterWithContext(shutdownBlobReaper, func(_ context.Context) error { rt.blobReaper.Stop(); return nil })
-	p.shutdown.RegisterWithContext(shutdownBGCancel, func(_ context.Context) error { bgCancel(); return nil })
+	_ = p.shutdown.RegisterWithContext(shutdownReqReaper, func(_ context.Context) error { rt.reqReaper.Stop(); return nil })
+	_ = p.shutdown.RegisterWithContext(shutdownBlobReaper, func(_ context.Context) error { rt.blobReaper.Stop(); return nil })
+	_ = p.shutdown.RegisterWithContext(shutdownBGCancel, func(_ context.Context) error { bgCancel(); return nil })
 
 	return nil
 }
@@ -391,10 +393,14 @@ func (p *Pepper) routeResponse(data []byte) {
 	switch envelope.Type(env.MsgType()) {
 	case envelope.MsgRes:
 		p.rt.router.ResolveInflight(corrID, env.OriginID(), env.WorkerID())
+		// Feed the circuit breaker: a worker that keeps failing is taken out of
+		// rotation instead of being retried forever.
+		p.rt.router.RecordSuccess(env.WorkerID())
 		p.rt.reqReaper.Remove(corrID)
 		p.pending.Resolve(corrID, pending.Response{Payload: env.Payload(), WorkerID: env.WorkerID(), Cap: env.Cap(), CapVer: env.CapVer(), Hop: env.Hop(), Meta: env.Meta()})
 	case envelope.MsgErr:
 		p.rt.router.ResolveInflight(corrID, env.OriginID(), env.WorkerID())
+		p.rt.router.RecordFailure(env.WorkerID())
 		p.rt.reqReaper.Remove(corrID)
 		p.pending.Fail(corrID, &WorkerError{Code: env.Code(), Message: env.Message()})
 	case envelope.MsgResChunk:
@@ -823,9 +829,10 @@ func (p *Pepper) startRespawnLooper(workerID string, wc WorkerConfig, allSpecs [
 
 func (p *Pepper) checkRecycle(workerID string, wc WorkerConfig, served uint64, uptimeMs int64) {
 	if (wc.MaxRequests > 0 && served >= wc.MaxRequests) || (wc.MaxUptime > 0 && time.Duration(uptimeMs)*time.Millisecond >= wc.MaxUptime) {
+		// Targeted, not broadcast: recycling one worker must not stop its peers.
 		bye, _ := p.codec.Marshal(envelope.WorkerBye{ProtoVer: envelope.ProtoVer, MsgType: envelope.MsgWorkerBye, WorkerID: workerID})
-		if err := p.rt.bus.Publish(bus.TopicBroadcast, bye); err != nil {
-			p.logger.Fields("worker_id", workerID, "error", err).Warn("recycle: worker bye broadcast failed")
+		if err := p.rt.bus.Publish(bus.TopicControl(workerID), bye); err != nil {
+			p.logger.Fields("worker_id", workerID, "error", err).Warn("recycle: worker bye publish failed")
 		}
 	}
 }
@@ -897,8 +904,8 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 
 	if err := cmd.Start(); err != nil {
 		if logW != nil {
-			logR.Close()
-			logW.Close()
+			_ = logR.Close()
+			_ = logW.Close()
 		}
 		return err
 	}
@@ -908,7 +915,7 @@ func (p *Pepper) spawnPythonWorker(ctx context.Context, wc WorkerConfig, workerI
 		p.logger.Fields("worker", workerID, "error", err).Warn("sub.Track failed")
 	}
 	if logW != nil {
-		logW.Close() // parent closes write end; child holds the only reference
+		_ = logW.Close() // parent closes write end; child holds the only reference
 		go p.pipeWorkerLogs(logR, workerID, string(registry.RuntimePython))
 	}
 	p.rt.workerStates.Store(workerID, &workerEntry{id: workerID, groups: groups, wc: wc, busAddr: busAddr})
@@ -965,7 +972,7 @@ func (p *Pepper) bootGoWorkers(ctx context.Context, allSpecs []*registry.Spec) e
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
-		p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeGo), wid), func(_ context.Context) error { rt.Stop(); return nil })
+		_ = p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeGo), wid), func(_ context.Context) error { rt.Stop(); return nil })
 	}
 	return nil
 }
@@ -1016,7 +1023,7 @@ func (p *Pepper) bootAdapterWorkers(ctx context.Context, allSpecs []*registry.Sp
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
-		p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeHTTP), wid), func(_ context.Context) error { wrt.Stop(); return nil })
+		_ = p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeHTTP), wid), func(_ context.Context) error { wrt.Stop(); return nil })
 	}
 	return nil
 }
@@ -1045,7 +1052,7 @@ func (p *Pepper) bootCLIWorkers(ctx context.Context, allSpecs []*registry.Spec) 
 		p.signalFirstWorkerReady()
 		p.rt.readyWorkers.Add(1)
 		p.rt.workerStates.Store(wid, &workerEntry{id: wid, groups: groups, ready: true, caps: []string{spec.Name}})
-		p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeCLI), wid), func(_ context.Context) error { wrt.Stop(); return nil })
+		_ = p.shutdown.RegisterWithContext(shutdownWorkerKey(string(registry.RuntimeCLI), wid), func(_ context.Context) error { wrt.Stop(); return nil })
 	}
 	return nil
 }
@@ -1119,7 +1126,7 @@ func (p *Pepper) Run(ctx context.Context, snippet string, vars Vars, opts ...Cal
 // pipeWorkerLogs reads structured JSON log lines from Python fd 3 and
 // re-emits them through the Go logger so all worker logs share one backend.
 func (p *Pepper) pipeWorkerLogs(r *os.File, workerID, runtimeKind string) {
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		var entry map[string]any
@@ -1148,35 +1155,6 @@ func (p *Pepper) pipeWorkerLogs(r *os.File, workerID, runtimeKind string) {
 			l.Info(msg)
 		}
 	}
-}
-
-// newBus creates a Bus from the URL scheme.
-// All four backends (memory, mula/tcp, redis, nats) now go through coord.Store
-// → bus.coordBus, giving a single transport path.
-func newBus(url string, cfg bus.Config) (bus.Bus, error) {
-	var c coord.Store
-	var err error
-	switch {
-	case url == "" || wire.HasScheme(url, wire.SchemeTCP):
-		// Mula: default single-node TCP transport.
-		c, err = coord.NewMula(url)
-		if err != nil {
-			return nil, fmt.Errorf("bus: mula: %w", err)
-		}
-	case wire.HasScheme(url, wire.SchemeRedis):
-		c, err = coord.NewRedis(url)
-		if err != nil {
-			return nil, fmt.Errorf("bus: redis: %w", err)
-		}
-	case wire.HasScheme(url, wire.SchemeNATS):
-		c, err = coord.NewNATS(url)
-		if err != nil {
-			return nil, fmt.Errorf("bus: nats: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("bus: unknown transport URL %q", url)
-	}
-	return bus.NewCoordBus(c, url), nil
 }
 
 // extractMap normalises a value that may be map[string]any (JSON) or

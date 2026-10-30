@@ -302,8 +302,12 @@ class Worker {
         log.info(`req received #${this._msgsReceived}`, { cap: env.cap, corr_id: env.corr_id, worker: this.workerId, hop: env.hop ?? 0 });
         this._handleRequest(env).catch(e => log.error("request handler crashed: " + e.message));
       } else if (t === "worker_bye") {
-        this.running = false;
-        break;
+        // Targeted bye (recycle) carries a worker_id; global shutdown carries none.
+        const target = env.worker_id || "";
+        if (!target || target === this.workerId) {
+          this.running = false;
+          break;
+        }
       } else if (t === "cancel") {
         if (env.origin_id) markCancelled(env.origin_id);
       }

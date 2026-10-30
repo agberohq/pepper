@@ -94,6 +94,21 @@ func (p *Pepper) Compose(name string, stages ...Stage) error {
 	if err != nil {
 		return fmt.Errorf("compose %q: %w", name, err)
 	}
+	// Only reject what the executor cannot run, and say so at registration time:
+	// a stage that silently half-runs is worse than an error.
+	for i := range stages {
+		kind, err := dag.StageKind(i)
+		if err != nil {
+			return fmt.Errorf("compose %q: %w", name, err)
+		}
+		switch kind {
+		case compose.StageDispatch, compose.StageTransform, compose.StageReturn:
+		default:
+			return fmt.Errorf("compose %q: stage %d (%s) is not executable yet — the router runs "+
+				"Pipe, Transform and PipeReturn stages; scatter gather and branching are still open",
+				name, i, kind)
+		}
+	}
 	spec := &registry.Spec{Name: name, Runtime: registry.RuntimePipeline, Pipeline: dag, Version: defaultCapVersion}
 	p.logger.Fields("name", name, "stages", len(stages)).Info("composed pipeline")
 	return p.reg.Add(spec)

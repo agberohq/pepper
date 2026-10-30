@@ -114,7 +114,7 @@ func (ins *Inspector) handleClient(conn net.Conn) {
 	ins.mu.Unlock()
 
 	// Write a welcome line
-	fmt.Fprintf(conn, "# pepper inspector — %s\n", time.Now().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(conn, "# pepper inspector — %s\n", time.Now().Format(time.RFC3339))
 
 	// Keep alive — wait for disconnect
 	discard := make([]byte, 1)
@@ -128,7 +128,7 @@ func (ins *Inspector) handleClient(conn net.Conn) {
 	ins.mu.Lock()
 	delete(ins.clients, conn)
 	ins.mu.Unlock()
-	conn.Close()
+	_ = conn.Close()
 }
 
 func (ins *Inspector) broadcastLoop() {
@@ -161,6 +161,6 @@ func (ins *Inspector) broadcast(e Event) {
 		} else {
 			line = e.Format()
 		}
-		fmt.Fprintln(c.conn, line)
+		_, _ = fmt.Fprintln(c.conn, line)
 	}
 }

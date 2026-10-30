@@ -14,7 +14,7 @@ type Result struct {
 	WorkerID      string
 	Runtime       string
 	Latency       time.Duration
-	WorkerMs      time.Duration
+	WorkerLatency time.Duration
 	Cap           string
 	CapVer        string
 	Hop           uint8

@@ -300,7 +300,7 @@ func TestExec(t *testing.T) {
 
 	if err := pp.Register(Func("text.noop",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
-			return TextOut{Text: in.Text}, nil
+			return TextOut(in), nil
 		},
 	)); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -422,7 +422,7 @@ func TestExecuteAndProcess(t *testing.T) {
 	}
 	if err := pp.Register(Func("text.id",
 		func(ctx context.Context, in TextIn) (TextOut, error) {
-			return TextOut{Text: in.Text}, nil
+			return TextOut(in), nil
 		},
 	)); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -607,7 +607,7 @@ func TestFilterByRuntimeTyped(t *testing.T) {
 		Text string `json:"text"`
 	}
 	_ = pp.Register(Func("text.upper", func(_ context.Context, in TextIn) (TextOut, error) {
-		return TextOut{Text: in.Text}, nil
+		return TextOut(in), nil
 	}))
 
 	schemas := pp.Capabilities(context.Background(), FilterByRuntime("go"))

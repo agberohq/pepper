@@ -231,7 +231,7 @@ python-setup-real: python-setup
 	$(PIP) install nomic
 
 # ─── Both ─────────────────────────────────────────────────────────────────────
-test: go-test python-test
+test: go-test python-test rust-test
 
 # ─── Service + environment check ─────────────────────────────────────────────
 check-services:

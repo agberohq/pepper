@@ -129,7 +129,7 @@ func (s *PrometheusSink) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		return true
 	})
 
-	fmt.Fprint(w, sb.String())
+	_, _ = fmt.Fprint(w, sb.String())
 }
 
 // Prometheus returns a PrometheusSink. Register its ServeHTTP for /metrics:

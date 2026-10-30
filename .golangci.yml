@@ -1,0 +1,22 @@
+version: "2"
+
+# Deliberately strict: the point of linting this repo is to catch protocol and
+# resource bugs early, so nothing is disabled wholesale. The one exclusion is
+# errcheck in tests — a failed cleanup there shows up as a failing assertion, and
+# checking every `defer rows.Close()` hides the real signal.
+linters:
+  default: standard
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+run:
+  timeout: 5m
+  tests: true

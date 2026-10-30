@@ -113,7 +113,7 @@ func (p *Pepper) freePort() int {
 		return 7731
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	_ = ln.Close()
 	return port
 }
 

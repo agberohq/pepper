@@ -29,6 +29,7 @@ func (b *HTTPBuilder) BuildSpec(name string) *registry.Spec {
 		Version:     "0.0.0",
 		Source:      b.baseURL,
 		Groups:      groups,
+		Timeout:     timeout,
 		AdapterSpec: b, // store the whole builder for the runner
 	}
 }

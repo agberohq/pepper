@@ -77,7 +77,7 @@ func NewMulaCluster(bindAddr string, gossipPort, rpcPort int, seeds []string) (S
 
 	ml, err := memberlist.Create(conf)
 	if err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return nil, fmt.Errorf("coord/mula: memberlist: %w", err)
 	}
 	m.ml = ml
@@ -417,21 +417,29 @@ func (m *mulaStore) Close() error {
 		return nil
 	}
 	close(m.stopCh)
+	var firstErr error
 	if m.ml != nil {
-		m.ml.Leave(0)
-		m.ml.Shutdown()
+		// Shutdown must happen even if Leave fails, so collect rather than bail.
+		if err := m.ml.Leave(0); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("coord/mula: leave cluster: %w", err)
+		}
+		if err := m.ml.Shutdown(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("coord/mula: memberlist shutdown: %w", err)
+		}
 	}
-	m.ln.Close()
+	if err := m.ln.Close(); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("coord/mula: listener close: %w", err)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, subs := range m.remoteSubs {
 		for _, sub := range subs {
-			sub.conn.Close()
+			_ = sub.conn.Close()
 		}
 	}
 	// Local and prefix sub cleanup goroutines select on stopCh and will run
 	// their close-under-WLock logic once stopCh fires. Nothing to do here.
-	return nil
+	return firstErr
 }
 
 // TCP accept loop
@@ -452,7 +460,7 @@ func (m *mulaStore) acceptLoop() {
 }
 
 func (m *mulaStore) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	helloData, err := mulaReadFrame(conn)
 	if err != nil {
 		return
@@ -681,10 +689,6 @@ func (m *mulaStore) keyOwner(key string) *string {
 
 // queueOwner returns the RPC address of the node owning a push queue,
 // or nil if this node is the owner.
-func (m *mulaStore) queueOwner(queue string) *string {
-	return m.keyOwner(queue)
-}
-
 // Inter-node RPC
 
 const (
@@ -702,7 +706,7 @@ func (m *mulaStore) rpcDial(addr string) (net.Conn, error) {
 	}
 	// Identify as internal RPC connection.
 	if err := mulaWriteFrame(conn, []byte("rpc")); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return conn, nil
@@ -731,9 +735,8 @@ func (m *mulaStore) serveRPC(conn net.Conn) {
 			m.kvMu.Unlock()
 			mulaWriteFrame(conn, []byte{0}) //nolint:errcheck
 		case rpcOpGet:
-			key := string(rest)
 			m.kvMu.RLock()
-			v, ok := m.kv[key]
+			v, ok := m.kv[string(rest)]
 			m.kvMu.RUnlock()
 			if !ok {
 				mulaWriteFrame(conn, []byte{1}) //nolint:errcheck
@@ -784,7 +787,7 @@ func (m *mulaStore) rpcSet(ctx context.Context, addr *string, key string, value 
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := mulaWriteFrame(conn, rpcEncodeKV(rpcOpSet, key, value)); err != nil {
 		return err
 	}
@@ -797,7 +800,7 @@ func (m *mulaStore) rpcGet(ctx context.Context, addr *string, key string) ([]byt
 	if err != nil {
 		return nil, false, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	frame := append([]byte{rpcOpGet}, []byte(key)...)
 	if err := mulaWriteFrame(conn, frame); err != nil {
 		return nil, false, err
@@ -817,7 +820,7 @@ func (m *mulaStore) rpcDelete(ctx context.Context, addr *string, key string) err
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	frame := append([]byte{rpcOpDelete}, []byte(key)...)
 	if err := mulaWriteFrame(conn, frame); err != nil {
 		return err
@@ -831,7 +834,7 @@ func (m *mulaStore) rpcPublish(ctx context.Context, addr string, channel string,
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := mulaWriteFrame(conn, rpcEncodeKV(rpcOpPublish, channel, payload)); err != nil {
 		return err
 	}
@@ -839,12 +842,13 @@ func (m *mulaStore) rpcPublish(ctx context.Context, addr string, channel string,
 	return err
 }
 
+//nolint:unused // client half of the cross-node pull handshake served by servePuller.
 func (m *mulaStore) rpcPullFrom(ctx context.Context, ownerAddr string, queue string) ([]byte, error) {
 	conn, err := net.Dial(wire.SchemeTCP, strings.TrimPrefix(ownerAddr, wire.TCPPrefix))
 	if err != nil {
 		return nil, fmt.Errorf("coord/mula: rpcPullFrom dial %s: %w", ownerAddr, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send the pull handshake: the owner's handleConn routes "pull:topic" to servePuller.
 	if err := mulaWriteFrame(conn, []byte("pull:"+queue)); err != nil {
@@ -861,7 +865,7 @@ func (m *mulaStore) rpcPullFrom(ctx context.Context, ownerAddr string, queue str
 	go func() {
 		select {
 		case <-ctx.Done():
-			conn.Close() // unblocks mulaReadFrame
+			_ = conn.Close() // unblocks mulaReadFrame
 		case <-done:
 		}
 	}()
@@ -882,7 +886,7 @@ func (m *mulaStore) rpcPush(ctx context.Context, addr *string, queue string, pay
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := mulaWriteFrame(conn, rpcEncodeKV(rpcOpPush, queue, payload)); err != nil {
 		return err
 	}

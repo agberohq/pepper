@@ -24,7 +24,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/agberohq/pepper/internal/blob"
@@ -134,18 +133,8 @@ func (b *Builder) Build() CMDSpec { return b.spec }
 type Runner struct {
 	spec    CMDSpec
 	tmpDir  string
-	mu      sync.Mutex
-	pool    []*poolWorker // non-nil when Pool > 0
 	blobs   *blob.Manager
 	blobTTL time.Duration
-}
-
-type poolWorker struct {
-	cmd    *exec.Cmd
-	stdin  *bytes.Buffer
-	stdout *bytes.Buffer
-	mu     sync.Mutex
-	served int
 }
 
 // NewRunner creates a Runner for the given spec.
@@ -168,7 +157,7 @@ func (r *Runner) Run(ctx context.Context, in map[string]any) (map[string]any, er
 			return nil, fmt.Errorf("cli.Run: write input: %w", err)
 		}
 		inputPath = path
-		cleanup = append(cleanup, func() { os.Remove(path) })
+		cleanup = append(cleanup, func() { _ = os.Remove(path) })
 	}
 
 	// Prepare output path
@@ -178,7 +167,7 @@ func (r *Runner) Run(ctx context.Context, in map[string]any) (map[string]any, er
 			glob = "output-*.bin"
 		}
 		outputPath = r.tmpFilePath(glob)
-		cleanup = append(cleanup, func() { os.Remove(outputPath) })
+		cleanup = append(cleanup, func() { _ = os.Remove(outputPath) })
 	}
 
 	defer func() {

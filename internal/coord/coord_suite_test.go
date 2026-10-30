@@ -261,20 +261,3 @@ func (s *Suite) testPullCancelledContext(t *testing.T) {
 		t.Fatal("Pull did not return after ctx cancel")
 	}
 }
-
-// runBenchSetGet is a shared benchmark helper for any coord.Store backend.
-func runBenchSetGet(b *testing.B, store Store) {
-	b.Helper()
-	ctx := context.Background()
-	key := "bench:setget"
-	val := []byte("bench-value")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := store.Set(ctx, key, val, 0); err != nil {
-			b.Fatalf("Set: %v", err)
-		}
-		if _, _, err := store.Get(ctx, key); err != nil {
-			b.Fatalf("Get: %v", err)
-		}
-	}
-}

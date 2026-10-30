@@ -101,7 +101,7 @@ func runInspect(args []string) {
 		fmt.Fprintf(os.Stderr, "pepper inspect: cannot connect to %q: %v\n", sockPath, err)
 		os.Exit(1)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send filter config
 	cfg := struct {
@@ -109,7 +109,10 @@ func runInspect(args []string) {
 		Format string         `json:"format"`
 	}{Filter: merged, Format: *format}
 	data, _ := json.Marshal(cfg)
-	conn.Write(data)
+	if _, err := conn.Write(data); err != nil {
+		fmt.Fprintf(os.Stderr, "pepper inspect: send filter: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Stream events to stdout
 	buf := make([]byte, 65536)
@@ -121,7 +124,9 @@ func runInspect(args []string) {
 			}
 			return
 		}
-		os.Stdout.Write(buf[:n])
+		if _, err := os.Stdout.Write(buf[:n]); err != nil {
+			return
+		}
 	}
 }
 

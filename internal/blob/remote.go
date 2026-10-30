@@ -102,7 +102,7 @@ func (s *S3Backend) Put(ctx context.Context, id string, r io.Reader, size int64)
 	if err != nil {
 		return "", fmt.Errorf("blob/s3: PUT: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return "", fmt.Errorf("blob/s3: PUT %d: %s", resp.StatusCode, body)
@@ -143,7 +143,7 @@ func (s *S3Backend) Get(ctx context.Context, path string) (io.ReadCloser, error)
 		return nil, fmt.Errorf("blob/s3: GET: %w", err)
 	}
 	if resp.StatusCode >= 300 {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("blob/s3: GET %d for %s", resp.StatusCode, path)
 	}
 	return resp.Body, nil
@@ -179,7 +179,7 @@ func (s *S3Backend) Delete(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode >= 300 && resp.StatusCode != 404 {
 		return fmt.Errorf("blob/s3: DELETE %d for %s", resp.StatusCode, path)
 	}
@@ -197,7 +197,7 @@ func Fetch(ctx context.Context, remote RemoteBackend, ref Ref, m *Manager) (Ref,
 	if err != nil {
 		return Ref{}, fmt.Errorf("blob.Fetch %s: %w", ref.ID, err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	local, err := m.WriteFromReader(r, 30*time.Minute,
 		WithDType(ref.DType),

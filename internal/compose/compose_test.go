@@ -146,17 +146,32 @@ func TestParallelValidate(t *testing.T) {
 // error policies
 
 func TestErrorPolicyEquality(t *testing.T) {
-	if AbortPipeline != AbortPipeline {
-		t.Error("AbortPipeline self-equality failed")
+	// Distinct policies must not compare equal, or stage configuration would be
+	// silently interchangeable.
+	if AbortPipeline == SkipStage {
+		t.Error("AbortPipeline and SkipStage must differ")
 	}
-	if SkipStage != SkipStage {
-		t.Error("SkipStage self-equality failed")
+	if AbortPipeline == FallbackStage("x") {
+		t.Error("AbortPipeline and FallbackStage must differ")
 	}
-	if RetryStage(3) != RetryStage(3) {
+	if SkipStage == RetryStage(1) {
+		t.Error("SkipStage and RetryStage must differ")
+	}
+	// Identical policies must compare equal (compared via variables: an
+	// expression-vs-itself check is a no-op the linter rightly rejects).
+	ra, rb := RetryStage(3), RetryStage(3)
+	if ra != rb {
 		t.Error("RetryStage equality failed")
 	}
-	if FallbackStage("x") != FallbackStage("x") {
+	fa, fb := FallbackStage("x"), FallbackStage("x")
+	if fa != fb {
 		t.Error("FallbackStage equality failed")
+	}
+	if RetryStage(1) == RetryStage(2) {
+		t.Error("RetryStage(1) and RetryStage(2) must differ")
+	}
+	if FallbackStage("x") == FallbackStage("y") {
+		t.Error("FallbackStage with different capabilities must differ")
 	}
 	if RetryStage(3) == RetryStage(4) {
 		t.Error("RetryStage inequality failed")

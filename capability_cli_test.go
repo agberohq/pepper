@@ -12,11 +12,19 @@ import (
 // TestCoordConstructorsCompile pins the public shape of the cluster coord
 // constructors. They are thin wrappers over internal/coord, which external users
 // cannot import directly.
+//
+// The pinning happens through parameter types: passing the function to a helper
+// only compiles if the signature still matches.
+func pinCoordCtor(f func(string) (Coord, error)) { _ = f }
+func pinMulaClusterCtor(f func(string, int, int, []string) (Coord, error)) {
+	_ = f
+}
+
 func TestCoordConstructorsCompile(t *testing.T) {
-	var _ func(string) (Coord, error) = Redis
-	var _ func(string) (Coord, error) = NATS
-	var _ func(string) (Coord, error) = Mula
-	var _ func(string, int, int, []string) (Coord, error) = MulaCluster
+	pinCoordCtor(Redis)
+	pinCoordCtor(NATS)
+	pinCoordCtor(Mula)
+	pinMulaClusterCtor(MulaCluster)
 }
 
 // so the stdin/stdout contract documented on pepper.CLI actually takes effect.

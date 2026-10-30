@@ -258,9 +258,9 @@ func TestStore_Subscribe_ClosedOnCtxDone(t *testing.T) {
 
 		// Channel must close promptly after ctx is cancelled.
 		select {
-		case _, ok := <-ch:
+		case v, ok := <-ch:
 			if ok {
-				// received a value before close — acceptable if something was buffered
+				t.Logf("buffered value delivered before close: %v", v)
 			}
 			// channel closed
 		case <-time.After(500 * time.Millisecond):
@@ -515,7 +515,7 @@ func TestStore_BinaryPayloads(t *testing.T) {
 // Interface compliance
 
 func TestStore_InterfaceCompliance(t *testing.T) {
-	var _ Store = NewMemory()
+	var _ = NewMemory()
 	// Redis and NATS are verified at runtime via var _ Store = (*Xstore)(nil)
 	// in their respective files.
 }

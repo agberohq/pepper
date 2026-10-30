@@ -7,3 +7,4 @@ xet
 /models*
 # Rust build output (runtime/rust target dir, capability caches)
 runtime/rust/target/
+.DS_Store

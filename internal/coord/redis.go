@@ -82,7 +82,7 @@ func (s *redisStore) Subscribe(ctx context.Context, channelPrefix string) (<-cha
 
 	go func() {
 		defer close(ch)
-		defer pubsub.Close()
+		defer func() { _ = pubsub.Close() }()
 
 		// WithChannelSize expands the internal go-redis buffer (default 100).
 		msgCh := pubsub.Channel(redis.WithChannelSize(1024))

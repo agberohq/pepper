@@ -280,7 +280,7 @@ func (r *Runner) Run(ctx context.Context, in map[string]any) (map[string]any, er
 	if err != nil {
 		return nil, fmt.Errorf("adapter.Run: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

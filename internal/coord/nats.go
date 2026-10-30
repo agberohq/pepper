@@ -126,7 +126,7 @@ func (s *natsStore) List(_ context.Context, prefix string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer lister.Stop()
+	defer func() { _ = lister.Stop() }()
 
 	var keys []string
 	for encoded := range lister.Keys() {
@@ -203,7 +203,7 @@ func (s *natsStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan
 		wildcard := channelPrefix + ".>"
 		sub2, err := s.nc.Subscribe(wildcard, handler)
 		if err != nil {
-			sub1.Unsubscribe()
+			_ = sub1.Unsubscribe()
 			return nil, err
 		}
 		subs = append(subs, sub2)
@@ -215,7 +215,7 @@ func (s *natsStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan
 		case <-s.stopCh:
 		}
 		for _, sub := range subs {
-			sub.Unsubscribe()
+			_ = sub.Unsubscribe()
 		}
 		close(ch)
 	}()
@@ -288,7 +288,7 @@ func (s *natsStore) Close() error {
 		close(s.stopCh)
 		s.pullSubsMu.Lock()
 		for _, sub := range s.pullSubs {
-			sub.Unsubscribe()
+			_ = sub.Unsubscribe()
 		}
 		s.pullSubsMu.Unlock()
 		err = s.nc.Drain()

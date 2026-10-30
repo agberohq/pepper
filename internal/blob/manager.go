@@ -56,7 +56,7 @@ func (m *Manager) WriteFile(srcPath string, ttl time.Duration, opts ...WriteOpti
 	if err != nil {
 		return nil, fmt.Errorf("blob.WriteFile: open %q: %w", srcPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return m.WriteFromReader(f, ttl, opts...)
 }
 
@@ -73,7 +73,9 @@ func (m *Manager) WriteFromReader(r io.Reader, ttl time.Duration, opts ...WriteO
 		return nil, fmt.Errorf("blob.WriteFromReader: create: %w", err)
 	}
 	size, err := io.Copy(f, r)
-	f.Close()
+	if cerr := f.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
 	if err != nil {
 		_ = os.Remove(path)
 		return nil, fmt.Errorf("blob.WriteFromReader: copy: %w", err)

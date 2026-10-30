@@ -297,7 +297,6 @@ func TestHandleMessageExecError(t *testing.T) {
 	resCh, _ := b.Subscribe(ctx, bus.TopicRes("origin-err"))
 	time.Sleep(20 * time.Millisecond)
 
-	data, _ := makeEnvelope("echo", map[string]any{})
 	// patch origin
 	env := envelope.DefaultEnvelope()
 	env.MsgType = envelope.MsgReq
@@ -307,7 +306,7 @@ func TestHandleMessageExecError(t *testing.T) {
 	env.DeadlineMs = time.Now().Add(5 * time.Second).UnixMilli()
 	p, _ := json.Marshal(map[string]any{})
 	env.Payload = p
-	data, _ = json.Marshal(env)
+	data, _ := json.Marshal(env)
 
 	b.Publish(bus.TopicPub("default"), data)
 

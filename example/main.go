@@ -43,7 +43,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pp.Stop()
+	defer func() { _ = pp.Stop() }()
 
 	// Register capabilities — one method for all runtime types
 
@@ -163,7 +163,7 @@ func main() {
 	// NewSession generates an ID you can persist (cookie, JWT, etc.)
 	sess := pp.NewSession()
 	fmt.Printf("\nsession ID: %s\n", sess.ID())
-	sess.Set("preference", "concise")
+	_ = sess.Set("preference", "concise")
 
 	// Everything dispatched through sess carries the session ID automatically.
 	// No passing IDs around — capabilities read it via SessionFromContext(ctx).

@@ -143,9 +143,6 @@ const (
 
 	// defaultCapVersion is the semver assigned to capabilities with no explicit version.
 	defaultCapVersion = "0.0.0"
-
-	// protoVer is the wire envelope protocol version.
-	protoVer = uint8(1)
 )
 
 // groupBroadcast is the group name that routes a request to all workers via pub/sub.

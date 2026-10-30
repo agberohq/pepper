@@ -55,9 +55,10 @@ func (p *Pepper) Health() HealthStatus {
 		h.Workers = len(workers)
 		for _, ws := range workers {
 			state := ws.State.Load().(router.WorkerHealthState)
-			if state == router.WorkerStateReady {
+			switch state {
+			case router.WorkerStateReady:
 				h.ReadyWorkers++
-			} else if state == router.WorkerStateDead {
+			case router.WorkerStateDead:
 				h.DeadWorkers++
 			}
 			if r.IsCircuitOpen(ws) {

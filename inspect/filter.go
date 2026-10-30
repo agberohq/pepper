@@ -60,7 +60,7 @@ func ParseFilterArg(arg string) Filter {
 		f.MsgType = val
 	case "hop":
 		if strings.HasPrefix(val, ">") {
-			fmt.Sscanf(val[1:], "%d", &f.MinHop)
+			_, _ = fmt.Sscanf(val[1:], "%d", &f.MinHop)
 			f.MinHop++ // ">0" means hop >= 1
 		}
 	}

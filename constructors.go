@@ -6,11 +6,13 @@ import (
 )
 
 // HTTPAdapter starts building an HTTP adapter capability builder.
-// Use with pp.Adapt() for the legacy API, or use pepper.HTTP(name, url) with pp.Use().
+// Use with pp.Register for the typed API, or pepper.HTTP(name, url) for the
+// one-liner form.
 func HTTPAdapter(baseURL string) *adapter.HTTPBuilder { return adapter.HTTP(baseURL) }
 
 // MCPAdapter starts building an MCP adapter capability builder.
-// Use with pp.Adapt() for the legacy API, or use pepper.MCP(name, url) with pp.Use().
+// Use with pp.Register for the typed API, or pepper.MCP(name, url) for the
+// one-liner form.
 func MCPAdapter(serverURL string) *adapter.MCPBuilder { return adapter.MCP(serverURL) }
 
 // Ollama is the built-in adapter for the Ollama HTTP API.
@@ -29,7 +31,8 @@ func BearerToken(token string) adapter.AuthProvider { return adapter.BearerToken
 func APIKey(header, key string) adapter.AuthProvider { return adapter.APIKey(header, key) }
 
 // CMD starts building a CLI tool capability.
-// Use with pp.Prepare() for the legacy API, or use pepper.CLI(name, cmd) with pp.Use().
+// Use with pp.Register for the typed API, or pepper.CLI(name, cmd) for the
+// one-liner form.
 func CMD(command string, args ...string) *cli.Builder { return cli.CMD(command, args...) }
 
 // JSONStdin passes the payload JSON-encoded to the process stdin.

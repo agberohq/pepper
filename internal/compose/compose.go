@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/agberohq/pepper/internal/envelope"
+	"github.com/agberohq/pepper/internal/wire"
 )
 
 // Stage is a single node in a pipeline DAG.
@@ -211,13 +212,13 @@ func WithGatherTimeout(d time.Duration) GatherOption {
 // Topic helpers
 
 func pipeTopicForStage(pipelineName string, stageIdx int) string {
-	return fmt.Sprintf("pepper.pipe.%s.stage.%d", sanitizeName(pipelineName), stageIdx)
+	return fmt.Sprintf("%s%s.stage.%d", wire.TopicPipePrefix, sanitizeName(pipelineName), stageIdx)
 }
 
 func pipeTopicForArm(pipelineName string, stageIdx int, condition string) string {
 	safe := strings.NewReplacer(" ", "_", "'", "", `"`, "", ">", "gt", "<", "lt", "=", "eq").
 		Replace(condition)
-	return fmt.Sprintf("pepper.pipe.%s.branch.%d.%s", sanitizeName(pipelineName), stageIdx, safe)
+	return fmt.Sprintf("%s%s.branch.%d.%s", wire.TopicPipePrefix, sanitizeName(pipelineName), stageIdx, safe)
 }
 
 func sanitizeName(name string) string {

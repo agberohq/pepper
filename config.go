@@ -1,6 +1,7 @@
 package pepper
 
 import (
+	"crypto/ed25519"
 	"crypto/tls"
 	"time"
 
@@ -61,6 +62,14 @@ type Config struct {
 
 	// Security
 	TLS *tls.Config
+	// AuthKeys is the set of authorized worker Ed25519 public keys.
+	// When non-empty, workers must present a valid public key in their Hello
+	// message and sign a challenge-response to authenticate.
+	// Auth is opt-in: leave empty for backward compatibility.
+	AuthKeys []ed25519.PublicKey
+	// RateLimit configures per-capability rate limiting.
+	// When enabled, each capability gets its own token bucket limiter.
+	RateLimit RateLimitConfig
 
 	// Debug & observability
 	Debug         DebugLevel
@@ -131,7 +140,40 @@ func WithCodec(c Codec) Option           { return func(cfg *Config) { cfg.Codec 
 func WithTransport(t Transport) Option   { return func(cfg *Config) { cfg.Transport = t } }
 func WithTransportURL(url string) Option { return func(cfg *Config) { cfg.TransportURL = url } }
 func WithTLS(c *tls.Config) Option       { return func(cfg *Config) { cfg.TLS = c } }
-func WithLogger(l *ll.Logger) Option     { return func(cfg *Config) { cfg.logger = l } }
+
+// WithAuthKeys sets the authorized worker Ed25519 public keys.
+// When set, workers must authenticate via challenge-response before
+// they can serve requests. Workers provide their private key via the
+// PEPPER_AUTH_KEY environment variable (hex-encoded Ed25519 private key).
+//
+//	priv, _ := hex.DecodeString("...")
+//	pub := ed25519.PublicKey(priv[32:])
+//	pepper.New(pepper.WithAuthKeys(pub))
+func WithAuthKeys(keys ...ed25519.PublicKey) Option {
+	return func(cfg *Config) { cfg.AuthKeys = keys }
+}
+
+// RateLimitConfig controls per-capability rate limiting.
+type RateLimitConfig struct {
+	Enabled     bool    // whether rate limiting is active
+	RatePerCap  float64 // sustained requests per second per capability
+	BurstPerCap int     // max burst size per capability
+}
+
+// WithRateLimit enables per-capability rate limiting.
+// ratePerCap is the sustained throughput; burstPerCap is the max burst.
+//
+//	pepper.New(pepper.WithRateLimit(true, 100, 50))
+func WithRateLimit(enabled bool, ratePerCap float64, burstPerCap int) Option {
+	return func(cfg *Config) {
+		cfg.RateLimit = RateLimitConfig{
+			Enabled:     enabled,
+			RatePerCap:  ratePerCap,
+			BurstPerCap: burstPerCap,
+		}
+	}
+}
+func WithLogger(l *ll.Logger) Option { return func(cfg *Config) { cfg.logger = l } }
 
 func WithMaxConcurrent(n int) Option            { return func(cfg *Config) { cfg.MaxConcurrent = n } }
 func WithMemoryBudget(b string) Option          { return func(cfg *Config) { cfg.MemoryBudget = b } }

@@ -10,31 +10,33 @@ const ProtoVer = uint8(1)
 type Type string
 
 const (
-	MsgReq          Type = "req"
-	MsgRes          Type = "res"
-	MsgResChunk     Type = "res_chunk"
-	MsgResEnd       Type = "res_end"
-	MsgErr          Type = "err"
-	MsgPipe         Type = "pipe"
-	MsgCancel       Type = "cancel"
-	MsgCbReq        Type = "cb_req"
-	MsgCbRes        Type = "cb_res"
-	MsgStreamOpen   Type = "stream_open"
-	MsgStreamChunk  Type = "stream_chunk"
-	MsgStreamClose  Type = "stream_close"
-	MsgStreamReady  Type = "stream_ready"
-	MsgStreamCredit Type = "stream_credit"
-	MsgStreamPause  Type = "stream_pause"
-	MsgStreamResume Type = "stream_resume"
-	MsgHbPing       Type = "hb_ping"
-	MsgHbPong       Type = "hb_pong"
-	MsgWorkerHello  Type = "worker_hello"
-	MsgWorkerBye    Type = "worker_bye"
-	MsgCapLoad      Type = "cap_load"
-	MsgCapReady     Type = "cap_ready"
-	MsgGroupJoin    Type = "group_join"
-	MsgGroupLeave   Type = "group_leave"
-	MsgBroadcast    Type = "broadcast"
+	MsgReq           Type = "req"
+	MsgRes           Type = "res"
+	MsgResChunk      Type = "res_chunk"
+	MsgResEnd        Type = "res_end"
+	MsgErr           Type = "err"
+	MsgPipe          Type = "pipe"
+	MsgCancel        Type = "cancel"
+	MsgCbReq         Type = "cb_req"
+	MsgCbRes         Type = "cb_res"
+	MsgStreamOpen    Type = "stream_open"
+	MsgStreamChunk   Type = "stream_chunk"
+	MsgStreamClose   Type = "stream_close"
+	MsgStreamReady   Type = "stream_ready"
+	MsgStreamCredit  Type = "stream_credit"
+	MsgStreamPause   Type = "stream_pause"
+	MsgStreamResume  Type = "stream_resume"
+	MsgHbPing        Type = "hb_ping"
+	MsgHbPong        Type = "hb_pong"
+	MsgWorkerHello   Type = "worker_hello"
+	MsgWorkerBye     Type = "worker_bye"
+	MsgCapLoad       Type = "cap_load"
+	MsgCapReady      Type = "cap_ready"
+	MsgGroupJoin     Type = "group_join"
+	MsgGroupLeave    Type = "group_leave"
+	MsgBroadcast     Type = "broadcast"
+	MsgAuthChallenge Type = "auth_challenge"
+	MsgAuthResponse  Type = "auth_response"
 )
 
 // Dispatch controls how a request is routed to workers in a group.
@@ -74,6 +76,8 @@ const (
 	ErrSessionNotFound  Code = "SESSION_NOT_FOUND"
 	ErrPoisonPill       Code = "POISON_PILL"
 	ErrCancelled        Code = "CANCELLED"
+	ErrAuthFailed       Code = "AUTH_FAILED"
+	ErrRateLimited      Code = "RATE_LIMITED"
 )
 
 // retryable returns true if the error code is safe to retry.
@@ -85,6 +89,7 @@ var retryable = map[Code]bool{
 	ErrDispatchTimeout:  true,
 	ErrModelOOM:         true,
 	ErrModelTimeout:     true,
+	// ErrAuthFailed is intentionally NOT retryable
 }
 
 // Retryable reports whether this error code should be retried.

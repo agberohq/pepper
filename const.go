@@ -7,6 +7,8 @@ package pepper
 
 import "time"
 
+import "github.com/agberohq/pepper/internal/wire"
+
 // Core types
 
 // In is the wire-level capability input map.
@@ -147,7 +149,7 @@ const (
 )
 
 // groupBroadcast is the group name that routes a request to all workers via pub/sub.
-const groupBroadcast = "*"
+const groupBroadcast = wire.GroupBroadcast
 
 // Meta key prefixes
 
@@ -164,3 +166,29 @@ const (
 	MetaKeyBlobs       = "_blobs"
 	MetaKeyCostUSD     = "_cost_usd"
 )
+
+// Internal identifiers
+//
+// These never leave the process, but they are still protocol: a shutdown label or
+// a key that is spelled two different ways fails silently. Wire-level strings
+// (bus topics, URL schemes, worker env vars) live in internal/wire.
+
+// Shutdown task labels, in LIFO registration order.
+const (
+	shutdownCoordClose = "coord.close"
+	shutdownDoctor     = "doctor.stop"
+	shutdownLoopers    = "loopers.stop"
+	shutdownWorkersBye = "workers.bye"
+	shutdownReqReaper  = "req.reaper.stop"
+	shutdownBlobReaper = "blob.reaper.stop"
+	shutdownBGCancel   = "bg.cancel"
+)
+
+// shutdownWorkerPrefix namespaces per-worker teardown tasks.
+const shutdownWorkerPrefix = "worker."
+
+// shutdownWorkerKey builds the shutdown label for one worker, e.g.
+// "worker.python.w-1".
+func shutdownWorkerKey(runtimeKind, workerID string) string {
+	return shutdownWorkerPrefix + runtimeKind + "." + workerID
+}

@@ -138,6 +138,19 @@ func (p *Pepper) groupsOverlap(a, b []string) bool {
 	return false
 }
 
+// signalFirstWorkerReady closes the firstWorkerReady channel once,
+// unblocking Start() when the first worker becomes ready.
+func (p *Pepper) signalFirstWorkerReady() {
+	if ch := p.rt.firstWorkerReady; ch != nil {
+		select {
+		case <-ch:
+			// already closed
+		default:
+			close(ch)
+		}
+	}
+}
+
 func (p *Pepper) buildCapLoad(spec *registry.Spec) envelope.CapLoad {
 	source := spec.Source
 	if source != "" && spec.Runtime == registry.RuntimePython {

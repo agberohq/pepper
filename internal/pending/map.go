@@ -66,6 +66,8 @@ func (m *Map) Resolve(corrID string, resp Response) {
 
 // Chunk delivers one streaming chunk to the goroutine waiting on corrID.
 // Does NOT mark the entry done — the stream stays open for more chunks.
+// Uses non-blocking send to avoid hanging the producer. If the buffer is full,
+// the chunk is dropped and a counter is incremented for observability.
 func (m *Map) Chunk(corrID string, resp Response) {
 	val, ok := m.entries.Get(corrID)
 	if !ok {
@@ -77,7 +79,10 @@ func (m *Map) Chunk(corrID string, resp Response) {
 	select {
 	case val.stream <- resp:
 	default:
-		// Stream buffer full — drop chunk (backpressure should prevent this)
+		// Stream buffer full — drop chunk and track for observability.
+		// Blocking here would hang the producer (e.g., Python worker)
+		// if the consumer is slow.
+		val.droppedChunks.Add(1)
 	}
 }
 

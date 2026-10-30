@@ -58,10 +58,11 @@ func NewNATS(url string) (Store, error) {
 	}
 
 	return &natsStore{
-		nc:     nc,
-		js:     js,
-		kv:     kv,
-		stopCh: make(chan struct{}),
+		nc:       nc,
+		js:       js,
+		kv:       kv,
+		stopCh:   make(chan struct{}),
+		pullSubs: make(map[string]*nats.Subscription),
 	}, nil
 }
 
@@ -81,6 +82,10 @@ type natsStore struct {
 	kv     nats.KeyValue
 	stopCh chan struct{}
 	closed sync.Once
+	// pullSubs caches persistent pull subscriptions per queue to avoid
+	// creating a new PullSubscribe on every Pull() call.
+	pullSubsMu sync.Mutex
+	pullSubs   map[string]*nats.Subscription
 }
 
 func encodeKey(key string) string {
@@ -142,7 +147,12 @@ func (s *natsStore) Publish(_ context.Context, channel string, payload []byte) e
 func (s *natsStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan Event, error) {
 	ch := make(chan Event, 64)
 
-	sub, err := s.nc.Subscribe(">", func(m *nats.Msg) {
+	// Use prefix-based subscriptions instead of ">" to avoid receiving all
+	// cluster traffic. For prefix patterns (ending with "." or ":"), subscribe
+	// to both the exact topic and the wildcard pattern.
+	var subs []*nats.Subscription
+
+	handler := func(m *nats.Msg) {
 		if !natsChannelMatches(m.Subject, channelPrefix) {
 			return
 		}
@@ -151,9 +161,51 @@ func (s *natsStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan
 		case <-ctx.Done():
 		case <-s.stopCh:
 		}
-	})
-	if err != nil {
-		return nil, err
+	}
+
+	if strings.HasSuffix(channelPrefix, ".") || strings.HasSuffix(channelPrefix, ":") {
+		// Prefix subscription: use NATS wildcard pattern for prefix matching
+		wildcard := strings.TrimSuffix(channelPrefix, ".") + ".>"
+		if strings.HasSuffix(channelPrefix, ":") {
+			wildcard = strings.TrimSuffix(channelPrefix, ":") + ":>"
+		}
+		sub, err := s.nc.Subscribe(wildcard, handler)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub)
+	} else if strings.HasSuffix(channelPrefix, "*") {
+		// Wildcard * converted to > for multi-level matching
+		wildcard := strings.TrimSuffix(channelPrefix, "*") + ">"
+		sub, err := s.nc.Subscribe(wildcard, handler)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub)
+	} else if strings.HasSuffix(channelPrefix, ">") {
+		// Already a wildcard pattern
+		sub, err := s.nc.Subscribe(channelPrefix, handler)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub)
+	} else {
+		// Exact topic subscription, but also subscribe to the wildcard pattern
+		// so that sub-topics like "pepper.control.w-1" are received when
+		// subscribing to "pepper.control".
+		sub1, err := s.nc.Subscribe(channelPrefix, handler)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub1)
+
+		wildcard := channelPrefix + ".>"
+		sub2, err := s.nc.Subscribe(wildcard, handler)
+		if err != nil {
+			sub1.Unsubscribe()
+			return nil, err
+		}
+		subs = append(subs, sub2)
 	}
 
 	go func() {
@@ -161,7 +213,9 @@ func (s *natsStore) Subscribe(ctx context.Context, channelPrefix string) (<-chan
 		case <-ctx.Done():
 		case <-s.stopCh:
 		}
-		sub.Unsubscribe()
+		for _, sub := range subs {
+			sub.Unsubscribe()
+		}
 		close(ch)
 	}()
 
@@ -179,6 +233,7 @@ func (s *natsStore) Push(_ context.Context, queue string, payload []byte) error 
 func (s *natsStore) Pull(ctx context.Context, queue string) ([]byte, error) {
 	cname := consumerName(queue)
 
+	// Ensure the consumer exists
 	_, err := s.js.ConsumerInfo(natsWorkStream, cname)
 	if err != nil {
 		_, err = s.js.AddConsumer(natsWorkStream, &nats.ConsumerConfig{
@@ -195,11 +250,18 @@ func (s *natsStore) Pull(ctx context.Context, queue string) ([]byte, error) {
 		}
 	}
 
-	sub, err := s.js.PullSubscribe(queue, cname, nats.BindStream(natsWorkStream))
-	if err != nil {
-		return nil, err
+	// Use cached persistent subscription to avoid creating one per call
+	s.pullSubsMu.Lock()
+	sub, ok := s.pullSubs[queue]
+	if !ok {
+		sub, err = s.js.PullSubscribe(queue, cname, nats.BindStream(natsWorkStream))
+		if err != nil {
+			s.pullSubsMu.Unlock()
+			return nil, err
+		}
+		s.pullSubs[queue] = sub
 	}
-	defer sub.Unsubscribe()
+	s.pullSubsMu.Unlock()
 
 	msgs, err := sub.Fetch(1, nats.Context(ctx))
 	if err != nil {
@@ -223,6 +285,11 @@ func (s *natsStore) Close() error {
 	var err error
 	s.closed.Do(func() {
 		close(s.stopCh)
+		s.pullSubsMu.Lock()
+		for _, sub := range s.pullSubs {
+			sub.Unsubscribe()
+		}
+		s.pullSubsMu.Unlock()
 		err = s.nc.Drain()
 	})
 	return err

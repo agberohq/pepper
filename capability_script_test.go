@@ -19,6 +19,7 @@ func TestRuntimeFromExt(t *testing.T) {
 		{"./caps/embed.jl", registry.RuntimeJulia, false},
 		{"./caps/search.js", registry.RuntimeNode, false},
 		{"./caps/tool.mjs", registry.RuntimeNode, false},
+		{"./caps/rerank.rs", registry.RuntimeRust, false},
 		{"CAPS/UPPER.PY", registry.RuntimePython, false}, // case-insensitive
 		{"./caps/model.JL", registry.RuntimeJulia, false},
 		{"./caps/unknown.rb", "", true},

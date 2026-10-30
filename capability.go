@@ -101,11 +101,12 @@ type scriptCap struct {
 // Script creates a script capability. The runtime is inferred from the file
 // extension so the same constructor works for every scripted language:
 //
-//	  .py → Python,  .jl → Julia,  .js / .mjs → Node.js
+//	  .py → Python,  .jl → Julia,  .js / .mjs → Node.js,  .rs → Rust
 //
 //		pp.Register(pepper.Script("echo",      "./caps/echo.py"))   // Python
 //		pp.Register(pepper.Script("embed",     "./caps/embed.jl"))  // Julia
 //		pp.Register(pepper.Script("search",    "./caps/search.js")) // Node.js
+//		pp.Register(pepper.Script("rerank",    "./caps/rerank.rs")) // Rust
 //		pp.Register(pepper.Script("transcribe", "./caps/transcribe.py").
 //		    Groups("gpu", "asr").
 //		    Config(map[string]any{"model_size": "small"}))
@@ -162,8 +163,10 @@ func runtimeFromExt(path string) (registry.Runtime, error) {
 		return registry.RuntimeJulia, nil
 	case ".js", ".mjs":
 		return registry.RuntimeNode, nil
+	case ".rs":
+		return registry.RuntimeRust, nil
 	default:
-		return "", fmt.Errorf("unsupported script extension %q — supported: .py, .jl, .js, .mjs", filepath.Ext(path))
+		return "", fmt.Errorf("unsupported script extension %q — supported: .py, .jl, .js, .mjs, .rs", filepath.Ext(path))
 	}
 }
 
@@ -179,12 +182,12 @@ type dirCap struct {
 // Dir registers every script file found under dir as a capability.
 // The runtime is inferred from each file's extension:
 //
-//	.py / .jl / .js / .mjs → Python / Julia / Node.js
+//	.py / .jl / .js / .mjs / .rs → Python / Julia / Node.js / Rust
 //
 // The capability name is derived from the file path relative to dir
 // (e.g. "audio/convert.py" → "audio.convert", "nlp/embed.jl" → "nlp.embed").
 //
-//	pp.Register(pepper.Dir("./caps"))           // mixed Python + Julia + Node caps
+//	pp.Register(pepper.Dir("./caps"))           // mixed Python + Julia + Node + Rust caps
 //	pp.Register(pepper.Dir("./caps").Groups("default"))
 func Dir(dir string) *dirCap {
 	return &dirCap{dir: dir}
@@ -498,7 +501,19 @@ type cliCap struct {
 
 // CLI creates a CLI tool capability.
 //
-//	pp.Register(pepper.CLI("convert", "ffmpeg", "-i", "{input}", "{output}"))
+// The default I/O contract is temp-file based: the payload is written to a
+// temp file whose path replaces {input} in the args, and the result is read
+// back from the temp file whose path replaces {output}. Pass glob patterns
+// with Input/Output, or switch to stdin/stdout with Stdin/Stdout.
+//
+//	pp.Register(pepper.CLI("video.thumbs", "ffmpeg", "-y", "-i", "{input}", "{output}").
+//	    Input("frame-*.png").
+//	    Output("thumbs-*.png"))
+//
+//	pp.Register(pepper.CLI("video.probe", "ffprobe", "-v", "quiet",
+//	    "-print_format", "json", "-show_format", "-").
+//	    Stdin(pepper.JSONStdin).
+//	    Stdout(pepper.JSONStdout))
 func CLI(name, command string, args ...string) *cliCap {
 	return &cliCap{capName: name, builder: cli.CMD(command, args...)}
 }
@@ -507,6 +522,59 @@ func (c *cliCap) name() string { return c.capName }
 
 func (c *cliCap) Groups(groups ...string) *cliCap {
 	c.builder = c.builder.Groups(groups...)
+	return c
+}
+
+// Args replaces the command arguments. They may contain {input}, {output}, and
+// {field_name} placeholders, where field names are substituted from the input map.
+func (c *cliCap) Args(args ...string) *cliCap {
+	c.builder = c.builder.Args(args...)
+	return c
+}
+
+// Input passes the payload to the process as a temp file whose name matches
+// glob, and substitutes {input} in the args with that path.
+func (c *cliCap) Input(glob string) *cliCap {
+	c.builder = c.builder.Input(glob)
+	return c
+}
+
+// Output reads the result from a temp file whose name matches glob, and
+// substitutes {output} in the args with that path.
+func (c *cliCap) Output(glob string) *cliCap {
+	c.builder = c.builder.Output(glob)
+	return c
+}
+
+// Stdin encodes the payload onto the process stdin instead of a temp file.
+// Use pepper.JSONStdin or pepper.MsgPackStdin.
+func (c *cliCap) Stdin(mode cli.InputMode) *cliCap {
+	c.builder = c.builder.Stdin(mode)
+	return c
+}
+
+// Stdout decodes the result from the process stdout instead of a temp file.
+// Use pepper.JSONStdout.
+func (c *cliCap) Stdout(mode cli.OutputMode) *cliCap {
+	c.builder = c.builder.Stdout(mode)
+	return c
+}
+
+// WorkDir sets the working directory the process runs in.
+func (c *cliCap) WorkDir(dir string) *cliCap {
+	c.builder = c.builder.WorkDir(dir)
+	return c
+}
+
+// Pool keeps n warm processes alive behind a line-framed protocol.
+func (c *cliCap) Pool(n int) *cliCap {
+	c.builder = c.builder.Pool(n)
+	return c
+}
+
+// Env appends extra environment variables ("KEY=value" pairs) to the process.
+func (c *cliCap) Env(kv ...string) *cliCap {
+	c.builder = c.builder.Env(kv...)
 	return c
 }
 
